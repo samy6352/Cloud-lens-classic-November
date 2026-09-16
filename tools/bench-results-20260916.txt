@@ -1,0 +1,38 @@
+# bench_schema_v2 @ ratio 2.86 (ROWS=1500000 RESOURCES=524476 MONTHS=6), trigger leg skipped. Started 2026-09-16T23:07:03.5217742+05:30
+generating 1,500,000 rows over 524,476 resources, 6 months
+partitions: 6 (costs_fact_202601 .. costs_fact_202606)
+skipping the trigger load leg (1,500,000 rows > BENCH_TRIGGER_MAX_ROWS=200,000)
+
+--- equivalence ---
+  OK   row count              1500000
+  OK   total BilledCost       30000159.98
+  OK   total CostInUsd        30000159.98
+  OK   distinct resources     494568
+  OK   distinct tags          6
+  OK   group-by service       4bce1baf5a9ae0e58a56d8431bd64ecf
+  OK   group-by rg+region     be86652043ed643158ccf84309b03c73
+  OK   daily trend            99aa395567ed31cd71d446feb7a0ed81
+
+--- size ---
+  v1 flat costs           492.2 MB
+  v2 costs_fact           267.2 MB  (all partitions)
+  v2 dim_resource         315.6 MB
+  v2 dim_tagset             0.1 MB
+  v2 total                582.9 MB   (118.4% of v1)
+  dim_resource rows    494,568   (fact rows 1,500,000)
+  dim_tagset rows      6
+
+--- load ---
+  v1 COPY              25.0s
+  v2 via trigger        skipped
+  v2 bulk (ingest)    181.7s   (7.3x v1)
+
+--- query (one month window) ---
+  v1 flat             365.6 ms
+  v2 partitioned      203.1 ms
+
+--- retention (drop oldest month) ---
+  dropped ['costs_fact_202601'] in 24.6 ms; rows 1,500,000 -> 1,241,208
+
+RESULT: all equivalence checks passed
+EXITCODE=0

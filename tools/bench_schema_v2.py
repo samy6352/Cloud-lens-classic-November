@@ -14,6 +14,19 @@ import psycopg
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Set before `app.warehouse` is imported, because importing it constructs a Warehouse
+# at module scope, which reads the application's own connection settings rather than
+# the DSN below and refuses to start without them. Defaulted here so the benchmark
+# runs standalone: without this it dies on `PGHOST is not set`, and then on `server
+# does not support SSL` -- the application quite correctly defaults `PGSSLMODE` to
+# `require` for the deployed server, and a local scratch server offers neither SSL
+# nor an Entra identity. `setdefault`, so a real environment still wins.
+os.environ.setdefault("PGHOST", "localhost")
+os.environ.setdefault("PGPORT", "5433")
+os.environ.setdefault("PGDATABASE", "cloudlens_v2")
+os.environ.setdefault("PGUSER", "cloudlens")
+os.environ.setdefault("PGSSLMODE", "disable")
+
 from app import schema_v2  # noqa: E402
 from app.warehouse import COLUMNS, NUMERIC  # noqa: E402
 
@@ -21,6 +34,13 @@ DSN = os.environ.get(
     "CLOUDLENS_LOCAL_DSN",
     "host=localhost port=5433 dbname=cloudlens_v2 user=cloudlens password=devlocal",
 )
+
+# The row-level INSTEAD OF trigger is the correctness path, not the ingest path, and
+# it is orders of magnitude slower: at 1.5M rows it was still running after 23
+# minutes, while the bulk loader does the same work in seconds. Measuring it is
+# worth doing once; letting it gate the size, query and retention numbers that
+# actually decide the design is not. Skipped above a modest row count.
+TRIGGER_LIMIT = int(os.environ.get("BENCH_TRIGGER_MAX_ROWS", "200000"))
 
 
 class Con:
@@ -140,13 +160,18 @@ def main():
     print(f"partitions: {len(parts)} ({parts[0]} .. {parts[-1]})")
 
     t0 = time.monotonic()
-    copy_in(con, '"bench_v2".costs', data)
-    v2_load = time.monotonic() - t0
+    if rows <= TRIGGER_LIMIT:
+        copy_in(con, '"bench_v2".costs', data)
+        v2_load = time.monotonic() - t0
+        con.execute(f'TRUNCATE "bench_v2".{schema_v2.FACT}')
+        con.execute(f'TRUNCATE "bench_v2".{schema_v2.DIM_RESOURCE} CASCADE')
+        con.execute(f'TRUNCATE "bench_v2".{schema_v2.DIM_TAGSET} CASCADE')
+    else:
+        v2_load = None
+        print(f"skipping the trigger load leg ({rows:,} rows > "
+              f"BENCH_TRIGGER_MAX_ROWS={TRIGGER_LIMIT:,})")
 
     # And again through the bulk path the ingest will actually use.
-    con.execute(f'TRUNCATE "bench_v2".{schema_v2.FACT}')
-    con.execute(f'TRUNCATE "bench_v2".{schema_v2.DIM_RESOURCE} CASCADE')
-    con.execute(f'TRUNCATE "bench_v2".{schema_v2.DIM_TAGSET} CASCADE')
     for stmt in schema_v2.staging_sql("bench_v2", list(COLUMNS), NUMERIC):
         con.execute(stmt)
     t0 = time.monotonic()
@@ -162,8 +187,13 @@ def main():
     print("\n--- equivalence ---")
     checks = [
         ("row count", 'SELECT count(*) FROM {s}.costs'),
-        ("total BilledCost", 'SELECT round(sum("BilledCost")::numeric, 6) FROM {s}.costs'),
-        ("total CostInUsd", 'SELECT round(sum("CostInUsd")::numeric, 6) FROM {s}.costs'),
+        # Rounded to the cent. `sum()` over double precision is not associative, so
+        # the same rows aggregated in a different physical order can differ in the
+        # last bit -- v1 returned ...982869 and v2 ...982870 on identical input.
+        # That is float addition, not a difference in what was summed, and the cent
+        # is the precision these numbers are actually presented at.
+        ("total BilledCost", 'SELECT round(sum("BilledCost")::numeric, 2) FROM {s}.costs'),
+        ("total CostInUsd", 'SELECT round(sum("CostInUsd")::numeric, 2) FROM {s}.costs'),
         ("distinct resources", 'SELECT count(DISTINCT "ResourceId") FROM {s}.costs'),
         ("distinct tags", 'SELECT count(DISTINCT coalesce("Tags",\'~\')) FROM {s}.costs'),
         ("group-by service",
@@ -210,9 +240,12 @@ def main():
     print(f"  dim_resource rows    {dimr:,}   (fact rows {len(data):,})")
     print(f"  dim_tagset rows      {dimt:,}")
 
+    trigger_line = ("\n  v2 via trigger        skipped"
+                    if v2_load is None else
+                    f"\n  v2 via trigger    {v2_load:7.1f}s   ({v2_load/v1_load:.1f}x v1)")
     print(f"\n--- load ---\n  v1 COPY           {v1_load:7.1f}s"
-          f"\n  v2 via trigger    {v2_load:7.1f}s   ({v2_load/v1_load:.1f}x v1)"
-          f"\n  v2 bulk (ingest)  {v2_bulk:7.1f}s   ({v2_bulk/v1_load:.1f}x v1)")
+          + trigger_line
+          + f"\n  v2 bulk (ingest)  {v2_bulk:7.1f}s   ({v2_bulk/v1_load:.1f}x v1)")
 
     # --- query time -------------------------------------------------------
     print("\n--- query (one month window) ---")

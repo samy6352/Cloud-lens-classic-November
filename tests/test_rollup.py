@@ -262,3 +262,136 @@ def test_the_grain_is_checked_against_the_real_schema():
         assert name in COLUMNS, f"{name} is not a warehouse column"
     for name in rollup.MEASURES:
         assert name in NUMERIC, f"{name} is not numeric and cannot be summed"
+
+
+# --------------------------------------------------------------- windowed rebuild
+
+def test_month_window_snaps_outwards():
+    """The window must cover whole months, and must never narrow.
+
+    Snapping outwards is what lets a scoped rebuild prune to `costs_fact`'s
+    monthly partitions. Snapping inwards, or off-by-one on the exclusive end,
+    would silently leave the last day of a write out of the rebuild -- which is
+    the one failure mode this whole feature must not have.
+    """
+    import datetime as dt
+
+    from app.rollup import month_window
+
+    assert month_window([]) is None
+    assert month_window([None]) is None
+
+    lo, hi = month_window([dt.date(2026, 2, 14)])
+    assert (lo, hi) == (dt.date(2026, 2, 1), dt.date(2026, 3, 1))
+
+    # A day that is already a month start still yields a whole month.
+    lo, hi = month_window([dt.date(2026, 2, 1)])
+    assert (lo, hi) == (dt.date(2026, 2, 1), dt.date(2026, 3, 1))
+
+    # The last day of a 31-day month must fall inside, not on, the upper bound.
+    lo, hi = month_window([dt.date(2026, 1, 31)])
+    assert (lo, hi) == (dt.date(2026, 1, 1), dt.date(2026, 2, 1))
+    assert lo <= dt.date(2026, 1, 31) < hi
+
+    # Spanning a year boundary.
+    lo, hi = month_window([dt.date(2026, 12, 9), dt.date(2025, 11, 30)])
+    assert (lo, hi) == (dt.date(2025, 11, 1), dt.date(2027, 1, 1))
+
+
+def test_a_windowed_rebuild_over_everything_equals_a_full_rebuild(loaded):
+    """The window is an optimisation, so widening it to all of history is a no-op.
+
+    Compared to the cent rather than bit-for-bit. `sum()` over double precision is
+    not associative, so recomputing the same group in a different physical row
+    order can move the last bits -- an artefact of float addition, not a
+    difference in what was aggregated. Rounding is also what the dashboard does
+    with these numbers, so it is the equality that actually matters.
+    """
+    import datetime as dt
+
+    from app.rollup import DIMENSIONS, MEASURES, TABLE
+
+    dims = ", ".join(f'"{d}"' for d in DIMENSIONS)
+    sums = ", ".join(f'round("{m}"::numeric, 2) AS "{m}"' for m in MEASURES)
+
+    def snapshot():
+        with loaded.reader() as r:
+            return r.rows(f'SELECT {dims}, {sums}, charges FROM {TABLE} '
+                          'ORDER BY 1,2,3,4,5,6,7,8', limit=100000)
+
+    full = snapshot()
+    assert full, "fixture produced no rollup rows"
+    loaded.refresh_rollup(window=(dt.date(2000, 1, 1), dt.date(2100, 1, 1)))
+    assert snapshot() == full
+
+
+def test_a_windowed_rebuild_corrects_its_month_and_leaves_the_others_alone(loaded):
+    """The actual contract: in-window rows are recomputed, out-of-window rows are untouched.
+
+    Written as a real correction rather than a no-op rebuild. February gains rows
+    after the rollup was last built, so a scoped rebuild of February alone has to
+    move February's total to agree with the detail table while leaving January and
+    March byte-identical -- which is what makes a daily ingest able to skip the
+    rest of a year of history.
+    """
+    import datetime as dt
+
+    from app.rollup import TABLE
+    from app.warehouse import COLUMNS, NUMERIC, insert_rows
+
+    def by_month():
+        with loaded.reader() as r:
+            return {row["m"]: row["c"] for row in r.rows(
+                'SELECT to_char("ChargePeriodStart", \'YYYY-MM\') AS m, '
+                f'round(sum("BilledCost"), 2) AS c FROM {TABLE} GROUP BY 1 ORDER BY 1')}
+
+    def detail_by_month():
+        with loaded.reader() as r:
+            return {row["m"]: row["c"] for row in r.rows(
+                'SELECT to_char("ChargePeriodStart", \'YYYY-MM\') AS m, '
+                'round(sum("BilledCost"), 2) AS c FROM costs GROUP BY 1 ORDER BY 1')}
+
+    def other_months():
+        with loaded.reader() as r:
+            return r.rows(
+                f'SELECT * FROM {TABLE} WHERE "ChargePeriodStart" < DATE \'2026-02-01\' '
+                'OR "ChargePeriodStart" >= DATE \'2026-03-01\' ORDER BY 1,2,3,4,5,6,7,8',
+                limit=100000)
+
+    before_rollup = by_month()
+    before_others = other_months()
+    assert before_rollup == detail_by_month(), "fixture should start in agreement"
+
+    extra = []
+    for i in range(50):
+        values = {
+            "SubAccountId": str(uuid.UUID(int=0)),
+            "SubAccountName": "sub-0",
+            "ChargePeriodStart": f"2026-02-{1 + (i % 28):02d}",
+            "BilledCost": 100.0,
+            "CostInUsd": 100.0,
+            "BillingCurrency": "USD",
+            "ServiceName": "Virtual Machines",
+            "ServiceFamily": "Compute",
+            "RegionName": "eastus",
+            "ResourceGroup": "rg-new",
+            "ResourceId": f"/subscriptions/x/rg-new/res-{i}",
+            "MeterName": "meter-new",
+        }
+        extra.append([values.get(c, 0.0 if c in NUMERIC else None) for c in COLUMNS])
+
+    with loaded.connect() as con:
+        insert_rows(con, extra)
+
+    # Stale by construction: the detail table has moved, the rollup has not.
+    assert by_month() == before_rollup
+    assert by_month() != detail_by_month()
+
+    loaded.refresh_rollup(window=(dt.date(2026, 2, 1), dt.date(2026, 3, 1)))
+
+    after = by_month()
+    assert after["2026-02"] == pytest.approx(
+        detail_by_month()["2026-02"], abs=0.01), "February was not corrected"
+    assert after["2026-02"] != pytest.approx(before_rollup["2026-02"], abs=0.01)
+    assert other_months() == before_others, "a month outside the window was rewritten"
+    assert after == pytest.approx(detail_by_month(), abs=0.01)

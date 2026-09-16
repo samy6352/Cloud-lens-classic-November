@@ -39,8 +39,10 @@ dashboard uses.
 """
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import time
+from collections.abc import Iterable
 from typing import Any
 
 log = logging.getLogger("cloudlens.rollup")
@@ -62,6 +64,10 @@ DIMENSIONS = [
     "ResourceGroup",
     "RegionName",
 ]
+
+# The date column the rollup is windowed and retained by. Named off DIMENSIONS
+# rather than repeated as a literal so the two cannot drift apart.
+PERIOD = DIMENSIONS[0]
 
 # Summed. Additive, so they survive re-aggregation at any coarser grain.
 #
@@ -132,33 +138,79 @@ def create_sql(schema: str) -> list[str]:
     ]
 
 
-def _select(source: str) -> str:
+def _select(source: str, window: tuple[dt.date, dt.date] | None = None) -> str:
     dims = ", ".join(f'"{d}"' for d in DIMENSIONS)
     sums = ", ".join(f'sum("{m}") AS "{m}"' for m in MEASURES)
+    where = ""
+    if window is not None:
+        lo, hi = window
+        where = (f" WHERE \"{PERIOD}\" >= DATE '{lo.isoformat()}'"
+                 f" AND \"{PERIOD}\" < DATE '{hi.isoformat()}'")
     return (f"SELECT {dims}, {sums}, count(*) AS charges "
-            f"FROM {source} GROUP BY {', '.join(str(i + 1) for i in range(len(DIMENSIONS)))}")
+            f"FROM {source}{where} "
+            f"GROUP BY {', '.join(str(i + 1) for i in range(len(DIMENSIONS)))}")
 
 
-def rebuild(con: Any, schema: str, source: str) -> int:
-    """Rebuild the whole rollup from the detail table.
+def month_start(day: dt.date) -> dt.date:
+    return day.replace(day=1)
 
-    A full rebuild rather than an incremental merge. The rollup is derived data
-    whose only job is to agree with the table it came from, and a rebuild cannot
-    drift: there is no partial-failure state where some months were updated and
-    others were not, and no need to work out which rows an ingest touched.
 
-    It costs one scan of the detail table, which is the same scan a single
-    unaggregated dashboard query was doing anyway -- except this one happens once
-    per refresh instead of seven times per page load.
+def next_month(day: dt.date) -> dt.date:
+    return (day.replace(day=1) + dt.timedelta(days=32)).replace(day=1)
+
+
+def month_window(days: Iterable[dt.date]) -> tuple[dt.date, dt.date] | None:
+    """The smallest whole-month span covering `days`, or None if there are none.
+
+    Whole months rather than the exact day range on purpose. The window is the
+    unit the rollup is rebuilt in, and snapping it out to month boundaries means
+    a scoped rebuild lines up with `costs_fact`'s monthly partitions, so the
+    planner can prune to the partitions that actually changed. Snapping outwards
+    can only ever include more source rows than strictly necessary, never fewer,
+    so it cannot cause a stale row to survive.
+    """
+    days = [d for d in days if d is not None]
+    if not days:
+        return None
+    return month_start(min(days)), next_month(max(days))
+
+
+def rebuild(con: Any, schema: str, source: str,
+            window: tuple[dt.date, dt.date] | None = None) -> int:
+    """Rebuild the rollup from the detail table.
+
+    A rebuild rather than an incremental merge. The rollup is derived data whose
+    only job is to agree with the table it came from, and a rebuild cannot drift:
+    there is no partial-failure state where some rows were updated and others
+    were not, and no need to work out which individual rows an ingest touched.
+
+    `window` narrows that rebuild to a half-open `[lo, hi)` span of charge dates.
+    The property above is preserved *within the window*, because everything in it
+    is deleted and recomputed from source -- nothing is merged. What the caller
+    takes on is the obligation to pass a window that actually covers every day the
+    write touched; days outside it keep whatever the last rebuild produced. A
+    caller that cannot state that with certainty must pass `None` and rebuild the
+    lot, which is why that remains the default.
+
+    This matters at retention scale. A full rebuild costs one scan of all retained
+    history, and at a year of daily ingestion that is the same scan repeated every
+    day to correct one day's rows. A windowed rebuild scans the month that changed,
+    and because the window is snapped to month boundaries it prunes to the matching
+    `costs_fact` partitions instead of reading the rest of the year to discard it.
 
     Inside a transaction, so readers see either the old rollup or the new one.
     DELETE rather than DROP keeps the indexes and the table's permissions.
     """
     t0 = time.monotonic()
+    scope = ""
+    if window is not None:
+        lo, hi = window
+        scope = (f' WHERE "{PERIOD}" >= DATE \'{lo.isoformat()}\''
+                 f' AND "{PERIOD}" < DATE \'{hi.isoformat()}\'')
     con.execute("BEGIN")
     try:
-        con.execute(f'DELETE FROM "{schema}".{TABLE}')
-        con.execute(f'INSERT INTO "{schema}".{TABLE} {_select(source)}')
+        con.execute(f'DELETE FROM "{schema}".{TABLE}{scope}')
+        con.execute(f'INSERT INTO "{schema}".{TABLE} {_select(source, window)}')
         con.execute("COMMIT")
     except Exception:
         con.execute("ROLLBACK")
@@ -168,5 +220,6 @@ def rebuild(con: Any, schema: str, source: str) -> int:
     # The planner needs current statistics or it may still choose a sequential
     # scan of the detail table for a query the rollup could answer.
     con.execute(f'ANALYZE "{schema}".{TABLE}')
-    log.info("rollup: %s rows in %.1fs", f"{rows:,}", time.monotonic() - t0)
+    log.info("rollup: %s rows in %.1fs (%s)", f"{rows:,}", time.monotonic() - t0,
+             "full" if window is None else f"{window[0]}..{window[1]}")
     return int(rows or 0)

@@ -501,13 +501,20 @@ class Warehouse:
             )
 
     # ------------------------------------------------------------------ rollup
-    def refresh_rollup(self, *, strict: bool = False) -> int:
+    def refresh_rollup(self, *, strict: bool = False,
+                       window: tuple[Any, Any] | None = None) -> int:
         """Rebuild the pre-aggregated table the dashboard reads.
 
         Called after every write. It is derived from the rows that were just written, so
         rebuilding it anywhere else would mean finding all the write paths again, and missing
         one would leave the dashboard showing yesterday's totals with no indication that it
         was doing so.
+
+        `window` is an optional half-open `(lo, hi)` span of charge dates that narrows the
+        rebuild to the months a write actually touched. It is an optimisation with a
+        precondition, not a default: pass it only where the set of affected days is known
+        for certain, because days outside it keep whatever the previous rebuild produced.
+        Every existing caller omits it and rebuilds the lot, which is always correct.
 
         Source writes are frozen while derived data is rebuilt. Failed rebuilds retain the
         previous ready generation; ingest callers raise so recovery cannot publish stale
@@ -516,7 +523,8 @@ class Warehouse:
         try:
             from . import jobs
             with jobs.coherent_rollup(self) as con:
-                return rollup.rebuild(jobs.RollupTransaction(con), self._rollup_schema, self._pg_table)
+                return rollup.rebuild(jobs.RollupTransaction(con), self._rollup_schema,
+                                      self._pg_table, window)
         except Exception as exc:  # noqa: BLE001
             log.warning("warehouse: could not rebuild the rollup (%s); "
                         "the previous ready generation is retained", exc)
@@ -524,9 +532,9 @@ class Warehouse:
                 raise
             return 0
 
-    async def refresh_rollup_async(self) -> None:
+    async def refresh_rollup_async(self, window: tuple[Any, Any] | None = None) -> None:
         """`refresh_rollup` off the event loop — it aggregates the whole detail table."""
-        await asyncio.to_thread(self.refresh_rollup, strict=True)
+        await asyncio.to_thread(self.refresh_rollup, strict=True, window=window)
 
     # ------------------------------------------------------------------ schema
     def _columns_sql(self, rate: float | None, target: str) -> str:
