@@ -1,4 +1,4 @@
-# bench_partition_only @ ratio 2.86 (ROWS=1500000 RESOURCES=524476 MONTHS=6). Started 2026-09-16T23:16:09.5000417+05:30
+# bench_partition_only @ ratio 2.86 (ROWS=1500000 RESOURCES=524476 MONTHS=6). Started 2026-09-16T23:22:41.3953270+05:30
 generating 1,500,000 rows over 524,476 resources, 6 months
 partitions: 6 (costs_202601 .. costs_202606)
 
@@ -10,21 +10,21 @@ partitions: 6 (costs_202601 .. costs_202606)
   OK   daily trend            99aa395567ed31cd71d446feb7a0ed81
 
 --- size ---
-  v1 flat                 492.1 MB
+  v1 flat                 492.2 MB
   v3 partitioned          493.8 MB   (100.3% of v1)
 
 --- load ---
-  v1 COPY              16.5s
-  v3 COPY              18.0s   (1.1x v1)
+  v1 COPY              22.0s
+  v3 COPY              19.4s   (0.9x v1)
 
 --- query (one month window) ---
-  v1 flat             376.9 ms
-  v3 partitioned      133.3 ms
+  v1 flat             410.1 ms
+  v3 partitioned      168.7 ms
 
 --- retention (remove oldest month) ---
-  v1 DELETE           15480.6 ms   rows 1,500,000 -> 1,241,208
-  v3 DROP partition     114.4 ms   rows 1,500,000 -> 1,241,208
-  v1 size after        492.1 MB   (was    492.1 MB, DELETE does not reclaim)
+  v1 DELETE           17211.1 ms   rows 1,500,000 -> 1,241,208
+  v3 DROP partition     209.5 ms   rows 1,500,000 -> 1,241,208
+  v1 size after        492.2 MB   (was    492.2 MB, DELETE does not reclaim)
   v3 size after        408.7 MB   (was    493.8 MB)
 
 RESULT: all equivalence checks passed

@@ -2,10 +2,11 @@
 
 Why this exists
 ---------------
-`bench_schema_v2.py` measured the four-object star schema and it lost: at the real
+An earlier benchmark measured the four-object star schema and it lost: at the real
 customer ratio of 2.86 rows per resource, `dim_resource` grew to 315.6 MB against a
-267.2 MB fact, making v2 118.4% of the flat table it was meant to shrink, and the
-bulk load 7.3x slower than a plain COPY.
+267.2 MB fact, making it 118.4% of the flat table it was meant to shrink, and the
+bulk load 7.3x slower than a plain COPY. That script has been removed along with
+the design it measured; both are preserved in history at commit 2af27ef.
 
 What did pay in that run came from partitioning alone -- dropping a month took
 24.6 ms, and the one-month query ran 203 ms against the flat table's 366 ms.
@@ -16,8 +17,8 @@ view, no trigger: the only difference is RANGE partitioning by month. If size an
 load come out at parity with flat while the query and retention wins survive, then
 partitioning on its own is the whole design and the rest is complexity to delete.
 
-Run directly. Honours the same ROWS / RESOURCES / MONTHS environment variables as
-bench_schema_v2, and defaults to the same local server.
+Run directly. Honours ROWS / RESOURCES / MONTHS from the environment, and defaults
+to the local server configured in `bench_common`.
 """
 from __future__ import annotations
 
@@ -30,10 +31,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import psycopg  # noqa: E402
 
-from bench_schema_v2 import Con, copy_in, flat_ddl, generate, size  # noqa: E402
+# bench_common sets the PG* defaults the application needs, and must therefore be
+# imported before anything that pulls in app.warehouse.
+from bench_common import (  # noqa: E402
+    Con, copy_in, flat_ddl, generate, partitioned_size, size, sql_type,
+)
 
 from app import schema_v2  # noqa: E402
-from app.warehouse import COLUMNS, NUMERIC  # noqa: E402
+from app.warehouse import COLUMNS  # noqa: E402
 
 DSN = os.environ.get(
     "CLOUDLENS_LOCAL_DSN",
@@ -51,11 +56,7 @@ def partitioned_ddl(schema: str) -> str:
     comparison is only worth anything if partitioning is the single difference,
     so nothing here narrows a column or adds an index that v1 does not have.
     """
-    cols = ",\n  ".join(
-        f'"{c}" ' + ("double precision" if c in NUMERIC
-                     else "date" if c == PERIOD else "text")
-        for c in COLUMNS
-    )
+    cols = ",\n  ".join(f'"{c}" {sql_type(c)}' for c in COLUMNS)
     return (f'CREATE TABLE IF NOT EXISTS "{schema}".costs (\n  {cols}\n) '
             f'PARTITION BY RANGE ("{PERIOD}")')
 
@@ -145,11 +146,7 @@ def main() -> int:
     # --- size -------------------------------------------------------------
     print("\n--- size ---")
     v1 = size(con, "bench_v1", "costs")
-    v3 = con.execute(
-        "SELECT sum(pg_total_relation_size(c.oid)) FROM pg_class c "
-        "JOIN pg_namespace n ON n.oid = c.relnamespace "
-        "WHERE n.nspname = 'bench_v3' AND c.relkind IN ('r','p')"
-    ).fetchone()[0]
+    v3 = partitioned_size(con, "bench_v3")
     mb = lambda n: f"{n/1024/1024:8.1f} MB"  # noqa: E731
     print(f"  v1 flat              {mb(v1)}")
     print(f"  v3 partitioned       {mb(v3)}   ({v3/v1*100:.1f}% of v1)")
@@ -191,11 +188,7 @@ def main() -> int:
 
     # Size after removal, before any VACUUM. A DELETE leaves the space behind.
     v1_after = size(con, "bench_v1", "costs")
-    v3_after = con.execute(
-        "SELECT sum(pg_total_relation_size(c.oid)) FROM pg_class c "
-        "JOIN pg_namespace n ON n.oid = c.relnamespace "
-        "WHERE n.nspname = 'bench_v3' AND c.relkind IN ('r','p')"
-    ).fetchone()[0]
+    v3_after = partitioned_size(con, "bench_v3")
     print(f"  v1 size after     {mb(v1_after)}   (was {mb(v1)}, DELETE does not reclaim)")
     print(f"  v3 size after     {mb(v3_after)}   (was {mb(v3)})")
 
