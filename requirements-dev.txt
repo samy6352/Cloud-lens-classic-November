@@ -1,0 +1,10 @@
+# Everything needed to run the tests and the linter, on top of requirements.txt.
+#
+#     pip install -r requirements.txt -r requirements-dev.txt
+#
+-r requirements.txt
+
+pytest>=8.3.0
+pytest-asyncio>=0.24.0  # the async cache tests in tests/test_cost_cache.py
+pytest-xdist>=3.6.0     # -n auto; the suite is process-isolated, so it parallelises cleanly
+ruff>=0.8.0

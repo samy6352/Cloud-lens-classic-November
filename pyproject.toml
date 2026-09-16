@@ -1,0 +1,79 @@
+[project]
+name = "cloudlens"
+version = "1.0.0"
+description = "Azure cost analysis: what it cost, what changed, what is being wasted."
+requires-python = ">=3.11"
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "script: a standalone test script run as a subprocess",
+    "postgres: needs an explicitly configured test PostgreSQL server",
+    "offline: script needs no database, network or Azure credentials",
+    "warehouse: needs the seeded fixture warehouse",
+    "network: needs outbound internet access",
+    "azure: needs Azure credentials and a real subscription",
+]
+filterwarnings = ["default"]
+
+[tool.ruff]
+# The codebase is written to a wide line: the comments explain *why* a thing is
+# done, in prose, and rewrapping them at 88 would cost more than it buys.
+line-length = 100
+target-version = "py311"
+extend-exclude = ["web/assets"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes: undefined names, unused imports, real defects
+    "W",    # whitespace
+    "I",    # import ordering
+    "UP",   # outdated syntax for the Python we target
+    "B",    # bugbear: likely bugs rather than style
+    "C4",   # comprehension misuse
+    "SIM",  # simplifiable constructs
+    "RUF",  # ruff's own correctness rules
+]
+ignore = [
+    "E501",    # line length is enforced by the formatter's own limit above
+    "B008",    # FastAPI's Depends() in a default argument is the documented idiom
+    "SIM108",  # a ternary is not always clearer than an if/else
+    # The codebase carries `# noqa: BLE001` on around 120 deliberate blind excepts, each
+    # with a sentence saying why that failure must not propagate. BLE001 is not in the
+    # select list above, so ruff calls every one of those suppressions unused and would
+    # have us delete the reasoning with it. The comments are the documentation; keep them.
+    "RUF100",
+    # Prose. The comments in this codebase use en dashes and typographic quotes on
+    # purpose, and flagging them as "ambiguous unicode" is noise, not a finding.
+    "RUF001", "RUF002", "RUF003",
+    # Deliberately not enforced yet, and each for a reason rather than because it is
+    # inconvenient. Turn them on one at a time, with the fixes, rather than in a batch.
+    #
+    # B905: `zip(strict=)` is worth having, but the right value differs per call site --
+    #   strict=True turns a benign truncation into a runtime exception. Twenty-seven call
+    #   sites each need reading, not a blanket edit.
+    # SIM105: `contextlib.suppress` reads better but is measurably slower than try/except
+    #   pass, and several of these sit in per-row loops in the ingest path.
+    # SIM115: the flagged opens are nearly all in tests reading a file once; wrapping them
+    #   changes nothing that can leak in a process that is about to exit.
+    "B905", "SIM105", "SIM115",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Test scripts set environment variables before importing the application, so their
+# imports genuinely cannot all sit at the top of the file.
+"tests/*" = ["E402"]
+# Same reason: both put the checkout on sys.path before importing `app`.
+"ingest.py" = ["E402"]
+"verify_warehouse.py" = ["E402"]
+"conftest.py" = ["SLF001"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app", "tests"]

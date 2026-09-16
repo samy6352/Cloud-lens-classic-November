@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+# A second push to the same branch makes the first run irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check --output-format=github .
+
+  test:
+    name: Tests (${{ matrix.python }} / ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is in the matrix because that is where the app is developed, and
+        # where the path handling has bitten us before: the '/home/' prefix check in
+        # warehouse.py passed for the wrong reason on Windows until a test caught it.
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: pip install -r requirements-dev.txt
+      - name: Verify database-free tooling
+        run: python -m pytest tests/test_conftest.py tests/test_packaging.py tests/test_deployment.py tests/test_preflight_checks.py -q
+
+      # Both runner images ship PostgreSQL with the service stopped, so it is started
+      # here rather than pulled as a service container. A container would have been
+      # Linux-only -- GitHub does not run them on Windows agents -- and Windows is the
+      # half of this matrix that has actually caught bugs.
+      #
+      # Image versions can change; print the running version rather than assume one.
+      - name: Start PostgreSQL (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo systemctl start postgresql.service
+          # The image's postgres role authenticates by peer over the local socket; the
+          # tests connect over TCP, which needs a password.
+          sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
+          timeout 60s bash -c 'until pg_isready -h localhost -U postgres; do sleep 1; done'
+          sudo -u postgres psql -c "SELECT version();"
+
+      - name: Start PostgreSQL (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $svc = Get-Service -Name 'postgresql*' | Select-Object -First 1
+          if (-not $svc) { throw 'Runner has no PostgreSQL service.' }
+          Set-Service -Name $svc.Name -StartupType Manual
+          Start-Service -Name $svc.Name
+          # The image sets this account's password to 'root'. Changed to match the
+          # Linux leg so the job needs only one PGPASSWORD.
+          $env:PGPASSWORD = 'root'
+          & "$env:PGBIN\psql" -U postgres -h localhost `
+              -c "ALTER USER postgres PASSWORD 'postgres';"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not configure the test PostgreSQL role.' }
+          $env:PGPASSWORD = 'postgres'
+          & "$env:PGBIN\psql" -U postgres -h localhost -c "SELECT version();"
+          if ($LASTEXITCODE -ne 0) { throw 'Test PostgreSQL is not ready.' }
+
+      - name: Run the suite
+        env:
+          CLOUDLENS_PG_TEST: localhost
+          CLOUDLENS_PG_USER: postgres
+          PGPASSWORD: postgres
+          PGSSLMODE: disable
+        # Tests marked `azure` need credentials and a real subscription, so they are
+        # not run here. Everything else must pass, including the `network` tests --
+        # hosted runners have outbound internet, which is all those need.
+        #
+        # A fixed worker count, not `-n auto`. Each script test runs in a subprocess of
+        # its own, so `auto` would start one worker per core and each of those a child,
+        # oversubscribing the runner two to one; measured locally that turned a
+        # two-minute run into a stall.
+        run: pytest -n 4 -m "not azure" --durations=10
+
+  infrastructure:
+    name: Bicep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build the templates
+        # Catches a template that no longer compiles before somebody finds out
+        # halfway through a deployment.
+        run: |
+          az bicep install
+          az bicep build --file infra/main.bicep --stdout > /dev/null
+          echo "infra/main.bicep builds"
+      - name: Build the customer application package
+        shell: pwsh
+        run: ./tools/package.ps1 -Destination (Join-Path $env:GITHUB_WORKSPACE '.artifacts/cloudlens-app.zip')

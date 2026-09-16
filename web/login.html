@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="dark light" />
+  <meta name="theme-color" content="#1B1A19" />
+  <meta name="robots" content="noindex" />
+  <title>Sign in · CloudLens</title>
+
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/assets/app.css" />
+
+  <!-- Same pre-paint theme application as the app shell: signing in and landing on a
+       differently-themed page is a seam worth avoiding. -->
+  <script>
+    (function () {
+      try {
+        var saved = localStorage.getItem("costTheme");
+        document.documentElement.dataset.theme = ["light", "dark", "vivid", "paper"].indexOf(saved) >= 0
+          ? saved
+          : (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+      } catch (e) {
+        document.documentElement.dataset.theme = "dark";
+      }
+    })();
+  </script>
+</head>
+<body class="auth-body">
+  <div class="auth-split">
+
+    <!-- Left: what this is. An external visitor arrives with no idea what CloudLens is or why
+         it wants their Microsoft account, and a bare form answers neither question. -->
+    <aside class="auth-brand">
+      <div class="auth-brand-inner">
+        <div class="lockup">
+          <img src="/assets/logo.svg" width="52" height="52" alt="" />
+          <h1><span class="wm-1">Cloud</span><span class="wm-2">Lens</span></h1>
+          <p class="tagline">See. Analyze. Optimize.</p>
+        </div>
+
+        <p class="auth-pitch">Total clarity for your cloud spend.</p>
+
+        <ul class="auth-points">
+          <li>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10.5l4 4 8-9" /></svg>
+            <div>
+              <b>Your subscriptions, found for you</b>
+              Sign in and CloudLens asks Azure which subscriptions you hold. Nothing to
+              configure, nothing to paste.
+            </div>
+          </li>
+          <li>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10.5l4 4 8-9" /></svg>
+            <div>
+              <b>Where the money actually goes</b>
+              Cost by service, resource group, region and tag — with the anomalies and the
+              waste called out rather than left for you to spot.
+            </div>
+          </li>
+          <li>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10.5l4 4 8-9" /></svg>
+            <div>
+              <b>Your access, unchanged</b>
+              CloudLens reads Azure as you, so you see exactly what your own permissions
+              allow. Read-only, always.
+            </div>
+          </li>
+        </ul>
+      </div>
+    </aside>
+
+    <!-- Right: the one thing to do. -->
+    <main class="auth">
+      <button id="themeBtn" class="ghost icon-btn auth-theme"
+              title="Switch between light, dark, colourful and Kindle E-Ink"
+              aria-label="Switch theme">
+        <svg viewBox="0 0 20 20" width="15" height="15" aria-hidden="true" focusable="false">
+          <mask id="moonMask">
+            <rect width="100%" height="100%" fill="#fff" />
+            <circle class="bite" cx="17" cy="4" r="6" fill="#000" />
+          </mask>
+          <linearGradient id="vividGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#4C8DFF" />
+            <stop offset="50%" stop-color="#16A085" />
+            <stop offset="100%" stop-color="#FF6F91" />
+          </linearGradient>
+          <circle class="disc" cx="10" cy="10" r="4.6" fill="currentColor" mask="url(#moonMask)" />
+          <g class="rays" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+            <line x1="10" y1="1.5" x2="10" y2="3" /><line x1="10" y1="17" x2="10" y2="18.5" />
+            <line x1="1.5" y1="10" x2="3" y2="10" /><line x1="17" y1="10" x2="18.5" y2="10" />
+            <line x1="4" y1="4" x2="5" y2="5" /><line x1="15" y1="15" x2="16" y2="16" />
+            <line x1="16" y1="4" x2="15" y2="5" /><line x1="5" y1="15" x2="4" y2="16" />
+          </g>
+          <!-- Same page mark as the shell's toggle; shown only under [data-theme="paper"]. -->
+          <g class="page" fill="none" stroke="currentColor"
+             stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M5 3.5h6.5L15 7v9.5H5z" />
+            <path d="M11 3.5V7h4" />
+            <path d="M7.5 10.5h5M7.5 13h3" />
+          </g>
+        </svg>
+      </button>
+
+      <div class="auth-card">
+        <!-- The mark repeats here only on narrow screens, where the brand panel is gone. -->
+        <img class="auth-mark" src="/assets/logo.svg" width="44" height="44" alt="CloudLens" />
+
+        <h2>Sign in</h2>
+        <p class="muted" id="lede">Checking how this server signs people in…</p>
+
+        <!-- Everything below stays hidden until /api/auth/me says which of it applies. Showing
+             a form and then retracting it is worse than a moment of honest waiting. -->
+        <div class="auth-load" id="loading" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </div>
+
+        <div id="options" hidden>
+          <!-- Email first. The address is not a credential here — it decides which Microsoft
+               authority this person needs, which is a question they cannot answer themselves. -->
+          <form id="emailForm" autocomplete="on" hidden>
+            <label for="email">Email address</label>
+            <input id="email" name="email" type="email" inputmode="email" autocomplete="username"
+                   autocapitalize="none" spellcheck="false" placeholder="you@company.com"
+                   required />
+            <button type="submit" class="primary" id="continueBtn">Continue</button>
+          </form>
+
+          <a class="sso-btn" id="ssoBtn" href="/auth/login" hidden>
+            <svg viewBox="0 0 23 23" aria-hidden="true" width="17" height="17">
+              <path fill="#f25022" d="M1 1h10v10H1z"/><path fill="#7fba00" d="M12 1h10v10H12z"/>
+              <path fill="#00a4ef" d="M1 12h10v10H1z"/><path fill="#ffb900" d="M12 12h10v10H12z"/>
+            </svg>
+            <span id="ssoLabel">Sign in with Microsoft</span>
+          </a>
+
+          <div class="auth-or" id="authOr" hidden><span>or</span></div>
+
+          <p class="fineprint" id="localToggleWrap" hidden>
+            <button type="button" class="linklike" id="localToggle">Sign in with a local
+              account</button>
+          </p>
+
+          <form id="loginForm" autocomplete="on" hidden>
+            <label for="username">Email or username</label>
+            <input id="username" name="username" type="text" autocomplete="username"
+                   autocapitalize="none" spellcheck="false" />
+
+            <label for="password">Password</label>
+            <div class="auth-secret">
+              <input id="password" name="password" type="password"
+                     autocomplete="current-password" />
+              <button type="button" id="reveal" class="auth-reveal" aria-pressed="false"
+                      aria-label="Show password" title="Show password">Show</button>
+            </div>
+            <p class="auth-caps" id="caps" hidden>Caps Lock is on.</p>
+
+            <button type="submit" class="primary" id="submit">Sign in</button>
+          </form>
+        </div>
+
+        <!-- role=alert so the failure is announced, not just shown. -->
+        <p class="auth-error" id="error" role="alert" hidden></p>
+
+        <!-- Setup guidance, not a failure: shown while no delegated sign-in has yet worked
+             here, so whoever is deploying can approve the app before handing the URL out. -->
+        <div class="auth-setup" id="setup" hidden>
+          <b>Finishing setup?</b>
+          CloudLens reads Azure as each person who signs in, so it needs a one-time approval
+          from an administrator of this directory. Until then, sign-in will be refused.
+          <a href="/auth/admin-consent" id="consentLink">Approve CloudLens for this
+            directory</a>
+        </div>
+
+        <p class="fineprint auth-foot">
+          CloudLens reads your Azure cost data as you, and only the subscriptions your own
+          access allows. Read-only — it never changes a resource.
+        </p>
+      </div>
+    </main>
+  </div>
+
+  <script type="module">
+    const $ = (id) => document.getElementById(id);
+    const emailForm = $("emailForm");
+    const form = $("loginForm");
+    const errorBox = $("error");
+    const submit = $("submit");
+
+    // -- theme, same key and behaviour as the app shell
+    const THEMES = ["dark", "light", "vivid", "paper"];
+    $("themeBtn").addEventListener("click", () => {
+      const cur = THEMES.includes(document.documentElement.dataset.theme)
+        ? document.documentElement.dataset.theme
+        : "dark";
+      const next = THEMES[(THEMES.indexOf(cur) + 1) % THEMES.length];
+      document.documentElement.dataset.theme = next;
+      try { localStorage.setItem("costTheme", next); } catch { /* private mode */ }
+    });
+
+    // Where to land afterwards. Same rules as the server's safe_next(): a path on this site
+    // only. "//evil.example.com" and "/\evil.example.com" both start with a slash and are both
+    // read by the browser as another origin, which is exactly the trick this has to refuse.
+    const params = new URLSearchParams(location.search);
+    const requested = params.get("next") || "/";
+    const safe =
+      requested.startsWith("/") &&
+      !requested.startsWith("//") &&
+      !requested.startsWith("/\\") &&
+      !/^\/(api|auth|login)/.test(requested);
+    const next = safe ? requested : "/";
+
+    const fail = (message) => {
+      errorBox.textContent = message;
+      errorBox.classList.remove("auth-notice");
+      errorBox.hidden = false;
+    };
+
+    /** A failure body can be a string, or FastAPI's array of validation objects. */
+    const reason = (body, fallback) => {
+      const d = body && body.detail;
+      if (typeof d === "string" && d) return d;
+      if (Array.isArray(d) && d.length) return d.map((e) => e.msg || "Invalid input").join(". ");
+      return fallback;
+    };
+
+    const settled = () => {
+      $("loading").hidden = true;
+      $("options").hidden = false;
+    };
+
+    // Entra hands failures back through ?error=, e.g. when someone declines consent or the
+    // tenant requires an administrator to approve the app first.
+    if (params.get("error")) {
+      fail(params.get("error"));
+
+      // When the block is a consent policy, the remedy is a link an administrator opens once.
+      // It points at our own endpoint rather than carrying the Entra URL in the query string:
+      // a consent link is exactly the sort of thing worth phishing with, and a page that will
+      // render any URL handed to it is an open invitation to try.
+      if (params.get("consent") === "1") {
+        const help = document.createElement("p");
+        help.className = "fineprint";
+        help.append("Send this to an administrator of your directory: ");
+        const link = document.createElement("a");
+        link.href = "/auth/admin-consent";
+        link.textContent = "grant access for your organisation";
+        help.append(link);
+        help.append(". They approve it once, then everyone there can sign in.");
+        errorBox.insertAdjacentElement("afterend", help);
+      }
+    }
+
+    // A successful admin consent comes back with a notice rather than an error.
+    if (params.get("notice")) {
+      errorBox.textContent = params.get("notice");
+      errorBox.classList.add("auth-notice");
+      errorBox.hidden = false;
+    }
+
+    // Which sign-in this deployment uses is the server's decision, not a build-time constant.
+    // A slow or wedged server must still leave a usable page rather than an empty card, so the
+    // request is given a deadline and the local form is revealed if it isn't met.
+    try {
+      const me = await fetch("/api/auth/me", { signal: AbortSignal.timeout(8000) })
+        .then((r) => r.json());
+      if (me.authenticated) {
+        location.replace(next);
+      } else {
+        settled();
+        const sso = me.mode === "entra";
+        const tenantHref = me.home_tenant
+          ? `/auth/login?next=${encodeURIComponent(next)}` +
+            `&tenant=${encodeURIComponent(me.home_tenant)}`
+          : null;
+
+        // Shown before anyone is turned away rather than after. The reactive path still exists
+        // for a deployment where this notice was missed, but a fresh install should not need
+        // its first user to hit a refusal in order to discover the step that was left out.
+        // Suppressed when an error is already on screen: that path offers the same link with
+        // more specific wording, and two consent links would read as two different problems.
+        if (me.consent_needed && !params.get("error")) $("setup").hidden = false;
+
+        if (sso) {
+          const btn = $("ssoBtn");
+
+          // Where a deployment serves one directory, the general work-account button sends
+          // everyone else into their own tenant's consent policy and ends at "ask your
+          // administrator" — which reads as a broken app rather than a door that was never
+          // open. Hiding it promotes the tenant sign-in to the primary button instead of
+          // leaving the page with no way in.
+          const hideWork = me.hide_work_signin && tenantHref;
+
+          btn.href = hideWork ? tenantHref : `/auth/login?next=${encodeURIComponent(next)}`;
+          btn.hidden = false;
+
+          if (me.email_first && !hideWork) {
+            // Both destinations exist, so the address is worth asking for: it picks the
+            // authority, which is the one thing the visitor cannot work out for themselves.
+            // The Microsoft button stays, demoted, for anyone who would rather use the picker.
+            emailForm.hidden = false;
+            $("lede").textContent =
+              "Enter your email and we'll take you to Microsoft. You'll see the Azure " +
+              "subscriptions your own access allows — nothing more.";
+            $("ssoLabel").textContent = "Continue with Microsoft instead";
+            btn.classList.add("sso-btn-alt");
+            $("email").focus();
+          } else {
+            $("lede").textContent = hideWork
+              ? "Sign in with your Microsoft account. You'll see the subscriptions your own " +
+                "Azure access allows — nothing more."
+              : "Sign in with your work account. You'll see the subscriptions your own Azure " +
+                "access allows — nothing more.";
+            btn.focus();
+
+            // Azure Resource Manager is an Entra-only resource, so the multi-tenant endpoints
+            // refuse a personal Microsoft account outright — even though such accounts commonly
+            // own Visual Studio and pay-as-you-go subscriptions. A tenant sign-in does admit
+            // them, so offer it rather than leaving them at "use your work or school account".
+            //
+            // Only needed when the address was not asked for: when it was, that question is
+            // already answered and a second link would only reopen it.
+            if (tenantHref && !hideWork) {
+              const alt = document.createElement("p");
+              alt.className = "fineprint";
+              const link = document.createElement("a");
+              link.href = tenantHref;
+              link.textContent = "Sign in with a personal Microsoft account";
+              alt.append(link);
+              alt.append(" — for Visual Studio or pay-as-you-go subscriptions.");
+              btn.insertAdjacentElement("afterend", alt);
+            }
+          }
+        }
+
+        if (me.local) {
+          form.username.required = true;
+          form.password.required = true;
+          if (sso) {
+            // Secondary to Microsoft, because a local account cannot reach Azure at all: it has
+            // no identity to ask ARM with, so it can never discover anyone's subscriptions.
+            // Offering it as an equal would send people down the path that cannot do the job.
+            $("authOr").hidden = false;
+            $("localToggleWrap").hidden = false;
+          } else {
+            form.hidden = false;
+            $("lede").textContent = "Sign in to ask about your Azure spend.";
+            form.username.focus();
+          }
+        }
+        if (!sso && !me.local) fail("No sign-in method is configured on the server.");
+      }
+    } catch {
+      // Unknown server state: offer both routes rather than none, so a person is never left
+      // looking at a card with no way to sign in.
+      settled();
+      form.hidden = false;
+      form.username.required = true;
+      form.password.required = true;
+      $("ssoBtn").hidden = false;
+      $("authOr").hidden = false;
+      fail("Could not check how this server signs people in. Try again, or use a local account.");
+    }
+
+    // -- email first: no request of ours, just a better-aimed trip to Microsoft
+    emailForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const email = $("email").value.trim();
+      if (!email) return;
+      $("continueBtn").disabled = true;
+      $("continueBtn").textContent = "Taking you to Microsoft…";
+      location.assign(`/auth/login?next=${encodeURIComponent(next)}` +
+                      `&email=${encodeURIComponent(email)}`);
+    });
+
+    // -- local account, revealed on request
+    $("localToggle").addEventListener("click", () => {
+      form.hidden = false;
+      $("localToggleWrap").hidden = true;
+      form.username.focus();
+    });
+
+    // -- password affordances
+    const password = $("password");
+    const reveal = $("reveal");
+    reveal.addEventListener("click", () => {
+      const shown = password.type === "text";
+      password.type = shown ? "password" : "text";
+      reveal.textContent = shown ? "Show" : "Hide";
+      reveal.setAttribute("aria-pressed", String(!shown));
+      reveal.setAttribute("aria-label", shown ? "Show password" : "Hide password");
+      password.focus();
+    });
+
+    // Caps Lock silently turning a correct password into a wrong one is the single most common
+    // cause of a sign-in failure that looks like a bug.
+    const caps = (event) => {
+      if (typeof event.getModifierState !== "function") return;
+      $("caps").hidden = !event.getModifierState("CapsLock");
+    };
+    password.addEventListener("keydown", caps);
+    password.addEventListener("keyup", caps);
+    password.addEventListener("blur", () => { $("caps").hidden = true; });
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      errorBox.hidden = true;
+      submit.disabled = true;
+      submit.textContent = "Signing in…";
+      try {
+        const res = await fetch("/api/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            username: form.username.value.trim(),
+            password: form.password.value,
+          }),
+        });
+        if (res.ok) {
+          location.replace(next);
+          return;
+        }
+        const body = await res.json().catch(() => ({}));
+        fail(reason(body, `Sign-in failed (${res.status}).`));
+      } catch (err) {
+        fail("Could not reach the server. Is it still running?");
+      } finally {
+        submit.disabled = false;
+        submit.textContent = "Sign in";
+        form.password.value = "";
+        form.password.focus();
+      }
+    });
+  </script>
+</body>
+</html>

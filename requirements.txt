@@ -1,0 +1,22 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.9.0
+httpx>=0.27.0
+azure-identity>=1.19.0
+# azure.identity.aio's async credentials (used for the app's own token when ARM calls are not
+# delegated to the signed-in person -- see app/cost.py's Azure._bearer) need an async transport,
+# and azure-core only picks one up if it is installed: without this, DefaultAzureCredential in
+# the aio namespace fails at call time with "aiohttp package is not installed", not at import.
+aiohttp>=3.9.0
+# The chat agent, which the application will not start without. Declared explicitly because
+# `app/agent.py` imports it directly: it used to arrive only as a dependency of
+# azure-ai-projects, so removing that package -- or a release of it dropping the dependency --
+# would have broken startup with an ImportError nothing in this file explained.
+openai>=1.54.0
+python-dotenv>=1.0.1
+psycopg[binary]>=3.2.0
+# Parquet. Azure writes FOCUS exports as Parquet and the archive is Parquet, and PostgreSQL
+# can neither read nor write it -- so the format is handled here rather than by the database.
+pyarrow>=17.0.0
+openpyxl>=3.1.0
+python-pptx>=1.0.0

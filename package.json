@@ -1,0 +1,21 @@
+{
+  "name": "cloudlens-frontend-tooling",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Browser-side test tooling for CloudLens. The application is Python; this file exists so the Playwright suites and the accessibility audit have somewhere to declare their dependencies.",
+  "//type": "web/assets holds ES modules. Declaring commonjs here -- which `npm init` does by default -- made Node treat every .js in the repository as CommonJS, and the frontend tests that import them with `node --input-type=module` stopped resolving their named exports. 98 of them failed on that alone.",
+  "type": "module",
+  "scripts": {
+    "test:browser": "node tests/run_browser_suites.mjs",
+    "audit:a11y": "node tests/audit_a11y.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/samy6352/CloudLens.git"
+  },
+  "license": "ISC",
+  "devDependencies": {
+    "axe-core": "^4.13.0",
+    "playwright": "^1.63.0"
+  }
+}

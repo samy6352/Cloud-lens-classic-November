@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="dark light" />
+  <meta name="theme-color" content="#111315" />
+  <meta name="description" content="CloudLens — see, analyze, optimize. Total clarity for your cloud spend: Azure cost and waste, broken down by area, with an agent alongside." />
+  <title>CloudLens</title>
+
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/assets/app.css" />
+
+  <!-- Theme is applied before the stylesheet paints. Deferring this to app.js would show a
+       dark frame to someone who chose light, which is the one bug people always notice. Small
+       enough to inline; a separate file would be another blocking request.
+
+       The rail's collapsed state rides along for the same reason: applied after paint it would
+       show a full-width rail that snaps narrow, and the board would reflow under the reader. -->
+  <script>
+    (function () {
+      try {
+        var saved = localStorage.getItem("costTheme");
+        // A list rather than a chain of comparisons: this is the third place a theme has to be
+        // named, and the other two are arrays too (THEMES in app.js, the token blocks in
+        // app.css). Keep them in step.
+        var theme = ["light", "dark", "vivid", "paper"].indexOf(saved) >= 0
+          ? saved
+          : (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+        document.documentElement.dataset.theme = theme;
+      } catch (e) {
+        document.documentElement.dataset.theme = "dark";
+      }
+      try {
+        // Set on <html>: <body> does not exist yet, and dashboard.js mirrors the class onto
+        // body once it does, which is what the rest of the code and the stylesheet key off.
+        if (JSON.parse(localStorage.getItem("railMini")) === true) {
+          document.documentElement.classList.add("rail-mini");
+        }
+      } catch (e) { /* no stored preference — full width, which is the default */ }
+      // The two chrome rows between the summary and the board -- the filter/freshness row and
+      // the view actions row -- are empty until their controls are built, and both collapse to
+      // nothing while they are. When they fill, they take 87px and push the whole board down:
+      // measured, that single move was 0.145 of a 0.158 CLS. This class reserves their space
+      // from the first paint; reportReadiness() drops it once the board has rendered once.
+      document.documentElement.classList.add("cl-booting");
+    })();
+  </script>
+
+  <!-- Vendored, not CDN: no third-party round trips, works offline, no supply-chain risk.
+       Chart.js (201 KB) and the markdown pair (57 KB) are both fetched on demand — this is a
+       dashboard first, and a session that never asks a question should never pay for them. -->
+  <script src="/assets/dashboard.js" type="module"></script>
+
+  <!-- These modules are reached by static `import` from dashboard.js, so every session fetches
+       all of them before anything renders. Without this the browser can only discover them by
+       parsing what it has already downloaded, adding serial discovery round trips.
+       On a local server that is 120ms nobody notices;
+       on a connection with a 200ms round trip it is most of a second of an empty screen, for
+       bytes that were always going to be fetched.
+
+       Static imports only. The tab modules below them are deliberately loaded on demand and
+       warmed on intent, and listing one here would undo that. tests/test_module_preload.py reads
+       the import graph and fails if this list drifts from it. -->
+  <link rel="modulepreload" href="/assets/analysis.js" />
+  <link rel="modulepreload" href="/assets/app.js" />
+  <link rel="modulepreload" href="/assets/bot.js" />
+  <link rel="modulepreload" href="/assets/budget-chart.js" />
+  <link rel="modulepreload" href="/assets/cost-totals.js" />
+  <link rel="modulepreload" href="/assets/dashboard-currencies.js" />
+  <link rel="modulepreload" href="/assets/dashboard-drilldowns.js" />
+  <link rel="modulepreload" href="/assets/dashboard-explore.js" />
+  <link rel="modulepreload" href="/assets/dashboard-freshness.js" />
+  <link rel="modulepreload" href="/assets/dashboard-module-loader.js" />
+  <link rel="modulepreload" href="/assets/dashboard-navigation.js" />
+  <link rel="modulepreload" href="/assets/dashboard-performance.js" />
+  <link rel="modulepreload" href="/assets/dashboard-savings-scan.js" />
+  <link rel="modulepreload" href="/assets/dashboard-search.js" />
+  <link rel="modulepreload" href="/assets/dashboard-state.js" />
+  <link rel="modulepreload" href="/assets/dashboard-table-model.js" />
+  <link rel="modulepreload" href="/assets/filters.js" />
+  <link rel="modulepreload" href="/assets/icons.js" />
+  <link rel="modulepreload" href="/assets/overview-status.js" />
+  <link rel="modulepreload" href="/assets/reporting-period.js" />
+  <link rel="modulepreload" href="/assets/tooltips.js" />
+</head>
+<body>
+  <!-- Keyboard users otherwise tab through the whole header and a twenty-item rail before
+       reaching the numbers they came for. Visible only when focused. -->
+  <a class="skip-link" href="#tabBody">Skip to content</a>
+  <header class="bar">
+    <div class="brand" id="brand" role="button" tabindex="0" aria-label="CloudLens — go to Overview">
+      <!-- Who runs this, then what it is. Separated by a rule so the two marks read as two
+           statements rather than one compound logo. -->
+      <img class="ms-mark" src="/assets/microsoft.svg" width="18" height="18"
+           alt="Microsoft" />
+      <span class="brand-rule" aria-hidden="true"></span>
+      <span class="dot" id="dot" role="img" aria-label="Service status"></span>
+      <img class="mark" src="/assets/logo.svg" width="22" height="22" alt="" />
+      <div class="brand-wordmark">
+        <h1><span class="wm-1">Cloud</span><span class="wm-2">Lens</span></h1>
+        <span class="brand-caption">Cost intelligence</span>
+      </div>
+    </div>
+
+    <div class="reporting-controls" aria-label="Cost reporting period">
+      <div class="reporting-period">
+        <button type="button" class="tab-search-btn" id="tabSearchBtn" disabled
+          aria-label="Search tabs" aria-haspopup="dialog" aria-expanded="false"
+          aria-controls="tabSearchDialog" title="Search tabs">
+          <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true" focusable="false">
+            <circle cx="8.5" cy="8.5" r="5.5" fill="none" stroke="currentColor" stroke-width="1.5"/>
+            <path d="m12.5 12.5 4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <div class="period" id="period" role="group" aria-label="Rolling reporting period">
+          <button type="button" data-days="7" aria-pressed="false">7d</button>
+          <button type="button" data-days="30" class="on" aria-pressed="true">30d</button>
+          <button type="button" data-days="60" aria-pressed="false">60d</button>
+          <button type="button" data-days="90" aria-pressed="false">90d</button>
+        </div>
+      </div>
+      <div class="reporting-month">
+        <label for="reportingMonth">Month</label>
+        <button type="button" id="reportingRange" class="reporting-range" hidden
+                aria-describedby="periodRange">Last 30 days</button>
+        <input type="month" id="reportingMonth" aria-label="Calendar month"
+               aria-describedby="periodRange" />
+      </div>
+      <span id="periodRange" class="reporting-caption" role="status">Loading reporting dates...</span>
+    </div>
+    <div class="bar-right">
+      <!-- Display currency. A view, never storage: the warehouse keeps what Azure billed, so a
+           converted figure can always be traced back to the invoice. -->
+      <select id="currency" class="currency" aria-label="Display currency" hidden
+              data-pending></select>
+
+      <div class="picker" id="picker">
+        <button class="picker-btn" id="pickerBtn" aria-haspopup="listbox"
+                aria-expanded="false" aria-controls="pickerMenu">
+          <span id="pickerLabel">Subscriptions</span>
+          <span class="caret" aria-hidden="true">▾</span>
+        </button>
+        <div class="picker-menu" id="pickerMenu" role="listbox" aria-multiselectable="true"
+             aria-label="Subscriptions to analyse" hidden>
+          <div class="picker-head">
+            <span>Analyse</span>
+            <button class="link" id="pickAll">Select all</button>
+          </div>
+          <div id="pickerList"></div>
+        </div>
+      </div>
+
+      <div class="menu-wrap" id="exportWrap">
+        <button class="ghost" id="exportBtn" aria-haspopup="menu" aria-expanded="false"
+                aria-controls="exportMenu" title="Download this report">Export</button>
+        <div class="drop" id="exportMenu" role="menu" hidden>
+          <div class="head">Download report</div>
+          <a data-fmt="xlsx" role="menuitem" href="/api/report/xlsx">Excel workbook
+            <span class="sub">Every area on its own sheet, with charts</span></a>
+          <a data-fmt="pptx" role="menuitem" href="/api/report/pptx">PowerPoint deck
+            <span class="sub">Editable charts, one slide per area</span></a>
+          <a data-fmt="csv" role="menuitem" href="/api/report/csv">CSV
+            <span class="sub">One flat table, opens anywhere</span></a>
+          <hr />
+          <a data-raw="csv" role="menuitem" href="/api/costs/raw.csv">Raw cost rows
+            <span class="sub">Every charge, for the subscriptions you selected</span></a>
+          <hr />
+          <button data-fmt="print" role="menuitem">Print or save as PDF
+            <span class="sub">Uses your browser's print dialog</span></button>
+          <button data-fmt="custom" role="menuitem">Choose what to include…
+            <span class="sub">Opens the Export data tab</span></button>
+        </div>
+      </div>
+
+      <div class="refresh" id="refresh" hidden data-pending>
+        <button class="ghost" id="refreshBtn" aria-haspopup="menu" aria-expanded="false"
+                aria-controls="refreshMenu" title="Load newer cost data">
+          <span id="refreshLabel">Refresh data</span>
+        </button>
+        <div class="refresh-menu" id="refreshMenu" role="menu" hidden></div>
+      </div>
+
+      <button id="themeBtn" class="ghost icon-btn"
+              title="Switch between light, dark, colourful and Kindle E-Ink"
+              aria-label="Switch theme">
+        <svg viewBox="0 0 20 20" width="15" height="15" aria-hidden="true" focusable="false">
+          <!-- Sun and moon in one glyph: the moon is the sun's disc with a bite taken out,
+               animated by moving the mask circle rather than swapping icons. Colourful reuses
+               the sun's own shape and repaints it with this same gradient via CSS — see
+               [data-theme="vivid"] .icon-btn in app.css — so the toggle previews the theme
+               it switches to rather than needing a fourth pose. -->
+          <mask id="moonMask">
+            <rect width="100%" height="100%" fill="#fff" />
+            <circle class="bite" cx="17" cy="4" r="6" fill="#000" />
+          </mask>
+          <linearGradient id="vividGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#4C8DFF" />
+            <stop offset="50%" stop-color="#16A085" />
+            <stop offset="100%" stop-color="#FF6F91" />
+          </linearGradient>
+          <circle class="disc" cx="10" cy="10" r="4.6" fill="currentColor" mask="url(#moonMask)" />
+          <g class="rays" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+            <line x1="10" y1="1.5" x2="10" y2="3" /><line x1="10" y1="17" x2="10" y2="18.5" />
+            <line x1="1.5" y1="10" x2="3" y2="10" /><line x1="17" y1="10" x2="18.5" y2="10" />
+            <line x1="4" y1="4" x2="5" y2="5" /><line x1="15" y1="15" x2="16" y2="16" />
+            <line x1="16" y1="4" x2="15" y2="5" /><line x1="5" y1="15" x2="4" y2="16" />
+          </g>
+          <!-- Kindle E-Ink previews as a page rather than a light source: the sun and the moon
+               are one glyph in two poses, and neither says anything about paper. Hidden until
+               [data-theme="paper"] asks for it — see the end of app.css. -->
+          <g class="page" fill="none" stroke="currentColor"
+             stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M5 3.5h6.5L15 7v9.5H5z" />
+            <path d="M11 3.5V7h4" />
+            <path d="M7.5 10.5h5M7.5 13h3" />
+          </g>
+        </svg>
+      </button>
+
+      <button id="askToggle" class="ghost ask-toggle" aria-expanded="true"
+              aria-controls="side" hidden>Ask</button>
+    </div>
+  </header>
+
+  <dialog class="tab-search-dialog" id="tabSearchDialog" aria-labelledby="tabSearchTitle">
+    <div class="tab-search-head">
+      <h2 id="tabSearchTitle">Jump to a tab</h2>
+      <button type="button" class="ghost" id="tabSearchClose" aria-label="Close tab search">Esc</button>
+    </div>
+    <input type="search" id="tabSearchInput" placeholder="Search tabs..."
+      aria-label="Search available tabs" role="combobox" aria-autocomplete="list"
+      aria-expanded="false" aria-controls="tabSearchResults" maxlength="80" autocomplete="off">
+    <div class="tab-search-meta">
+      <span id="tabSearchStatus" role="status" aria-live="polite"></span>
+      <button type="button" class="linkish" id="tabSearchClear" hidden>Clear recent</button>
+    </div>
+    <div class="tab-search-results" id="tabSearchResults" role="listbox" aria-label="Tabs"></div>
+    <p class="tab-search-hint">Arrow keys to move · Enter to open · Esc to close</p>
+  </dialog>
+
+  <!-- Onboarding replaces the shell, so it must remain outside the shell it hides. -->
+  <div id="firstRun" hidden></div>
+  <!-- `class` and `data-state` are what mountBot() sets, declared here rather than left to it.
+       Without them the button paints in normal flow at the top of the document and only jumps
+       to its fixed corner once the module loads — an 872px move of the button plus a reflow of
+       the shell behind it, which was on its own 94% of the page's cumulative layout shift
+       (0.91 of 0.97). mountBot still sets both, so this is a starting position, not a fork. -->
+  <button id="chatFab" class="bot" data-state="idle" type="button"
+          aria-controls="side" aria-expanded="false"></button>
+
+  <div class="shell" id="shell">
+    <aside class="sidebar" aria-label="Navigation and account">
+      <nav class="rail" id="tabs" role="tablist" aria-label="Main sections" aria-orientation="vertical">
+        <!-- Built from /api/dashboard/sections. -->
+      </nav>
+      <footer class="sidebar-account" id="sidebarAccount">
+        <details class="who account-profile" id="who" aria-label="Signed-in account" hidden>
+          <summary class="account-trigger" id="accountTrigger" aria-label="Account options">
+            <span class="account-avatar" id="whoAvatar" aria-hidden="true"></span>
+            <span class="account-identity">
+              <span class="name" id="whoName"></span>
+              <span class="account-status">Signed in</span>
+            </span>
+            <img class="account-illustration" src="/assets/account-illustration.png" width="36" height="36" alt="" />
+            <svg class="account-chevron" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+              <path d="m5 8 5 5 5-5" fill="none" stroke="currentColor" stroke-width="1.6"
+                    stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </summary>
+          <div class="account-popover">
+            <div class="account-meta">
+              <span class="tag" id="whoAdmin" hidden>admin</span>
+              <span class="account-email" id="whoEmail"></span>
+            </div>
+            <button type="button" class="ghost account-signout" id="signout" aria-label="Sign out">
+              <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true" focusable="false">
+                <path d="M8 3H4v14h4m4-11 4 4-4 4m-5-4h9" fill="none" stroke="currentColor" stroke-width="1.5"
+                      stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <span>Sign out</span>
+            </button>
+          </div>
+        </details>
+      </footer>
+    </aside>
+
+    <main class="board">
+      <div class="board-summary">
+        <!-- Refresh progress. A strip rather than a spinner on the button: a refresh takes minutes,
+             and a control that only looks busy is what makes someone press it again, or give up and
+             reload the page mid-ingest. Sits under the header so it is visible from every tab. -->
+        <div class="ingest" id="ingest" hidden role="status" aria-live="polite">
+          <div class="ingest-bar"><span class="ingest-fill" id="ingestFill"></span></div>
+          <div class="ingest-row">
+            <span class="ingest-what" id="ingestWhat">Starting…</span>
+            <span class="ingest-meta">
+              <span id="ingestPct">0%</span>
+              <span class="ingest-sep">·</span>
+              <span id="ingestElapsed">0:00</span>
+            </span>
+          </div>
+          <p class="ingest-note" id="ingestNote">This runs on Azure and takes a few minutes. You can
+            keep using the dashboard — the numbers update on their own when it finishes.</p>
+        </div>
+
+        <!-- The estate at a glance: six figures, each with the comparison that makes it mean
+             something. A number with no baseline is trivia — "$130" answers nothing until you know
+             it is three days into a month that is running below the last one. -->
+        <div class="glance" id="glance" aria-label="Cost summary">
+          <button type="button" class="tile loading"><span class="k">Month to date</span><span class="v">—</span></button>
+          <button type="button" class="tile loading"><span class="k">Last month</span><span class="v">—</span></button>
+          <button type="button" class="tile loading"><span class="k">Forecast 30d</span><span class="v">—</span></button>
+          <button type="button" class="tile loading"><span class="k">Month on month</span><span class="v">—</span></button>
+          <button type="button" class="tile loading"><span class="k">Budget</span><span class="v">—</span></button>
+          <button type="button" class="tile loading"><span class="k">Savings found</span><span class="v">—</span></button>
+        </div>
+        <div id="headerFreshness" class="snapshot-status" role="status" hidden></div>
+
+        <!-- Subscriptions this person can see that the warehouse has not loaded yet. Empty and
+             still-loading look identical on a dashboard, and only one of them is a fact about
+             their spend, so the difference is stated here rather than left to be inferred. -->
+        <div id="backfill" hidden></div>
+
+        <!-- Filters stay left; contextual actions sit immediately before local data on the right. -->
+        <div class="statusrow" id="statusRow">
+          <div class="filterbar" id="filterBar" hidden>
+            <span class="fb-label">Filter</span>
+            <div class="fb-slots" id="fbSlots"></div>
+            <button type="button" class="fb-clear" id="fbClear" hidden>Clear all</button>
+            <span id="fbStatus" class="muted" role="status"></span>
+          </div>
+          <div class="status-meta">
+            <div class="view-controls" id="statusActions" aria-label="Actions for the current view"></div>
+            <div class="datastate" id="dataState" hidden></div>
+          </div>
+        </div>
+
+        <div class="view-actions" id="viewActions" aria-label="Explore the current view"></div>
+        <div id="viewFreshness" class="snapshot-status" role="status" hidden></div>
+      </div>
+      <div class="board-body" id="tabBody" role="tabpanel" tabindex="-1">
+        <p class="board-loading">Loading…</p>
+      </div>
+
+      <!-- The analysis covers the board rather than replacing it: closing returns you to the
+           tab you were reading, at the position you were at. -->
+      <section class="analysis-view" id="analysisView" tabindex="-1" hidden
+               aria-label="AI analysis">
+        <header class="an-head">
+          <div class="an-head-id">
+            <span class="an-head-mark" aria-hidden="true">
+              <svg viewBox="0 0 24 24" focusable="false">
+                <path d="M5 18v-5m7 5V7m7 11v-7M17 3v4m-2-2h4" fill="none"
+                      stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+              </svg>
+            </span>
+            <div>
+              <h2>AI Analysis</h2>
+              <p>Expand a recommendation to see the details</p>
+            </div>
+          </div>
+          <button class="ghost icon" id="analysisClose" title="Close the analysis"
+                  aria-label="Close the analysis">
+            <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+              <path d="m6 6 8 8m0-8-8 8" fill="none" stroke="currentColor"
+                    stroke-width="1.5" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </header>
+        <div class="an-scroll" id="analysisBody">
+          <div class="an-empty">
+            <h3>Ready when you are</h3>
+            <p>Reads spend, idle resources, utilisation, anomalies, commitments, budgets and
+              tags, then reports what is worth acting on — with the reasoning behind each one.</p>
+            <button class="primary" id="runAnalysis">Analyse this estate</button>
+            <p class="an-note">Around half a minute. Each recommendation includes its source,
+              assumptions and supporting evidence.</p>
+          </div>
+        </div>
+
+        <!-- The conversation takes the whole panel while it is running. An answer with a table
+             in it needs the room, and the findings are one click away rather than gone. The
+             chat element itself is moved in here from the side panel rather than duplicated,
+             so there is one renderer and one transcript however you got to it. -->
+        <div class="an-conversation" id="anConversation" hidden>
+          <div class="an-conv-head">
+            <button type="button" class="an-back" id="anBack">
+              <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+                <path d="M10 4L6 8l4 4" fill="none" stroke="currentColor" stroke-width="1.6"
+                      stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              Findings
+            </button>
+            <span class="an-conv-title">Answering from your analysis</span>
+          </div>
+        </div>
+
+        <!-- The follow-up. Pinned to the foot of the analysis rather than left in the side
+             panel: someone who has just read that two VMs are idle should be able to ask which
+             ones without going to find the chat first. -->
+        <footer class="an-ask-bar">
+          <div class="an-ask-inner">
+            <div class="an-suggest" id="anSuggest" role="group"
+                 aria-label="Suggested questions"></div>
+            <form id="anAskForm">
+              <svg class="an-composer-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M7 18 3 21V6a3 3 0 0 1 3-3h12a3 3 0 0 1 3 3v9a3 3 0 0 1-3 3H7Zm0-9h10M7 13h6"
+                      fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <label class="sr-only" for="anAsk">Ask about your costs</label>
+              <input id="anAsk" type="text" autocomplete="off"
+                     placeholder="Ask about these recommendations…" />
+              <button type="submit" class="primary" id="anAskSend">Ask
+                <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+                  <path d="M4 10h12m-5-5 5 5-5 5" fill="none" stroke="currentColor"
+                        stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </button>
+            </form>
+          </div>
+        </footer>
+      </section>
+    </main>
+
+    <aside class="side" id="side" aria-label="Ask about your costs">
+      <div class="side-head">
+        <h2>Ask about your costs</h2>
+        <div class="side-actions">
+          <button id="reset" class="ghost" title="Start a new conversation">New</button>
+          <button id="sideClose" class="ghost icon" title="Hide the panel"
+                  aria-label="Hide the panel">✕</button>
+        </div>
+      </div>
+
+      <div class="chat-shell">
+        <div id="chat" tabindex="-1">
+          <section class="intro">
+            <p class="muted" id="introScope">Covers every subscription your signed-in account can see. Read-only.</p>
+            <div class="chips">
+              <button class="chip">What am I wasting money on?</button>
+              <button class="chip">Why has my bill changed?</button>
+              <button class="chip">Chart the top 10 services by cost</button>
+              <button class="chip">Are any of my VMs idle?</button>
+            </div>
+          </section>
+        </div>
+        <button class="jump" id="jump" hidden>Jump to latest ↓</button>
+      </div>
+
+      <footer class="composer">
+        <form id="form">
+          <label class="sr-only" for="q">Ask about your Azure costs</label>
+          <textarea id="q" rows="1" placeholder="Ask about your Azure costs…" autocomplete="off"
+                    enterkeyhint="send"></textarea>
+          <button type="submit" id="send" class="primary">Ask</button>
+          <button type="button" id="stop" class="ghost" hidden>Stop</button>
+        </form>
+      </footer>
+    </aside>
+  </div>
+
+  <footer class="onboarding-account" id="onboardingAccount" hidden></footer>
+
+  <!-- Streaming answers are announced here rather than on every token, which would flood a
+       screen reader. app.js posts one concise update per meaningful step. -->
+  <p class="sr-only" id="live" role="status" aria-live="polite"></p>
+</body>
+</html>
