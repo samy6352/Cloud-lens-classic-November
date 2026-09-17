@@ -60,6 +60,12 @@ def test_shutdown_monthly_estimate_is_scaled_to_combined_window(fx, days):
 @pytest.fixture
 def mixed_costs(monkeypatch):
     class Reader:
+        # `named` is the relation per-resource money is read from -- the presence
+        # table in production, `costs` when a converted currency puts that money
+        # out of reach. This double answers from a fixed list either way, so the
+        # name only has to exist for the SQL to be well formed.
+        named = "costs"
+
         def rows(self, sql, limit=None):
             return [{"rid": rid("vm").lower(), "cost": 100, "currency": "USD"},
                     {"rid": rid("vm").lower(), "cost": 8000, "currency": "INR"}]

@@ -355,11 +355,20 @@ def _costs_for(resource_ids: list[str], days: int, *,
     identifiers = ", ".join("'" + rid.replace("'", "''") + "'" for rid in sorted(wanted))
     try:
         with warehouse.reader() as reader:
+            # Per-resource billed money is exactly what the presence table carries, so
+            # `Reader.named` answers this from 2.8M narrow rows rather than 5.8M wide
+            # ones. `named` rather than the table by name because under a converted
+            # currency that money cannot be converted, and `named` is `costs` there.
+            #
+            # `lower(trim(...))` still has to be applied here rather than relied upon:
+            # the presence grain keeps `ResourceId` as the export spelled it, and the
+            # export spells it inconsistently, so two casings are two presence rows
+            # whose costs must still be added together.
             rows = reader.rows(
                 'SELECT lower(trim("ResourceId")) AS rid, '
                 'coalesce(nullif(upper(trim("BillingCurrency")), \'\'), \'unknown\') AS currency, '
                 'sum("BilledCost") AS cost '
-                f"FROM costs WHERE \"ChargePeriodStart\" >= DATE '{since}' "
+                f"FROM {reader.named} WHERE \"ChargePeriodStart\" >= DATE '{since}' "
                 f'AND lower(trim("ResourceId")) IN ({identifiers}) GROUP BY 1,2', None)
     except Exception as exc:  # noqa: BLE001 - waste findings are still useful without cost
         log.warning("cost join failed: %s", exc)

@@ -309,6 +309,10 @@ def test_cost_lookup_pushes_ids_into_sql(monkeypatch):
     seen = []
 
     class Reader:
+        # The relation per-resource money is read from. Present because `_costs_for`
+        # names it; the double answers from a fixed list regardless.
+        named = "costs"
+
         def rows(self, sql, limit=None):
             seen.append(sql)
             assert limit is None

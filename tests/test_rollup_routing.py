@@ -361,6 +361,71 @@ def test_a_scoped_anomaly_tab_is_the_same_either_way(loaded, monkeypatch):
                              dimensions=("ServiceName",)))
 
 
+# ------------------------------------------------- per-resource money (waste)
+
+def _costs_for(warehouse, monkeypatch, ids, days=3650):
+    import app.warehouse as wh_mod
+    import app.waste as waste
+
+    monkeypatch.setattr(wh_mod, "warehouse", warehouse)
+    return waste._costs_for(ids, days, allow_mixed=True)
+
+
+def _every_resource_id(warehouse) -> list[str]:
+    with warehouse.reader() as r:
+        return [row["id"] for row in r.rows(
+            'SELECT DISTINCT "ResourceId" AS id FROM costs '
+            'WHERE "ResourceId" IS NOT NULL', None)]
+
+
+def test_per_resource_money_is_the_same_either_way(loaded, monkeypatch):
+    """`waste._costs_for` backs rightsizing, recommendations and the waste tab.
+
+    It was reading the detail table for money the presence table already holds,
+    at 27.0s of rightsizing's 28.4s and 84.0s of recommendations' 87.4s. Routing
+    it is only legitimate if every resource's money is unchanged, so this compares
+    every resource rather than a sample.
+    """
+    ids = _every_resource_id(loaded)
+    assert ids, "fixture must have resources, or this test proves nothing"
+    routed = _costs_for(loaded, monkeypatch, ids)
+    assert routed, "routed read returned nothing -- the query failed and was swallowed"
+    _on_the_detail_table(monkeypatch, loaded)
+    _same(routed, _costs_for(loaded, monkeypatch, ids))
+
+
+def test_per_resource_money_adds_up_casings_of_one_id(loaded, monkeypatch):
+    """The presence grain keeps `ResourceId` as the export spelled it.
+
+    The export spells it inconsistently -- both `resourceGroups` and
+    `resourcegroups` appear -- so one resource can be several presence rows.
+    `lower(trim(...))` has to stay in the query to add them back together, and
+    the fixture's ids are uniformly cased, so this inserts the awkward case
+    rather than assuming it is already there.
+    """
+    import uuid as _uuid
+
+    from app.warehouse import COLUMNS, NUMERIC, insert_rows
+
+    one = "/subscriptions/x/resourceGroups/rg-cased/res-1"
+    rows = []
+    for spelling, cost in ((one, 10.0), (one.lower(), 20.0), (one.upper(), 40.0)):
+        values = {
+            "SubAccountId": str(_uuid.UUID(int=0)), "SubAccountName": "sub-0",
+            "ChargePeriodStart": "2026-02-10", "BilledCost": cost, "CostInUsd": cost,
+            "BillingCurrency": "USD", "ServiceName": "Virtual Machines",
+            "ServiceFamily": "Compute", "RegionName": "eastus",
+            "ResourceGroup": "rg-cased", "ResourceId": spelling,
+        }
+        rows.append([values.get(c, 0.0 if c in NUMERIC else None) for c in COLUMNS])
+    with loaded.connect() as con:
+        insert_rows(con, rows)
+    loaded.refresh_rollup()
+
+    found = _costs_for(loaded, monkeypatch, [one])
+    assert found[one.lower()]["cost_by_currency"]["USD"] == pytest.approx(70.0, abs=0.01)
+
+
 # ------------------------------------------------------- resource presence table
 
 def _counts(reader, table: str, where: str = "") -> list[dict]:
