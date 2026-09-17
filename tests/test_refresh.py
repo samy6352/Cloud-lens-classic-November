@@ -136,7 +136,15 @@ ROW = {
 
 
 def seed(wh_obj, sub_id: str, day: str, n: int) -> None:
-    """Put rows in the warehouse the way a previous successful refresh would have."""
+    """Put rows in the warehouse the way a previous successful refresh would have.
+
+    That now means rebuilding the derived tables as well as writing `costs`.
+    `summary()` counts rows from `Reader.agg` -- the rollup -- rather than scanning the
+    detail table, so an insert that skips `refresh_rollup` is invisible to it: this
+    read 0 rows immediately after seeding 40 and 40 afterwards, because the failed
+    refresh under test rebuilt the rollup from the rows the seed had already written.
+    The rows were never lost; the instrument was measuring the wrong table.
+    """
     cols = list(__import__("app.warehouse", fromlist=["COLUMNS"]).COLUMNS)
     names = ",".join(f'"{c}"' for c in cols)
     holes = ",".join("?" * len(cols))
@@ -156,6 +164,7 @@ def seed(wh_obj, sub_id: str, day: str, n: int) -> None:
             rec.append(None)
     with wh_obj.connect() as con:
         con.executemany(f"INSERT INTO costs ({names}) VALUES ({holes})", [rec] * n)
+    wh_obj.refresh_rollup()
 
 
 wh2 = Warehouse()
