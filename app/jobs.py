@@ -81,6 +81,20 @@ def snapshot_generation(con: Any, scope: list[str] | None = None) -> str:
     return f"data:{source}" if source >= 0 and source == ready else f"pending:{source}:{ready}"
 
 
+def rollup_current(con: Any) -> bool:
+    """Whether the rollup holds the generation the detail table is now at.
+
+    The read-side counterpart to `coherent_rollup`, which stamps the rollup's
+    generation inside the same transaction that rebuilt it. Two rows from `meta`,
+    so it is cheap enough to ask on every connection that might read the rollup.
+
+    A rollup that was never built reads as generation -1 and is therefore never
+    current, which is the answer that keeps an empty rollup from serving zeroes.
+    """
+    source, ready = _generation_pair(con)
+    return source == ready
+
+
 def generation_ready(expected: int) -> bool:
     from .warehouse import warehouse
 

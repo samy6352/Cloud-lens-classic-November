@@ -60,6 +60,37 @@ def _q(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def _aggregate(reader: Any) -> str:
+    """The relation this reader wants summed queries to read.
+
+    `Warehouse.reader` sets `agg` to the rollup whenever the rollup can answer that
+    connection exactly, and to `costs` when it cannot. These functions are duck-typed
+    though -- the offline tests pass their own reader-likes -- so anything without
+    the attribute gets the detail table, which is always correct and merely slower.
+    """
+    return getattr(reader, "agg", "costs")
+
+
+def _counted(reader: Any) -> str:
+    """The relation this reader wants resource counts read from.
+
+    The presence table where it can answer exactly, `costs` otherwise. Same
+    duck-typing allowance as `_aggregate`.
+    """
+    return getattr(reader, "res", "costs")
+
+
+def _named(reader: Any) -> str:
+    """The relation this reader wants per-named-resource money read from.
+
+    The presence table carries `ResourceName` and the billed money at the resource
+    grain, so the top-spend list no longer needs the detail table -- except when the
+    connection converts currency, where the presence money cannot be converted and
+    `Reader.named` falls back to `costs`. Same duck-typing allowance as `_aggregate`.
+    """
+    return getattr(reader, "named", "costs")
+
+
 def _families_clause(families: list[str], negate: bool = False) -> str:
     if not families:
         return "1=1"
@@ -199,9 +230,10 @@ class Dashboard:
             if not hi:
                 return {"sections": [], "days": days, "empty": True}
 
+            agg = _aggregate(r)
             rows = r.rows(
                 'SELECT "ServiceFamily" AS family, "BillingCurrency" AS currency, '
-                'sum("BilledCost") AS cost FROM costs '
+                f'sum("BilledCost") AS cost FROM {agg} '
                 f'WHERE "ChargePeriodStart" > {start} GROUP BY 1, 2', None)
 
             # AKS, on the same connection, because the picker offers it as a segment beside the
@@ -210,7 +242,7 @@ class Dashboard:
             # against the Kubernetes service. Naming the *cluster* needs Resource Graph, which
             # is slow and can be refused -- but the total does not, so the strip stays fast.
             aks_rows = r.rows(
-                'SELECT "BillingCurrency" AS currency, sum("BilledCost") AS cost FROM costs '
+                f'SELECT "BillingCurrency" AS currency, sum("BilledCost") AS cost FROM {agg} '
                 f'WHERE "ChargePeriodStart" > {start} AND ('
                 'lower("ResourceGroup") LIKE \'mc\\_%\' ESCAPE \'\\\' '
                 'OR lower("ServiceName") LIKE \'%kubernetes%\') GROUP BY 1', None)
@@ -219,7 +251,7 @@ class Dashboard:
             # across the families rather than a family of its own, so it rides the same
             # connection rather than a second round trip once the tab is opened.
             marketplace_rows = r.rows(
-                'SELECT "BillingCurrency" AS currency, sum("BilledCost") AS cost FROM costs '
+                f'SELECT "BillingCurrency" AS currency, sum("BilledCost") AS cost FROM {agg} '
                 f'WHERE "ChargePeriodStart" > {start} AND {MARKETPLACE_CLAUSE} GROUP BY 1', None)
 
         seen = {r["family"] for r in rows if r["family"]}
@@ -281,6 +313,8 @@ class Dashboard:
 
             period = f'"ChargePeriodStart" > {start}'
             window = f'"ChargePeriodStart" > {prev}'
+            agg = _aggregate(r)
+            res = _counted(r)
             # One pass per shape, all inside the same connection. Splitting current from
             # previous with a CASE rather than two queries halves the scans.
             split = (
@@ -289,24 +323,36 @@ class Dashboard:
             )
 
             totals = r.rows(
-                'SELECT "BillingCurrency" AS currency, ' + split + f" FROM costs WHERE {window} GROUP BY 1",
+                'SELECT "BillingCurrency" AS currency, ' + split
+                + f" FROM {agg} WHERE {window} GROUP BY 1",
                 None)
 
+            # Resources counted by hashing a distinct subquery rather than with
+            # `count(DISTINCT)`, which sorts: at two million identities the sort spills
+            # to disk and costs 9s where the hash costs 6.8s. The other three are taken
+            # from the rollup, which preserves every distinct dimension combination and
+            # is sixty thousand rows rather than three million -- 118ms against 9s.
             counts = r.rows(
-                'SELECT "BillingCurrency" AS currency, count(DISTINCT "ResourceId") AS resources, '
+                'WITH seen AS (SELECT "BillingCurrency" AS currency, count(*) AS resources '
+                'FROM (SELECT DISTINCT "BillingCurrency", "ResourceId" '
+                f'FROM {res} WHERE {period}) x GROUP BY 1), '
+                'dims AS (SELECT "BillingCurrency" AS currency, '
                 'count(DISTINCT "ServiceName") AS services, '
                 'count(DISTINCT "SubAccountId") AS subscriptions, '
                 'count(DISTINCT "RegionName") AS regions '
-                f"FROM costs WHERE {period} GROUP BY 1", None)
+                f'FROM {agg} WHERE {period} GROUP BY 1) '
+                'SELECT dims.currency, coalesce(seen.resources, 0) AS resources, '
+                'dims.services, dims.subscriptions, dims.regions FROM dims LEFT JOIN seen '
+                'ON seen.currency IS NOT DISTINCT FROM dims.currency', None)
 
             daily = r.rows(
                 'SELECT "ChargePeriodStart" AS day, "BillingCurrency" AS currency, '
-                f'sum("BilledCost") AS cost FROM costs WHERE {window} GROUP BY 1, 2 ORDER BY 1',
+                f'sum("BilledCost") AS cost FROM {agg} WHERE {window} GROUP BY 1, 2 ORDER BY 1',
                 None)
 
             families = r.rows(
                 'SELECT "ServiceFamily" AS family, "BillingCurrency" AS currency, ' + split
-                + f" FROM costs WHERE {window} GROUP BY 1, 2", None)
+                + f" FROM {agg} WHERE {window} GROUP BY 1, 2", None)
 
             # Independent of the 7d/30d/60d/90d picker above -- month-over-month is deliberately
             # a longer, coarser look than the rest of this tab, so it keeps its own window rather
@@ -314,29 +360,39 @@ class Dashboard:
             monthly_family = r.rows(
                 'SELECT strftime("ChargePeriodStart", \'%Y-%m\') AS month, '
                 '"ServiceFamily" AS family, "BillingCurrency" AS currency, '
-                'sum("BilledCost") AS cost FROM costs '
+                f'sum("BilledCost") AS cost FROM {agg} '
                 f"WHERE \"ChargePeriodStart\" > date '{hi}' - INTERVAL {MONTHLY_TREND_MONTHS} MONTH "
                 "GROUP BY 1, 2, 3", None)
 
             services = self._ranked(r,
                 'SELECT "ServiceName" AS name, "BillingCurrency" AS currency, ' + split
-                + f" FROM costs WHERE {window} GROUP BY 1, 2", 8, movers=True)
+                + f" FROM {agg} WHERE {window} GROUP BY 1, 2", 8, movers=True)
 
             subs = self._ranked(r,
                 'SELECT coalesce("SubAccountName", "SubAccountId", \'—\') AS name, '
                 '"BillingCurrency" AS currency, ' + split
-                + f" FROM costs WHERE {window} GROUP BY 1, 2", 8)
+                + f" FROM {agg} WHERE {window} GROUP BY 1, 2", 8)
 
             groups_top = self._ranked(r,
                 'SELECT coalesce("ResourceGroup", \'—\') AS name, '
                 '"BillingCurrency" AS currency, ' + split
-                + f" FROM costs WHERE {window} GROUP BY 1, 2", 8)
+                + f" FROM {agg} WHERE {window} GROUP BY 1, 2", 8)
 
+            # Money and resource counts come from different derived tables now, so they
+            # are computed separately and joined rather than scanned together. `_ranked`
+            # still ranks by cost over the joined result, exactly as before.
             regions_top = self._ranked(r,
-                'SELECT coalesce("RegionName", \'—\') AS name, '
+                'WITH money AS (SELECT coalesce("RegionName", \'—\') AS name, '
                 '"BillingCurrency" AS currency, ' + split
-                + ' , count(DISTINCT "ResourceId") AS resources'
-                + f" FROM costs WHERE {window} GROUP BY 1, 2", 20)
+                + f' FROM {agg} WHERE {window} GROUP BY 1, 2), '
+                'seen AS (SELECT coalesce("RegionName", \'—\') AS name, '
+                '"BillingCurrency" AS currency, count(*) AS resources '
+                'FROM (SELECT DISTINCT "RegionName", "BillingCurrency", "ResourceId" '
+                f'FROM {res} WHERE {window}) x GROUP BY 1, 2) '
+                'SELECT money.name, money.currency, money.cost, money.prior, '
+                'coalesce(seen.resources, 0) AS resources FROM money LEFT JOIN seen '
+                'ON seen.name = money.name '
+                'AND seen.currency IS NOT DISTINCT FROM money.currency', 20)
 
         return self._currency_views(self._executive_payload, {
             "days": days, "hi": hi, "totals": totals, "counts": counts, "daily": daily,
@@ -553,41 +609,64 @@ class Dashboard:
             period = f'"ChargePeriodStart" > {start}'
             previous = f'"ChargePeriodStart" > {prev} AND "ChargePeriodStart" <= {start}'
 
+            # The rollup carries `PublisherName` now, so every tab -- Marketplace
+            # included -- can take its money from it.
+            estate = _aggregate(r)
+            res = _counted(r)
+            agg = estate
+
+            # Money from whichever table can answer this tab, counts from the presence
+            # table -- which holds `ServiceFamily` and `PublisherName`, so it serves the
+            # Marketplace tab too even though the rollup cannot.
             totals = r.rows(
-                'SELECT "BillingCurrency" AS currency, sum("BilledCost") AS cost, '
-                'count(DISTINCT "ResourceId") AS resources, '
-                'count(DISTINCT "ServiceName") AS services FROM costs '
-                f"WHERE {where} AND {period} GROUP BY 1", None)
+                'WITH money AS (SELECT "BillingCurrency" AS currency, '
+                f'sum("BilledCost") AS cost FROM {agg} '
+                f'WHERE {where} AND {period} GROUP BY 1), '
+                'seen AS (SELECT "BillingCurrency" AS currency, count(*) AS resources '
+                'FROM (SELECT DISTINCT "BillingCurrency", "ResourceId" '
+                f'FROM {res} WHERE {where} AND {period}) x GROUP BY 1), '
+                'svc AS (SELECT "BillingCurrency" AS currency, '
+                'count(DISTINCT "ServiceName") AS services '
+                f'FROM {agg} WHERE {where} AND {period} GROUP BY 1) '
+                'SELECT money.currency, money.cost, coalesce(seen.resources, 0) AS resources, '
+                'coalesce(svc.services, 0) AS services FROM money '
+                'LEFT JOIN seen ON seen.currency IS NOT DISTINCT FROM money.currency '
+                'LEFT JOIN svc ON svc.currency IS NOT DISTINCT FROM money.currency', None)
 
             before = r.rows(
-                'SELECT "BillingCurrency" AS currency, sum("BilledCost") AS cost FROM costs '
+                f'SELECT "BillingCurrency" AS currency, sum("BilledCost") AS cost FROM {agg} '
                 f"WHERE {where} AND {previous} GROUP BY 1", None)
 
+            # The whole estate rather than this tab's slice, so it carries no `where` and
+            # the rollup can answer it even on the Marketplace tab.
             everything = r.rows(
-                'SELECT "BillingCurrency" AS currency, sum("BilledCost") AS cost FROM costs '
+                f'SELECT "BillingCurrency" AS currency, sum("BilledCost") AS cost FROM {estate} '
                 f"WHERE {period} GROUP BY 1", None)
 
             trend = r.rows(
                 'SELECT "ChargePeriodStart" AS day, "BillingCurrency" AS currency, '
-                'sum("BilledCost") AS cost FROM costs '
+                f'sum("BilledCost") AS cost FROM {agg} '
                 f"WHERE {where} AND {period} GROUP BY 1, 2 ORDER BY 1", None)
 
             services = self._ranked(r,
                 'SELECT "ServiceName" AS name, "BillingCurrency" AS currency, '
-                'sum("BilledCost") AS cost FROM costs '
+                f'sum("BilledCost") AS cost FROM {agg} '
                 f"WHERE {where} AND {period} GROUP BY 1, 2", 12)
 
+            # Named resources carry their own money on the presence table now, so this
+            # reads 2.8M narrow rows rather than 5.8M wide ones. `_named` falls back to
+            # `costs` under a converted currency, where that money cannot be converted.
             top = self._ranked(r,
                 'SELECT coalesce("ResourceName", \'—\') AS name, '
                 'coalesce("ResourceGroup", \'—\') AS grp, "ServiceName" AS service, '
                 'coalesce("RegionName", \'—\') AS region, "BillingCurrency" AS currency, '
-                'sum("BilledCost") AS cost FROM costs '
+                f'sum("BilledCost") AS cost FROM {_named(r)} '
                 f"WHERE {where} AND {period} AND \"ResourceId\" IS NOT NULL "
                 "GROUP BY 1, 2, 3, 4, 5", 20)
 
             regions = self._ranked(r,
                 'SELECT coalesce("RegionName", \'—\') AS name, "BillingCurrency" AS currency, '
-                'sum("BilledCost") AS cost FROM costs '
+                f'sum("BilledCost") AS cost FROM {agg} '
                 f"WHERE {where} AND {period} GROUP BY 1, 2", 8)
 
         return self._currency_views(self._section_payload, {

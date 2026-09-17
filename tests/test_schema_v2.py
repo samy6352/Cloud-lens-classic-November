@@ -273,3 +273,163 @@ def test_total_size_counts_partitions_not_the_empty_parent(built):
 
     assert parent_only == 0
     assert counted > 0
+
+
+# ------------------------------------------------------- the warehouse write path
+
+@pytest.fixture()
+def partitioned_wh(monkeypatch):
+    """A warehouse whose `costs` is partitioned, in a schema of its own.
+
+    `PARTITION_COSTS` is read once at import, so it is patched on the module
+    rather than in the environment -- setting the variable after import would do
+    nothing and the test would silently exercise the flat path instead.
+    """
+    from app import warehouse as wh_module
+
+    schema = f"cl_part_{uuid.uuid4().hex[:8]}"
+    monkeypatch.setenv("PGSCHEMA", schema)
+    monkeypatch.setattr(wh_module, "PARTITION_COSTS", True)
+
+    warehouse = wh_module.Warehouse()
+    yield warehouse
+
+    with warehouse._store.connect() as c:
+        c.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+    warehouse._store.close()
+
+
+def _rows_for(days):
+    from app.warehouse import COLUMNS, NUMERIC
+
+    out = []
+    for i, day in enumerate(days):
+        values = {
+            "ChargePeriodStart": day,
+            "BilledCost": 10.0,
+            "CostInUsd": 10.0,
+            "BillingCurrency": "USD",
+            "SubAccountId": str(uuid.UUID(int=1)),
+            "SubAccountName": "sub-1",
+            "ServiceName": "Virtual Machines",
+            "ServiceFamily": "Compute",
+            "RegionName": "eastus",
+            "ResourceGroup": "rg-1",
+            "ResourceId": f"/subscriptions/x/rg-1/res-{i}",
+        }
+        out.append([values.get(c, 0.0 if c in NUMERIC else None) for c in COLUMNS])
+    return out
+
+
+def test_the_warehouse_creates_costs_partitioned_when_enabled(partitioned_wh):
+    from app import schema_v2
+
+    schema = partitioned_wh._rollup_schema
+    with partitioned_wh.connect() as c:
+        kind = c.execute(
+            "SELECT relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE c.relname = 'costs' AND n.nspname = ?", [schema]).fetchone()[0]
+        assert kind == "p"
+        # The safety net must exist from the start, not on first overflow.
+        assert "costs_default" in schema_v2.attached_partitions(c, schema)
+
+
+def test_inserting_rows_creates_the_partitions_they_need(partitioned_wh):
+    """The actual wiring. Without it every charge lands in the default partition.
+
+    That failure is silent -- the rows are all present and every total is right --
+    so it is only detectable by looking at where they were stored.
+    """
+    from app import schema_v2
+    from app.warehouse import insert_rows
+
+    schema = partitioned_wh._rollup_schema
+    days = [dt.date(2026, 1, 15), dt.date(2026, 2, 20), dt.date(2026, 3, 5)]
+
+    with partitioned_wh.connect() as c:
+        insert_rows(c, _rows_for(days))
+
+        attached = schema_v2.attached_partitions(c, schema)
+        for month in ("202601", "202602", "202603"):
+            assert f"costs_{month}" in attached, f"no partition for {month}"
+            assert c.execute(
+                f'SELECT count(*) FROM "{schema}".costs_{month}').fetchone()[0] == 1
+
+        assert c.execute(
+            f'SELECT count(*) FROM "{schema}".costs_default').fetchone()[0] == 0
+        assert c.execute(f'SELECT count(*) FROM "{schema}".costs').fetchone()[0] == 3
+
+
+def test_iso_string_dates_route_as_well_as_date_objects(partitioned_wh):
+    """CSV paths hand over '2026-04-05'; API paths hand over a date. Both must route."""
+    from app import schema_v2
+    from app.warehouse import insert_rows
+
+    schema = partitioned_wh._rollup_schema
+    with partitioned_wh.connect() as c:
+        insert_rows(c, _rows_for(["2026-04-05", "2026-05-06"]))
+
+        attached = schema_v2.attached_partitions(c, schema)
+        assert "costs_202604" in attached and "costs_202605" in attached
+        assert c.execute(
+            f'SELECT count(*) FROM "{schema}".costs_default').fetchone()[0] == 0
+
+
+def test_retention_and_the_rollup_still_agree_on_a_partitioned_table(partitioned_wh):
+    """End to end: write, roll up, drop a month, roll up again, totals still match."""
+    from app import rollup, schema_v2
+    from app.warehouse import insert_rows
+
+    schema = partitioned_wh._rollup_schema
+    days = [dt.date(2026, 1, 10), dt.date(2026, 2, 10), dt.date(2026, 3, 10)]
+    with partitioned_wh.connect() as c:
+        insert_rows(c, _rows_for(days))
+    partitioned_wh.refresh_rollup()
+
+    with partitioned_wh.reader() as r:
+        detail = r.rows('SELECT round(sum("BilledCost"), 2) AS c FROM costs')[0]["c"]
+        rolled = r.rows(f'SELECT round(sum("BilledCost"), 2) AS c FROM {rollup.TABLE}')[0]["c"]
+    assert detail == pytest.approx(rolled, abs=0.01)
+
+    with partitioned_wh.connect() as c:
+        dropped = schema_v2.drop_partitions_before(c, schema, dt.date(2026, 2, 1))
+    assert dropped == ["costs_202601"]
+
+    partitioned_wh.refresh_rollup()
+    with partitioned_wh.reader() as r:
+        detail = r.rows('SELECT round(sum("BilledCost"), 2) AS c FROM costs')[0]["c"]
+        rolled = r.rows(f'SELECT round(sum("BilledCost"), 2) AS c FROM {rollup.TABLE}')[0]["c"]
+    assert detail == pytest.approx(rolled, abs=0.01)
+    assert detail == pytest.approx(20.0, abs=0.01), "a month should have been forgotten"
+
+
+def test_a_flat_costs_table_is_left_alone(monkeypatch):
+    """The flag must not convert, move or rewrite an existing flat table.
+
+    A database created before partitioning keeps the table it has. The insert path
+    reads the catalog rather than the flag, so it simply does no partition work.
+    """
+    from app import warehouse as wh_module
+    from app.warehouse import insert_rows
+
+    schema = f"cl_flat_{uuid.uuid4().hex[:8]}"
+    monkeypatch.setenv("PGSCHEMA", schema)
+    monkeypatch.setattr(wh_module, "PARTITION_COSTS", False)
+    flat = wh_module.Warehouse()
+    try:
+        # Now the flag flips on, as it would if an operator enabled it later.
+        monkeypatch.setattr(wh_module, "PARTITION_COSTS", True)
+        wh_module.Warehouse()  # a second boot against the same schema
+
+        with flat.connect() as c:
+            kind = c.execute(
+                "SELECT relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE c.relname = 'costs' AND n.nspname = ?", [schema]).fetchone()[0]
+            assert kind == "r", "an existing flat table was converted"
+
+            insert_rows(c, _rows_for([dt.date(2026, 1, 10), dt.date(2026, 2, 10)]))
+            assert c.execute(f'SELECT count(*) FROM "{schema}".costs').fetchone()[0] == 2
+    finally:
+        with flat._store.connect() as c:
+            c.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        flat._store.close()

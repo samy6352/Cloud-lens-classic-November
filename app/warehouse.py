@@ -28,12 +28,12 @@ import re
 import time
 from collections.abc import AsyncIterator, Iterator, Sequence
 from contextlib import asynccontextmanager, contextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, ClassVar
 
 import httpx
 
-from . import rollup, store
+from . import presence, rollup, schema_v2, store
 from .sqldialect import SHIM_SCHEMA, strip_literals
 
 log = logging.getLogger("cloudlens.warehouse")
@@ -431,14 +431,52 @@ class Reader:
     block that produced it.
     """
 
-    def __init__(self, con: Any) -> None:
+    def __init__(self, con: Any, aggregate: str = "costs", counted: str = "costs",
+                 named: str = "costs") -> None:
         self._con = con
+        self.agg = aggregate
+        self.res = counted
+        self.named = named
+
+    @property
+    def aggregated(self) -> bool:
+        """Whether `agg` and `res` are the derived tables rather than the detail table.
+
+        Only for tests and diagnostics. A query must read the same either way, so
+        nothing that builds a payload should branch on this.
+        """
+        return self.agg != "costs"
 
     def rows(self, sql: str, limit: int | None = 200) -> list[dict[str, Any]]:
         cur = self._con.execute(sql)
         columns = [d[0] for d in cur.description]
         rows = cur.fetchall() if limit is None else cur.fetchmany(limit)
         return [dict(zip(columns, row)) for row in rows]
+
+
+# Whether a *new* `costs` is created partitioned by month. Off by default, and
+# deliberately not a migration: `CREATE TABLE IF NOT EXISTS ... PARTITION BY` is
+# a no-op against an existing flat table, so turning this on cannot convert, move
+# or rewrite data that is already there. An existing deployment keeps the flat
+# table it has until someone migrates it on purpose.
+#
+# Everything downstream reads the catalog rather than this flag -- see
+# `_partitioned_target` -- so both shapes work whatever this is set to, and a
+# database created under one setting still behaves correctly under the other.
+PARTITION_COSTS = os.getenv("CLOUDLENS_PARTITION_COSTS", "").strip().lower() in {
+    "1", "true", "yes", "on"}
+
+
+def _costs_ddl(cols: str) -> str:
+    """DDL for `costs`: partitioned by month when enabled, flat otherwise.
+
+    The column list is identical either way. Partitioning changes where rows are
+    stored, not what the table looks like to the 25 modules that read it.
+    """
+    if not PARTITION_COSTS:
+        return f"CREATE TABLE IF NOT EXISTS costs (\n  {cols}\n)"
+    return (f"CREATE TABLE IF NOT EXISTS costs (\n  {cols}\n) "
+            f'PARTITION BY RANGE ("ChargePeriodStart")')
 
 
 class Warehouse:
@@ -514,18 +552,36 @@ class Warehouse:
         rebuild to the months a write actually touched. It is an optimisation with a
         precondition, not a default: pass it only where the set of affected days is known
         for certain, because days outside it keep whatever the previous rebuild produced.
-        Every existing caller omits it and rebuilds the lot, which is always correct.
+        Callers that cannot state that omit it and rebuild the lot, which is always correct.
+
+        A window is *ignored* if the last rebuild did not succeed. That is the one way a
+        narrow rebuild can go permanently wrong: a failed rebuild leaves days stale, and
+        every later windowed rebuild would step over them rather than correct them, so the
+        staleness would never age out. After a failure the next rebuild is full, whatever
+        the caller asks for, and the flag is only cleared once one has succeeded.
 
         Source writes are frozen while derived data is rebuilt. Failed rebuilds retain the
         previous ready generation; ingest callers raise so recovery cannot publish stale
         aggregates as current. Synchronous maintenance retains its non-raising default.
         """
+        if window is not None and getattr(self, "_rollup_full_required", True):
+            log.info("warehouse: rebuilding the whole rollup rather than %s..%s, "
+                     "because the last rebuild did not complete", window[0], window[1])
+            window = None
         try:
             from . import jobs
             with jobs.coherent_rollup(self) as con:
-                return rollup.rebuild(jobs.RollupTransaction(con), self._rollup_schema,
+                rows = rollup.rebuild(jobs.RollupTransaction(con), self._rollup_schema,
                                       self._pg_table, window)
+                # In the same transaction, so the two derived tables can never
+                # describe different generations of `costs`, and so the generation
+                # stamp `coherent_rollup` writes covers both or neither.
+                presence.rebuild(jobs.RollupTransaction(con), self._rollup_schema,
+                                 self._pg_table, window)
+            self._rollup_full_required = False
+            return rows
         except Exception as exc:  # noqa: BLE001
+            self._rollup_full_required = True
             log.warning("warehouse: could not rebuild the rollup (%s); "
                         "the previous ready generation is retained", exc)
             if strict:
@@ -793,7 +849,96 @@ class Warehouse:
                     "or configure FX rates; no partial total will be reported."
                 )
         con.execute(f"CREATE TEMP VIEW costs AS SELECT {select} FROM {self._pg_table} {where}")
+        self._shadow_rollup(con, where, rate, filters)
+        self._shadow_presence(con, where, rate, target, filters)
         return con
+
+    def _shadow_presence(self, con: Any, where: str, rate: float | None, target: str,
+                         filters: dict[str, list[str]] | None) -> None:
+        """Give this connection a `resource_presence` carrying the same scope as `costs`.
+
+        The same argument as `_shadow_rollup`: the table is not scope-filtered, so a
+        scoped connection reading it unshadowed would count every subscription's
+        resources rather than its own.
+
+        Unlike the rollup, the *counting* survives a converted currency. The only
+        dimension conversion touches is `BillingCurrency`, which the `costs` view
+        replaces with the target for every row, and which is reproduced here by
+        projecting the same literal; relabelling which currency a resource was billed
+        in does not change how many resources there were.
+
+        The *money* does not survive it, and is nulled rather than projected. The
+        factor that converts a row depends on `PricingCurrency` and
+        `ExchangeRatePricingToBilling`, neither of which is in the grain, so a summed
+        figure here cannot be converted after the fact. `_derived_sources` already
+        routes per-resource money to `costs` in that case, so nothing should read
+        these columns -- and if something does, it reads NULL rather than a number
+        that is silently in the wrong currency.
+        """
+        if rollup.serves_filters(filters) and self._rollup_fresh(con):
+            money_ok = presence.serves_money(rate)
+            columns = ", ".join(
+                [f"'{target}' AS \"BillingCurrency\""
+                 if name == "BillingCurrency" and rate is not None else f'"{name}"'
+                 for name in presence.DIMENSIONS]
+                + [f'"{m}"' if money_ok else f'CAST(NULL AS double precision) AS "{m}"'
+                   for m in presence.MEASURES])
+            con.execute(f'CREATE TEMP VIEW {presence.TABLE} AS SELECT {columns} '
+                        f'FROM "{self._rollup_schema}".{presence.TABLE} {where}')
+            return
+        # A filter on `charge`, `pricing` or `env` names something outside the grain,
+        # so the counts have to come from the detail table the filter can be applied to.
+        con.execute(f"CREATE TEMP VIEW {presence.TABLE} AS "
+                    f"{presence.select_sql('costs')}")
+
+    def _rollup_fresh(self, con: Any) -> bool:
+        """Whether the rollup was rebuilt from the generation `costs` is now at.
+
+        `jobs` advances the source generation inside the writing transaction and
+        stamps the rollup's own generation inside the rebuilding one, so the two
+        agreeing is a durable statement that the rollup is not stale -- unlike the
+        in-process `_rollup_full_required` flag, which says nothing after a restart.
+
+        Guarded, and answers False on any failure. The cost of being wrong here is
+        a wrong total on a page someone sends to a finance team, so the unknown
+        case has to fall back to the detail table rather than assume the best.
+        """
+        try:
+            from . import jobs
+
+            return jobs.rollup_current(con)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("warehouse: could not establish rollup freshness (%s)", str(exc)[:200])
+            return False
+
+    def _shadow_rollup(self, con: Any, where: str, rate: float | None,
+                       filters: dict[str, list[str]] | None) -> None:
+        """Give this connection a `costs_rollup` carrying the same scope as `costs`.
+
+        The rollup table is not scope-filtered -- an unqualified `SELECT * FROM
+        costs_rollup` is every subscription's money -- so a scoped connection must
+        shadow it exactly as it shadows `costs`, or routing a dashboard query to it
+        would quietly widen what that query can see.
+
+        Two backings, one shape. The rollup table itself when it can answer the
+        connection exactly, and the same grain computed from the already-scoped
+        `costs` view when it cannot. A query reads `costs_rollup` either way and
+        cannot tell which answered it; only the speed differs.
+
+        The fast path reuses `where` verbatim, which is sound because every column
+        it can mention -- `SubAccountId` from the scope, `ResourceGroup`,
+        `ServiceName` and `RegionName` from the filter bar, `ChargePeriodStart`
+        from the reporting period -- is part of the rollup's grain.
+        """
+        if rate is None and rollup.serves_filters(filters) and self._rollup_fresh(con):
+            con.execute(f'CREATE TEMP VIEW {rollup.TABLE} AS SELECT * '
+                        f'FROM "{self._rollup_schema}".{rollup.TABLE} {where}')
+            return
+        # A converted currency needs PricingCurrency, ExchangeRatePricingToBilling and
+        # BillingCostBasis; `charge`, `pricing` and `env` name ChargeCategory,
+        # PricingModel and the Tags document. None of those survive into the grain, so
+        # the rollup cannot answer these exactly and the detail table has to.
+        con.execute(f"CREATE TEMP VIEW {rollup.TABLE} AS {rollup.derive_sql('costs')}")
 
     @contextmanager
     def reader(self, scope: list[str] | None = None,
@@ -807,18 +952,77 @@ class Warehouse:
 
         For app-authored SQL only. Model-authored SQL still goes through `query()`, which is
         where the single-statement, no-file-access and currency checks live.
+
+        `Reader.agg` names the relation aggregate queries should read, `Reader.res`
+        the one resource counts should read, and `Reader.named` the one per-resource
+        money should read. Each is the derived table whenever that can answer this
+        connection exactly, and `costs` otherwise, so a caller writes one query and
+        gets the fast path when the fast path is correct.
         """
         con = self.connect(read_only=True, scope=scope, currency=currency, filters=filters)
         try:
-            yield Reader(con)
+            aggregate, counted, named = self._derived_sources(con, scope, currency, filters)
+            yield Reader(con, aggregate, counted, named)
         finally:
             con.close()
+
+    def _derived_sources(self, con: Any, scope: list[str] | None,
+                         currency: str | None,
+                         filters: dict[str, list[str]] | None) -> tuple[str, str, str]:
+        """Which relations `Reader.agg`, `Reader.res` and `Reader.named` should name.
+
+        A connection that `_prepare_connection` shadowed has both views, and both are
+        correct by construction -- either the derived table, chosen only where it can
+        answer exactly, or the grain computed from the scoped `costs` view. So the
+        shadowed case needs no further test.
+
+        The unshadowed case is the bare connection returned by the early exit: nothing
+        is scoped, converted or filtered, so the names resolve to the derived tables
+        themselves. That is the one case where staleness could show, and so the one
+        case that has to check.
+
+        `named` splits off from `res` for one reason: a converted currency leaves the
+        presence table able to count but not to price, because the conversion factor
+        needs columns outside its grain. Counting keeps the fast path; the money for
+        that connection goes to the detail table, which is the only place it is right.
+        """
+        from . import reporting
+
+        shadowed = bool(scope or currency or filters or reporting.view_predicate())
+        if not (shadowed or self._rollup_fresh(con)):
+            log.debug("warehouse: derived tables are behind the detail table; reading costs")
+            return "costs", "costs", "costs"
+
+        money_ok = presence.serves_money(self._display_rate(currency))
+        return rollup.TABLE, presence.TABLE, presence.TABLE if money_ok else "costs"
+
+    @staticmethod
+    def _display_rate(currency: str | None) -> float | None:
+        """The FX rate `_prepare_connection` would have applied, or None for as-billed.
+
+        Asked again rather than threaded through, because `reader` is handed the
+        caller's currency and not the rate derived from it. Guarded: a rate that
+        cannot be established is treated as a conversion, which routes money to the
+        detail table -- slower, and correct.
+        """
+        target = (currency or "").upper()
+        if not target:
+            return None
+        try:
+            from . import currency as fx
+
+            rate = fx.rate_to(target)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("warehouse: could not establish a display rate (%s)", str(exc)[:200])
+            return 1.0
+        return 1.0 if rate is None else rate
 
     def check_readiness(self) -> bool:
         """Validate the schema used by dashboard reads without reading customer rows."""
         return self._store.check_readiness({
             "costs": tuple(COLUMNS),
             rollup.TABLE: (*rollup.DIMENSIONS, *rollup.MEASURES, "charges"),
+            presence.TABLE: (*presence.DIMENSIONS, *presence.MEASURES),
             "ingest_log": ("subscription_id", "subscription_name", "period", "rows",
                            "ingested_at", "status", "detail"),
             "meta": ("key", "value", "updated_at"),
@@ -839,7 +1043,17 @@ class Warehouse:
             # Before anything is created, because a table stranded in the shim schema has to
             # be moved rather than shadowed by a new empty one of the same name.
             self._evacuate_shim_schema(con, schema)
-            con.execute(f"CREATE TABLE IF NOT EXISTS costs (\n  {cols}\n)")
+            con.execute(_costs_ddl(cols))
+            # Conditioned on what the table actually is, not on the flag. With the
+            # flag on against a database whose `costs` predates partitioning, the
+            # CREATE above is a no-op and the table is still flat -- and
+            # `PARTITION OF` against a flat table raises.
+            if _partitioned_target(con, "costs") is not None:
+                # Without this, a charge whose month has no partition is rejected
+                # outright and the row is lost. With it the charge is stored and
+                # merely queried more slowly, which is the right way round.
+                con.execute("CREATE TABLE IF NOT EXISTS costs_default "
+                            "PARTITION OF costs DEFAULT")
             con.execute("CREATE TABLE IF NOT EXISTS ingest_log ("
                         "subscription_id VARCHAR, subscription_name VARCHAR, period VARCHAR, "
                         "rows BIGINT, ingested_at TIMESTAMP, status VARCHAR, detail VARCHAR)")
@@ -897,10 +1111,40 @@ class Warehouse:
 
             self._merge_subscription_spellings(con)
             self._create_indexes(con)
+            self._drop_outdated_derived(con, schema)
             for statement in rollup.create_sql(schema):
+                con.execute(statement)
+            for statement in presence.create_sql(schema):
                 con.execute(statement)
             self._rollup_schema = schema
             self._ensure_query_role(con)
+
+    def _drop_outdated_derived(self, con: Any, schema: str) -> None:
+        """Drop a derived table whose columns no longer match the grain that defines it.
+
+        `CREATE TABLE IF NOT EXISTS` is a no-op against a table that already exists, so
+        changing `rollup.DIMENSIONS` or `presence.DIMENSIONS` would otherwise leave the
+        old shape in place and every query naming the new column would fail.
+
+        Dropping is safe here in a way it would never be for `costs`: both of these are
+        derived, hold nothing that is not recomputable from the detail table, and are
+        rebuilt by the refresh that follows. The generation stamp is what stops an empty
+        one being read in the meantime -- a table that has not been rebuilt is behind the
+        detail table by definition, so `_rollup_fresh` refuses it and reads `costs`.
+        """
+        for module in (rollup, presence):
+            expected = set(module.DIMENSIONS) | set(getattr(module, "MEASURES", []))
+            if module is rollup:
+                expected.add("charges")
+            found = {row[0] for row in con.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = ? AND table_name = ?",
+                [schema, module.TABLE]).fetchall()}
+            if found and found != expected:
+                log.info("warehouse: rebuilding %s; its columns no longer match the grain "
+                         "(missing %s, extra %s)", module.TABLE,
+                         sorted(expected - found) or "none", sorted(found - expected) or "none")
+                con.execute(f'DROP TABLE IF EXISTS "{schema}".{module.TABLE}')
 
     # The command that moves a relation between schemas depends on what it is; ALTER TABLE
     # accepts some of these but not all, and errors rather than doing the right thing.
@@ -2487,6 +2731,84 @@ def _report_failure(body: dict, metric: str) -> str:
 INSERT_CHUNK = 200
 
 
+def _partitioned_target(con: Any, table: str) -> str | None:
+    """The schema holding `table`, if `table` is partitioned. None otherwise.
+
+    Resolved through `to_regclass` rather than by splitting the name, because the
+    callers pass every form: a bare `costs` that resolves through search_path, a
+    quoted `"cl_x7".costs`, and `bench`. One catalog lookup handles all three and
+    cannot disagree with what the following COPY will actually write to.
+
+    Returning None for an ordinary table is the important case, not an edge case.
+    A database created before partitioning still holds a flat `costs`, and
+    `CREATE TABLE IF NOT EXISTS ... PARTITION BY` does not convert it. Converting
+    it is a migration, which is gated separately, so both shapes have to work.
+    """
+    row = con.execute(
+        "SELECT c.relkind, n.nspname FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE c.oid = to_regclass(?)",
+        [table],
+    ).fetchone()
+    if not row or row[0] != "p":
+        return None
+    return str(row[1])
+
+
+def _charge_dates(records: Sequence[Sequence[Any]]) -> list[date]:
+    """The distinct charge dates in a batch, ignoring anything unparseable.
+
+    Values arrive as `date` objects from the API paths and as ISO strings from the
+    CSV paths, so both are accepted. A row whose date cannot be read is skipped
+    rather than raised on: it still has a default partition to land in, and
+    failing the whole batch over one malformed date would lose the other rows.
+    """
+    index = COLUMNS_INDEX["ChargePeriodStart"]
+    out: set[date] = set()
+    for row in records:
+        if index >= len(row):
+            continue
+        value = row[index]
+        if isinstance(value, datetime):
+            out.add(value.date())
+        elif isinstance(value, date):
+            out.add(value)
+        elif value:
+            try:
+                out.add(date.fromisoformat(str(value)[:10]))
+            except ValueError:
+                continue
+    return sorted(out)
+
+
+def ensure_partitions_for(con: Any, records: Sequence[Sequence[Any]],
+                          table: str = "costs") -> list[str]:
+    """Create the monthly partitions a batch is about to need.
+
+    Done here, in the one function every write path already goes through, rather
+    than at each caller. The rollup docstring makes the same argument and it holds
+    just as well for partitions: finding all the write paths again and missing one
+    would send those charges to the default partition, where they are still
+    correct but no longer prunable or droppable.
+
+    A no-op when `costs` is not partitioned, and best-effort when it is -- the
+    default partition means a partition that could not be created costs a slower
+    query rather than a rejected charge, so this must never fail a load.
+    """
+    schema = _partitioned_target(con, table)
+    if schema is None:
+        return []
+    days = _charge_dates(records)
+    if not days:
+        return []
+    try:
+        return schema_v2.ensure_partitions(con, schema, days[0], days[-1])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("warehouse: could not create partitions for %s..%s (%s); "
+                    "rows will land in the default partition", days[0], days[-1], exc)
+        return []
+
+
 def insert_rows(con: Any, records: Sequence[Sequence[Any]],
                 table: str = "costs", chunk: int = INSERT_CHUNK) -> int:
     """Bulk-insert rows into `table`, naming the columns explicitly.
@@ -2511,6 +2833,11 @@ def insert_rows(con: Any, records: Sequence[Sequence[Any]],
     """
     if not records:
         return 0
+
+    # Before the savepoint, and before COPY. Creating a partition takes a lock on
+    # the parent, and taking that lock inside the same savepoint the COPY will roll
+    # back on failure would undo the partitions along with the batch.
+    ensure_partitions_for(con, records, table)
 
     # A savepoint only exists inside a transaction, and this is called both ways: the ingest
     # wraps its delete and insert in one, while the fixtures and the diagnostics bench call it

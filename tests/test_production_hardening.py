@@ -52,25 +52,40 @@ def test_ingest_progress_does_not_expose_unscoped_financials(monkeypatch):
 
 
 def test_scope_predicate_never_matches_display_names(monkeypatch):
-    from app import reporting
+    from app import presence, reporting, rollup
 
     monkeypatch.setattr(reporting, "view_predicate", lambda: "")
     statements = []
     connection = SimpleNamespace(execute=lambda sql, *args: statements.append(sql))
     owner = SimpleNamespace(_store=SimpleNamespace(connect=lambda: connection),
                             _columns_sql=lambda *args: "*", _pg_table="public.costs",
-                            _filter_sql=lambda *args: "")
+                            _filter_sql=lambda *args: "",
+                            _rollup_schema="public", _rollup_fresh=lambda con: True)
     connect = load_function("app/warehouse.py", "connect",
                             {"__package__": "app", "canonical_sub_id": lambda value: value},
                             class_name="Warehouse")
     prepare = load_function("app/warehouse.py", "_prepare_connection",
                             {"__package__": "app", "canonical_sub_id": lambda value: value},
                             class_name="Warehouse")
+    shadow = load_function("app/warehouse.py", "_shadow_rollup",
+                           {"__package__": "app", "rollup": rollup}, class_name="Warehouse")
+    shadow_seen = load_function("app/warehouse.py", "_shadow_presence",
+                                {"__package__": "app", "rollup": rollup, "presence": presence},
+                                class_name="Warehouse")
     owner._prepare_connection = lambda *args: prepare(owner, *args)
+    owner._shadow_rollup = lambda *args: shadow(owner, *args)
+    owner._shadow_presence = lambda *args: shadow_seen(owner, *args)
     assert connect(owner, scope=["allowed-id"]) is connection
-    view = statements[-1]
-    assert 'lower("SubAccountId") IN' in view
-    assert "SubAccountName" not in view
+
+    # All three of them: neither derived table is scope-filtered, so the views standing
+    # in for them have to carry the same predicate the `costs` view does.
+    views = [statement for statement in statements if "CREATE TEMP VIEW" in statement]
+    assert len(views) == 3
+    assert any("costs_rollup" in view for view in views)
+    assert any("resource_presence" in view for view in views)
+    for view in views:
+        assert 'lower("SubAccountId") IN' in view
+        assert "SubAccountName" not in view
 
 
 def test_history_strips_privileged_roles_and_orphaned_tool_messages():

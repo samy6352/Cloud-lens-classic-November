@@ -63,6 +63,11 @@ DIMENSIONS = [
     "ServiceName",
     "ResourceGroup",
     "RegionName",
+    # Marketplace/ISV spend is selected by publisher rather than by service family, so
+    # without this the Marketplace tab was the one tab that had to read the detail table
+    # for its money. Measured on the real estate before adding it: three distinct values
+    # across 5.8M rows, so it costs the grain essentially nothing.
+    "PublisherName",
 ]
 
 # The date column the rollup is windowed and retained by. Named off DIMENSIONS
@@ -117,6 +122,42 @@ def covers(group_by: list[str], measures: list[str]) -> bool:
     """
     return (all(g in SERVABLE for g in group_by)
             and all(m in MEASURES for m in measures))
+
+
+# The filter-bar dimensions the rollup can narrow itself. The rest of the bar --
+# `charge` and `pricing`, and `env`, which is read out of the `Tags` document --
+# names columns this grain does not carry, so a connection using any of them has
+# to answer from the detail table instead.
+FILTERABLE = frozenset({"rg", "service", "region"})
+
+
+def serves_filters(filters: dict[str, list[str]] | None) -> bool:
+    """Whether every dimension the caller narrowed is one the rollup holds.
+
+    Only dimensions with something actually selected count. An empty list adds no
+    predicate, so a filter bar that merely *offers* `charge` does not disqualify
+    the rollup until somebody picks a value from it.
+    """
+    return all(
+        key in FILTERABLE
+        for key, values in (filters or {}).items()
+        if any(v and v.strip() for v in (values or []))
+    )
+
+
+def derive_sql(source: str) -> str:
+    """The rollup grain computed on the fly from `source`.
+
+    The fallback for connections the rollup table cannot serve -- a converted
+    currency, or a filter on a dimension outside the grain. Aggregating the scoped
+    `costs` view gives a relation with exactly the rollup's shape, so a query reads
+    the same either way and cannot tell which backing answered it.
+
+    No faster than querying the detail table directly, which is the point: it is
+    there so that routing a query to the rollup is never *wrong*, not so that every
+    route is quick.
+    """
+    return _select(source)
 
 
 def create_sql(schema: str) -> list[str]:

@@ -86,8 +86,11 @@ def since_date(default: str) -> str:
 
 
 def window(reader: Any, days: int) -> tuple[str, str, str]:
+    # The rollup when the reader offers one: this runs on every tab load, and a
+    # min/max over the detail table reads every page to find two dates.
+    source = getattr(reader, "agg", "costs")
     rows = reader.rows(
-        'SELECT max("ChargePeriodStart") AS hi, min("ChargePeriodStart") AS lo FROM costs')
+        f'SELECT max("ChargePeriodStart") AS hi, min("ChargePeriodStart") AS lo FROM {source}')
     hi = rows[0]["hi"] if rows and rows[0].get("hi") else None
     if hi is None:
         return "", "", ""

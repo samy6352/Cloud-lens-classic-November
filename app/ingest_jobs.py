@@ -25,6 +25,26 @@ def frozen_periods(months: int, created_at: str) -> list[tuple[str, str, str]]:
     return periods
 
 
+def _written_window(bounds: list[str]) -> tuple[date, date] | None:
+    """The whole-month span covering every date an ingest committed, or None.
+
+    None means "rebuild everything", which is what an ingest that committed
+    nothing, or whose dates could not be read, must fall back to. Returning a
+    narrow window on uncertain input is the one way this can produce a quietly
+    stale dashboard, so anything unparseable abandons the optimisation entirely
+    rather than guessing at a smaller scope.
+    """
+    from .rollup import month_window
+
+    days = []
+    for value in bounds:
+        try:
+            days.append(date.fromisoformat(str(value)[:10]))
+        except (TypeError, ValueError):
+            return None
+    return month_window(days)
+
+
 async def ingest(subscriptions: list[dict], months: int, metric: str, *, quick: bool) -> dict:
     require_writable()
     from .warehouse import CLIENT_TYPE, COLUMNS_INDEX, QUICK_DEADLINE, _token, warehouse
@@ -48,6 +68,11 @@ async def ingest(subscriptions: list[dict], months: int, metric: str, *, quick: 
     progress = jobs.current_progress.get()
     progress.update(status="running", metric=metric, mode="quick" if quick else "details",
                     total=len(record["tasks"]), done=0, rows=0, failed=0, progress=0)
+    # The charge dates actually committed, so the rollup can rebuild just the months
+    # that changed instead of re-scanning all retained history. Only successful
+    # replacements are recorded: a failed task rolls its transaction back and leaves
+    # its days exactly as the last rebuild saw them, so they need no rebuilding.
+    written: list[str] = []
     async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
         for task in record["tasks"]:
             if task["status"] == "ready":
@@ -78,6 +103,7 @@ async def ingest(subscriptions: list[dict], months: int, metric: str, *, quick: 
                 rows = await warehouse._replace(
                     sub["id"], task["from"], task["to"], records,
                     preserve_detail=task["kind"] == "quick")
+                written.extend((task["from"], task["to"]))
                 await asyncio.to_thread(warehouse._log, sub, task["label"], rows, "ok", task["kind"])
                 await asyncio.to_thread(jobs.update, jid, task_id=task["task_id"],
                                         status="ready", rows=rows, finished=jobs.now())
@@ -93,7 +119,7 @@ async def ingest(subscriptions: list[dict], months: int, metric: str, *, quick: 
                 progress["done"] += 1
                 progress["progress"] = progress["done"] / max(1, progress["total"])
     await jobs.phase("warming-cache")
-    await warehouse.refresh_rollup_async()
+    await warehouse.refresh_rollup_async(_written_window(written))
     status = ("partial" if progress["failed"] and progress["rows"] else
               "failed" if progress["failed"] else "ready")
     progress.update(status=status, finished=jobs.now())

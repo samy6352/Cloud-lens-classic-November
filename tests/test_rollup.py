@@ -395,3 +395,62 @@ def test_a_windowed_rebuild_corrects_its_month_and_leaves_the_others_alone(loade
     assert after["2026-02"] != pytest.approx(before_rollup["2026-02"], abs=0.01)
     assert other_months() == before_others, "a month outside the window was rewritten"
     assert after == pytest.approx(detail_by_month(), abs=0.01)
+
+
+def test_a_windowed_rebuild_is_ignored_after_a_failed_rebuild(loaded, monkeypatch):
+    """A failure must force the next rebuild to be full, whatever the caller asks for.
+
+    This is the one way narrowing can go permanently wrong. A failed rebuild leaves
+    days stale; if every later windowed rebuild stepped over them they would never
+    be corrected, and the dashboard would keep showing them with no indication that
+    anything was wrong.
+    """
+    import datetime as dt
+
+    from app import rollup as rollup_module
+
+    calls: list[object] = []
+    real = rollup_module.rebuild
+
+    def spy(con, schema, source, window=None):
+        calls.append(window)
+        return real(con, schema, source, window)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("rebuild failed on purpose")
+
+    monkeypatch.setattr(rollup_module, "rebuild", boom)
+    assert loaded.refresh_rollup() == 0
+
+    # The very next windowed request must be widened to a full rebuild.
+    monkeypatch.setattr(rollup_module, "rebuild", spy)
+    loaded.refresh_rollup(window=(dt.date(2026, 2, 1), dt.date(2026, 3, 1)))
+    assert calls == [None], "a window was honoured while the rollup was known stale"
+
+    # And once one has succeeded, windows are honoured again.
+    loaded.refresh_rollup(window=(dt.date(2026, 2, 1), dt.date(2026, 3, 1)))
+    assert calls[-1] == (dt.date(2026, 2, 1), dt.date(2026, 3, 1))
+
+
+def test_the_ingest_window_covers_every_committed_date():
+    """Derived from the task bounds an ingest actually committed."""
+    import datetime as dt
+
+    from app.ingest_jobs import _written_window
+
+    assert _written_window([]) is None
+
+    lo, hi = _written_window(["2026-02-01", "2026-02-28"])
+    assert (lo, hi) == (dt.date(2026, 2, 1), dt.date(2026, 3, 1))
+
+    # Several tasks over several months collapse to one covering span.
+    lo, hi = _written_window(["2026-01-15", "2026-01-31", "2026-03-01", "2026-03-31"])
+    assert (lo, hi) == (dt.date(2026, 1, 1), dt.date(2026, 4, 1))
+
+
+def test_an_unreadable_ingest_date_abandons_the_optimisation():
+    """Uncertain input must widen to a full rebuild, never guess a narrower one."""
+    from app.ingest_jobs import _written_window
+
+    assert _written_window(["2026-02-01", "not-a-date"]) is None
+    assert _written_window([None]) is None
