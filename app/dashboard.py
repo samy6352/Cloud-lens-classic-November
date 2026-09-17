@@ -176,14 +176,71 @@ class Dashboard:
 
     @staticmethod
     def _ranked(reader: Any, query: str, limit: int, *, movers: bool = False) -> list[dict]:
-        """Bound presentation rows only after ranking within each native currency."""
+        """Bound presentation rows only after ranking within each native currency.
+
+        Ranking is done by taking the top rows per currency rather than by
+        numbering every row and discarding almost all of them. The two select the
+        same rows in the same order -- the ORDER BY is unchanged -- but they cost
+        very different amounts: numbering requires the whole input sorted, while a
+        bounded `ORDER BY ... LIMIT` lets PostgreSQL keep a heap of `limit` rows
+        and never sort the rest.
+
+        On the live estate the top-resources query groups 507,846 rows to publish
+        twenty of them. Sorting all of it took 5.9s, of which about 3.9s was libc
+        string comparison. `COLLATE "C"` would have removed most of that too, and
+        was measured saving 4.0s in 7 of 7 paired runs -- but it changes which of
+        two equal-cost rows wins and the order the currency groups come out in.
+        This changes neither.
+
+        The threshold is found with `ORDER BY ... LIMIT 1 OFFSET n-1`, which both
+        PostgreSQL and SQLite answer with a bounded heap of n rows. `LATERAL` would
+        read better and SQLite does not have it; these queries run against SQLite in
+        the offline tests, so the portable spelling is the one that can be tested.
+
+        `cut` is `MATERIALIZED` and that is not optional. Left inlinable, PostgreSQL
+        pushed the threshold subquery into the join filter and evaluated it once per
+        candidate row rather than once per currency: the estimate went to 4.4e11 and
+        the live query, measured at 6.2s before this change, was still running after
+        879 seconds. Materialising it makes the same query 1.4s.
+
+        Rows at the threshold are kept with `>=`, so ties spill through and the
+        window below still trims to `limit`. That keeps the boundary behaviour
+        identical to ranking everything: the same rows survive, in the same order,
+        with the same ranks.
+
+        `grouped` is `MATERIALIZED` because it is read three times here and the
+        aggregate behind it is the expensive part.
+        """
+        def threshold(order: str, n: int, alias: str) -> str:
+            """The nth-largest value per currency, or NULL where there are fewer."""
+            return (f"(SELECT g.cost FROM grouped g "
+                    f"WHERE g.currency IS NOT DISTINCT FROM c.currency "
+                    f"ORDER BY {order} LIMIT 1 OFFSET {n - 1}) AS {alias}")
+
+        # `cost` is what the cut is expressed in for both rankings, so the mover
+        # threshold is taken on its own ordering but compared on the same column.
+        cuts = [f"(SELECT abs(g.cost - g.prior) FROM grouped g "
+                f"WHERE g.currency IS NOT DISTINCT FROM c.currency "
+                f"ORDER BY abs(g.cost - g.prior) DESC, g.name LIMIT 1 OFFSET 7) AS move_cut"
+                ] if movers else []
+        keep = ["cut.spend_cut IS NULL OR grouped.cost >= cut.spend_cut"]
+        if movers:
+            keep.append("cut.move_cut IS NULL OR abs(grouped.cost - grouped.prior) >= cut.move_cut")
         movement = (
             ", row_number() OVER (PARTITION BY currency ORDER BY abs(cost - prior) DESC, name) "
             "AS movement_rank" if movers else "")
         return reader.rows(
-            f"WITH grouped AS ({query}), ranked AS (SELECT grouped.*, "
+            f"WITH grouped AS MATERIALIZED ({query}), "
+            "cut AS MATERIALIZED (SELECT c.currency, "
+            + ", ".join([threshold(f"g.cost DESC, g.name", limit, "spend_cut")] + cuts)
+            + " FROM (SELECT DISTINCT currency FROM grouped) c), "
+            "picked AS (SELECT grouped.* FROM grouped JOIN cut "
+            "ON cut.currency IS NOT DISTINCT FROM grouped.currency "
+            f"WHERE ({') OR ('.join(keep)})), "
+            "ranked AS (SELECT picked.*, "
             "row_number() OVER (PARTITION BY currency ORDER BY cost DESC, name) AS spend_rank"
-            f"{movement} FROM grouped) SELECT * FROM ranked WHERE spend_rank <= {limit}"
+            f"{movement} FROM picked) "
+            f"SELECT * FROM ranked WHERE spend_rank <= {limit}"
             + (" OR movement_rank <= 8" if movers else "")
             + " ORDER BY currency, cost DESC, name", None)
 
