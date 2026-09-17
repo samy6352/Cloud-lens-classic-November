@@ -438,6 +438,19 @@ class Dashboard:
             # Money and resource counts come from different derived tables now, so they
             # are computed separately and joined rather than scanned together. `_ranked`
             # still ranks by cost over the joined result, exactly as before.
+            #
+            # The two halves deliberately read different windows. Money spans `window`
+            # because it publishes a prior-period column; the count spans `period`
+            # because it does not. It is published as what is deployed in a region now,
+            # beside current spend, and `counts` above answers the same question for the
+            # estate over `period` -- so counting it over the comparison window made the
+            # tab disagree with itself: Central India read 2,031,576 resources beside a
+            # headline of 901,988, because every resource that existed only in the prior
+            # period was still being counted as deployed. Over `period` the same region
+            # reads 901,239 and the two figures reconcile.
+            #
+            # Half the scan falls out of that: 1.23M presence rows rather than 2.79M,
+            # measured at 4.1s against 9.5s, on a tab that spends 95% of its time here.
             regions_top = self._ranked(r,
                 'WITH money AS (SELECT coalesce("RegionName", \'—\') AS name, '
                 '"BillingCurrency" AS currency, ' + split
@@ -445,7 +458,7 @@ class Dashboard:
                 'seen AS (SELECT coalesce("RegionName", \'—\') AS name, '
                 '"BillingCurrency" AS currency, count(*) AS resources '
                 'FROM (SELECT DISTINCT "RegionName", "BillingCurrency", "ResourceId" '
-                f'FROM {res} WHERE {window}) x GROUP BY 1, 2) '
+                f'FROM {res} WHERE {period}) x GROUP BY 1, 2) '
                 'SELECT money.name, money.currency, money.cost, money.prior, '
                 'coalesce(seen.resources, 0) AS resources FROM money LEFT JOIN seen '
                 'ON seen.name = money.name '
