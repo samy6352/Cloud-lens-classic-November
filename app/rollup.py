@@ -159,6 +159,24 @@ def derive_sql(source: str) -> str:
     return select_sql(source)
 
 
+def charges_sql(source: str) -> str:
+    """How many detail rows `source` stands for.
+
+    Both backings of the rollup carry the count as `charges` -- the table because
+    `select_sql` builds it, the on-the-fly fallback because it is the same
+    statement -- so the only relation without the column is the detail table
+    itself, where one row is one charge.
+
+    Here rather than at the call site so that a caller holding `Reader.agg` can
+    ask for a row count without first working out which relation it is holding.
+    Cast because `sum(bigint)` is `numeric` in PostgreSQL, which psycopg hands
+    back as a `Decimal` -- and a row count that is a Decimal reaches the JSON
+    encoder, which refuses it. `count(*)` is already `bigint`, so the two arms
+    return the same Python type and a caller cannot tell them apart.
+    """
+    return "count(*)" if source == "costs" else "CAST(sum(charges) AS bigint)"
+
+
 def table_sql(schema: str, table: str = TABLE) -> str:
     """DDL for the rollup table, at whatever name it is being built under.
 

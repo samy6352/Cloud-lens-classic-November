@@ -2309,43 +2309,55 @@ class Warehouse:
 
     def currencies(self, scope: list[str] | None = None) -> list[str]:
         """Distinct billing currencies present, honouring the subscription scope."""
-        with self.connect(read_only=True, scope=scope) as con:
-            rows = con.execute(
-                'SELECT DISTINCT "BillingCurrency" FROM costs '
-                "WHERE \"BillingCurrency\" IS NOT NULL AND \"BillingCurrency\" <> ''"
-            ).fetchall()
-        return sorted(r[0] for r in rows)
+        with self.reader(scope) as reader:
+            rows = reader.rows(
+                f'SELECT DISTINCT "BillingCurrency" FROM {reader.agg} '
+                "WHERE \"BillingCurrency\" IS NOT NULL AND \"BillingCurrency\" <> ''",
+                None)
+        return sorted(r["BillingCurrency"] for r in rows)
 
     def summary(self, scope: list[str] | None = None) -> dict[str, Any]:
         """What the warehouse holds. With a scope, only what those subscriptions contribute —
-        so a person who can see one subscription isn't told the row count of the whole estate."""
-        with self.connect(read_only=True, scope=scope) as con:
-            row = con.execute(
-                'SELECT count(*), min("ChargePeriodStart"), max("ChargePeriodStart"), '
-                'count(DISTINCT "SubAccountId") FROM costs'
-            ).fetchone()
-            # Totals are only meaningful within a single currency, so never pre-sum across them.
-            by_currency = con.execute(
-                'SELECT coalesce(nullif("BillingCurrency", \'\'), \'unknown\'), sum("BilledCost") '
-                "FROM costs GROUP BY 1 ORDER BY 2 DESC"
-            ).fetchall()
-            pending = con.execute(
-                "SELECT value FROM meta WHERE key = ?", ["subscription_reconciliation"]
-            ).fetchone()
+        so a person who can see one subscription isn't told the row count of the whole estate.
 
-        totals = [{"currency": c, "cost": round(v or 0.0, 2)} for c, v in by_currency]
+        Read from `Reader.agg` rather than `costs`. Every question here is at or
+        above the rollup's grain: the row count is the sum of the `charges` each
+        group stands for, the period is a min/max over its date column, and the
+        money is already summed per currency. On the real estate that is the
+        difference between 25s and 0.15s, and this runs on the header of every
+        page -- so the detail table was being scanned in full to answer four
+        numbers that the rollup holds pre-computed.
+        """
+        with self.reader(scope) as reader:
+            row = reader.rows(
+                f'SELECT {rollup.charges_sql(reader.agg)} AS rows, '
+                f'min("ChargePeriodStart") AS lo, max("ChargePeriodStart") AS hi, '
+                f'count(DISTINCT "SubAccountId") AS subs FROM {reader.agg}')[0]
+            # Totals are only meaningful within a single currency, so never pre-sum across them.
+            by_currency = reader.rows(
+                'SELECT coalesce(nullif("BillingCurrency", \'\'), \'unknown\') AS currency, '
+                f'sum("BilledCost") AS cost FROM {reader.agg} GROUP BY 1 ORDER BY 2 DESC',
+                None)
+
+        # Its own read, because `Reader` passes no parameters and this key is bound.
+        # A single indexed row against `meta`, so the extra connection costs nothing
+        # next to the scan it replaced.
+        pending = self.get_meta("subscription_reconciliation")
+
+        totals = [{"currency": r["currency"], "cost": round(r["cost"] or 0.0, 2)}
+                  for r in by_currency]
         known = [t for t in totals if t["currency"] != "unknown"]
         mixed = len(totals) > 1
-        affected = json.loads(pending[0]) if pending else {}
+        affected = json.loads(pending) if pending else {}
         allowed = {canonical_sub_id(sid) for sid in scope} if scope else None
         reconciliation = [{"subscription_id": sid, **period}
                           for sid, period in sorted(affected.items())
                           if allowed is None or sid in allowed]
         return {
-            "rows": row[0] or 0,
-            "from": str(row[1]) if row[1] else None,
-            "to": str(row[2]) if row[2] else None,
-            "subscriptions": row[3] or 0,
+            "rows": row["rows"] or 0,
+            "from": str(row["lo"]) if row["lo"] else None,
+            "to": str(row["hi"]) if row["hi"] else None,
+            "subscriptions": row["subs"] or 0,
             # Left as None when mixed: a single cross-currency total would be a meaningless number.
             "total_cost": totals[0]["cost"] if len(totals) == 1 else None,
             "total_by_currency": totals,
@@ -2637,15 +2649,20 @@ class Warehouse:
             )
 
     def subscriptions(self, scope: list[str] | None = None) -> list[dict[str, Any]]:
-        """Subscriptions present in the warehouse, with their total spend."""
-        with self.connect(read_only=True, scope=scope) as con:
-            rows = con.execute(
+        """Subscriptions present in the warehouse, with their total spend.
+
+        Grouped on three columns the rollup carries, so `Reader.agg` answers it
+        exactly. This backs the subscription picker, which every page opens with.
+        """
+        with self.reader(scope) as reader:
+            rows = reader.rows(
                 'SELECT "SubAccountId" AS id, "SubAccountName" AS name, '
                 'coalesce(nullif("BillingCurrency", \'\'), \'unknown\') AS currency, '
-                'round(sum("BilledCost"),2) AS cost FROM costs '
-                'WHERE "SubAccountId" IS NOT NULL GROUP BY 1,2,3 ORDER BY cost DESC'
-            ).fetchall()
-        return [{"id": r[0], "name": r[1], "currency": r[2], "cost": r[3]} for r in rows]
+                f'round(sum("BilledCost"), 2) AS cost FROM {reader.agg} '
+                'WHERE "SubAccountId" IS NOT NULL GROUP BY 1,2,3 ORDER BY cost DESC',
+                None)
+        return [{"id": r["id"], "name": r["name"], "currency": r["currency"],
+                 "cost": r["cost"]} for r in rows]
 
     # ------------------------------------------------------------------ meta
     # Small durable facts about the deployment. Deliberately not part of `state`, which is

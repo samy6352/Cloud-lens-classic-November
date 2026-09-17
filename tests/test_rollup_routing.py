@@ -19,6 +19,7 @@ from pathlib import Path as _Path
 # Tests live in tests/ and import the application from the checkout root.
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
 
+import json
 import os
 import uuid
 
@@ -262,6 +263,62 @@ def test_the_grand_total_is_not_merely_close(loaded):
     """The one figure that must be exact, because it is the one people reconcile."""
     with loaded.reader() as r:
         assert _total(r, r.agg) == _total(r, "costs")
+
+
+# --------------------------------------------------------------- warehouse summary
+
+def test_the_summary_counts_charges_not_rollup_groups(loaded):
+    """`summary` reads the rollup, where one row stands for many charges.
+
+    The number on the page is a count of charges, so summing `charges` is the
+    only reading of the rollup that reproduces it. Taking `count(*)` there would
+    report the number of groups -- a smaller number, and a plausible-looking one.
+    """
+    with loaded.reader() as r:
+        detail = r.rows('SELECT count(*) AS n FROM costs')[0]["n"]
+        groups = r.rows(f'SELECT count(*) AS n FROM {r.agg}')[0]["n"]
+    assert groups < detail, "fixture must aggregate, or this test proves nothing"
+    assert loaded.summary()["rows"] == detail
+
+
+def test_the_summary_row_count_survives_the_json_encoder(loaded):
+    """`sum(bigint)` is `numeric` in PostgreSQL, and a Decimal cannot be encoded.
+
+    Caught in a browser rather than here the first time: the query was correct,
+    the total was right, and `/api/warehouse` still returned 500 because the
+    count came back as a `Decimal`. The type is part of the contract.
+    """
+    summary = loaded.summary()
+    assert isinstance(summary["rows"], int)
+    assert isinstance(summary["subscriptions"], int)
+    json.dumps(summary)
+
+
+def test_the_summary_is_the_same_without_the_rollup(loaded, monkeypatch):
+    """The fast path and the detail table must agree on every field."""
+    routed = loaded.summary()
+    _without_rollup(monkeypatch)
+    assert routed == loaded.summary()
+
+
+def test_the_subscription_picker_is_the_same_without_the_rollup(loaded, monkeypatch):
+    routed = loaded.subscriptions()
+    _without_rollup(monkeypatch)
+    assert routed == loaded.subscriptions()
+
+
+def test_the_currency_list_is_the_same_without_the_rollup(loaded, monkeypatch):
+    routed = loaded.currencies()
+    _without_rollup(monkeypatch)
+    assert routed == loaded.currencies()
+
+
+def test_the_summary_cannot_see_past_its_scope(loaded):
+    """Routing a scoped read to the rollup must not widen what it can see."""
+    scoped = loaded.summary(scope=[str(uuid.UUID(int=2))])
+    whole = loaded.summary()
+    assert scoped["rows"] < whole["rows"]
+    assert scoped["subscriptions"] == 1
 
 
 # ------------------------------------------------------- resource presence table

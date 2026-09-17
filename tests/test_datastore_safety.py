@@ -114,6 +114,13 @@ def test_reconciliation_notice_is_scoped_and_survives_summary(offline_warehouse,
         yield memory
 
     wh.connect = connection
+    # `summary` reads through the `reader` seam so it can be answered by the rollup;
+    # the default `Reader` names `costs`, which is the relation this fixture holds.
+    @contextmanager
+    def reading(*args, **kwargs):
+        yield offline_warehouse.Reader(memory)
+
+    wh.reader = reading
     result = wh.summary(scope=["/subscriptions/SUB-A"])
     assert result["reconciliation_required"]
     assert result["reconciliation"] == [
@@ -133,6 +140,11 @@ def test_summary_does_not_label_unknown_plus_usd_as_single_currency(offline_ware
         yield memory
 
     wh.connect = connection
+    @contextmanager
+    def reading(*args, **kwargs):
+        yield offline_warehouse.Reader(memory)
+
+    wh.reader = reading
     result = wh.summary()
     assert result["mixed_currency"]
     assert result["currency"] is None and result["total_cost"] is None

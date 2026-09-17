@@ -119,12 +119,18 @@ def metadata(warehouse: Any, scope: list[str] | None, days: int = 30,
     month = selected_month()
     # Discover availability before applying the month, but never outside the authorized scope.
     with select(None), warehouse.reader(scope, filters=filters) as reader:
+        # The rollup when the reader offers one, as `window` does: this is the header
+        # of every page, and both questions below are a scan of the detail table for
+        # an answer the rollup holds at a fraction of the rows.
+        source = getattr(reader, "agg", "costs")
         rows = reader.rows(
-            'SELECT max("ChargePeriodStart") AS hi, min("ChargePeriodStart") AS lo FROM costs')
+            'SELECT max("ChargePeriodStart") AS hi, min("ChargePeriodStart") AS lo '
+            f'FROM {source}')
         latest = str(rows[0]["hi"])[:10] if rows and rows[0].get("hi") else None
         months = reader.rows(
             'SELECT DISTINCT substr(CAST("ChargePeriodStart" AS VARCHAR), 1, 7) AS month '
-            'FROM costs WHERE "ChargePeriodStart" IS NOT NULL ORDER BY month DESC', 12000)
+            f'FROM {source} WHERE "ChargePeriodStart" IS NOT NULL '
+            'ORDER BY month DESC', 12000)
     bounds = month_bounds(month) if month else None
     if bounds:
         start, end = bounds
