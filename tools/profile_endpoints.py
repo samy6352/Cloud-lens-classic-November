@@ -79,7 +79,7 @@ def sample(stop: threading.Event, seen: Counter, texts: dict, buckets: Counter,
     look 95% dominated by a statement neither runs. Compare `query_start` against
     the moment this request began and count only what this request caused.
     """
-    with psycopg.connect(conninfo()) as con:
+    with psycopg.connect(conninfo(), autocommit=True) as con:
         while not stop.is_set():
             try:
                 rows = con.execute(
@@ -111,12 +111,18 @@ def run(port: int, path: str) -> None:
     texts: dict = {}
     buckets: Counter = Counter()
     stop = threading.Event()
-    # A second of slack, because `query_start` is the server's clock and this is
-    # the client's; a statement issued moments before must not be excluded.
-    started = time.time()
+    # Taken from the *server's* clock, not the client's. `query_start` is a server
+    # timestamp, and comparing it against a client `time.time()` silently drops
+    # every statement whenever the two clocks differ by more than the slack --
+    # which is how this tool once reported a single statement for a request that
+    # issued seven.
+    with psycopg.connect(conninfo(), autocommit=True) as probe:
+        since = float(probe.execute(
+            "SELECT extract(epoch from clock_timestamp())").fetchone()[0]) - 1
     sampler = threading.Thread(target=sample,
-                               args=(stop, seen, texts, buckets, started - 1), daemon=True)
+                               args=(stop, seen, texts, buckets, since), daemon=True)
     sampler.start()
+    started = time.time()
 
     status = "?"
     try:

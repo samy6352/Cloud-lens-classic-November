@@ -56,13 +56,19 @@ def main() -> None:
     samples: list[tuple] = []
 
     def sample() -> None:
-        with psycopg.connect(conninfo()) as con:
+        # Autocommit, because `now()` in PostgreSQL is the *transaction's* start
+        # time. A sampling connection that holds one transaction freezes it, and
+        # every `now() - query_start` is then measured from the moment sampling
+        # began -- which reported a 9.3s statement as never older than 0.09s.
+        # `clock_timestamp()` is the real clock and is used for the same reason.
+        with psycopg.connect(conninfo(), autocommit=True) as con:
             while not stop.is_set():
                 try:
                     rows = con.execute(
                         "SELECT pid, state, wait_event_type, wait_event, "
-                        "extract(epoch from now() - query_start), "
-                        "extract(epoch from now() - xact_start), query "
+                        "extract(epoch from clock_timestamp() - query_start), "
+                        "extract(epoch from clock_timestamp() - xact_start), query, "
+                        "extract(epoch from query_start) "
                         "FROM pg_stat_activity WHERE datname = current_database() "
                         "AND application_name = %s AND pid <> pg_backend_pid() "
                         "AND query NOT LIKE '%%pg_stat_activity%%'", (APPNAME,)).fetchall()
@@ -92,11 +98,15 @@ def main() -> None:
 
     # Per statement: which backends ran it, how many ticks it was active for, and
     # the longest single execution seen. A statement that is always young but
-    # always present is being run over and over.
+    # always present is being run over and over -- which `executions` counts
+    # directly, by how many distinct start times were seen for it. That is the
+    # number that separates one slow query from a hundred quick ones, and the two
+    # have nothing in common as problems.
     by_sql: dict[str, dict] = defaultdict(
-        lambda: {"pids": set(), "active": 0, "idle": 0, "max_age": 0.0, "waits": defaultdict(int)})
+        lambda: {"pids": set(), "active": 0, "idle": 0, "max_age": 0.0,
+                 "starts": set(), "waits": defaultdict(int)})
     states: dict[str, int] = defaultdict(int)
-    for _, pid, state, wtype, wevent, age, _xage, sql in samples:
+    for now, pid, state, wtype, wevent, age, _xage, sql, qstart in samples:
         key = shape(sql or "")
         entry = by_sql[key]
         entry["pids"].add(pid)
@@ -104,6 +114,11 @@ def main() -> None:
         if state == "active":
             entry["active"] += 1
             entry["max_age"] = max(entry["max_age"], float(age or 0))
+            # The server's own `query_start`, not one derived from the client's
+            # clock. Deriving it counted 234 executions of a statement the request
+            # issues once, because client and server clocks drift and every sample
+            # looked like a fresh start.
+            entry["starts"].add((pid, qstart))
             entry["waits"][f"{wtype or '-'}/{wevent or '-'}"] += 1
         else:
             entry["idle"] += 1
@@ -118,8 +133,10 @@ def main() -> None:
         if not entry["active"]:
             continue
         secs = entry["active"] * INTERVAL
+        runs = len(entry["starts"]) or 1
         print(f"\n   {secs:7.1f}s active  across {len(entry['pids'])} backend(s)  "
-              f"longest single execution {entry['max_age']:.2f}s")
+              f"~{runs} execution(s)  longest {entry['max_age']:.2f}s  "
+              f"mean {secs / runs:.2f}s")
         top = sorted(entry["waits"].items(), key=lambda kv: -kv[1])[:3]
         print(f"      waits: " + ", ".join(f"{w} x{n}" for w, n in top))
         print(f"      {key}")
