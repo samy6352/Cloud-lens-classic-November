@@ -71,7 +71,6 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-import time
 from typing import Any
 
 log = logging.getLogger("cloudlens.presence")
@@ -166,22 +165,40 @@ def serves_money(rate: float | None) -> bool:
     return rate is None
 
 
-def create_sql(schema: str) -> list[str]:
-    """DDL for the presence table and its indexes."""
+def table_sql(schema: str, table: str = TABLE) -> str:
+    """DDL for the presence table, at whatever name it is being built under.
+
+    Parameterised by name so a full rebuild can assemble the replacement in a
+    staging table of the same shape. See `derived` for why that is worth doing.
+    """
     _validate()
     cols = ",\n  ".join(
         [f'"{d}" {"date" if d == PERIOD else "text"}' for d in DIMENSIONS]
         + [f'"{m}" double precision' for m in MEASURES]
     )
+    return f'CREATE TABLE IF NOT EXISTS "{schema}".{table} (\n  {cols}\n)'
+
+
+def index_sql(schema: str, table: str = TABLE) -> list[str]:
+    """The indexes the presence table is read through.
+
+    Named after `table` so that a staging rebuild, which creates them only after
+    the swap has given the table its real name, produces the same names a
+    first-time create would.
+    """
     return [
-        f'CREATE TABLE IF NOT EXISTS "{schema}".{TABLE} (\n  {cols}\n)',
         # Every query against it is bounded by a date window, as with the rollup.
-        f'CREATE INDEX IF NOT EXISTS {TABLE}_period_idx '
-        f'ON "{schema}".{TABLE} ("{PERIOD}")',
+        f'CREATE INDEX IF NOT EXISTS {table}_period_idx '
+        f'ON "{schema}".{table} ("{PERIOD}")',
         # And then usually narrowed to a set of subscriptions.
-        f'CREATE INDEX IF NOT EXISTS {TABLE}_sub_idx '
-        f'ON "{schema}".{TABLE} (lower("SubAccountId"), "{PERIOD}")',
+        f'CREATE INDEX IF NOT EXISTS {table}_sub_idx '
+        f'ON "{schema}".{table} (lower("SubAccountId"), "{PERIOD}")',
     ]
+
+
+def create_sql(schema: str) -> list[str]:
+    """DDL for the presence table and its indexes."""
+    return [table_sql(schema), *index_sql(schema)]
 
 
 def select_sql(source: str, window: tuple[dt.date, dt.date] | None = None) -> str:
@@ -205,31 +222,15 @@ def select_sql(source: str, window: tuple[dt.date, dt.date] | None = None) -> st
 
 def rebuild(con: Any, schema: str, source: str,
             window: tuple[dt.date, dt.date] | None = None) -> int:
-    """Rebuild the presence table from the detail table.
+    """Rebuild the presence table alone from the detail table.
 
-    Same contract as `rollup.rebuild`, and rebuilt in the same transaction, so the
-    two derived tables can never disagree about which generation of `costs` they
-    describe. A caller passing a `window` takes on the same obligation: it must
-    cover every day the write touched, because days outside it keep what the last
-    rebuild produced.
+    The one-table spelling of `derived.rebuild`, which is where the mechanism and
+    the reasoning behind it live. `Warehouse.refresh_rollup` rebuilds this table
+    alongside the rollup in a single call, so the two can never disagree about
+    which generation of `costs` they describe.
     """
-    t0 = time.monotonic()
-    scope = ""
-    if window is not None:
-        lo, hi = window
-        scope = (f' WHERE "{PERIOD}" >= DATE \'{lo.isoformat()}\''
-                 f' AND "{PERIOD}" < DATE \'{hi.isoformat()}\'')
-    con.execute("BEGIN")
-    try:
-        con.execute(f'DELETE FROM "{schema}".{TABLE}{scope}')
-        con.execute(f'INSERT INTO "{schema}".{TABLE} {select_sql(source, window)}')
-        con.execute("COMMIT")
-    except Exception:
-        con.execute("ROLLBACK")
-        raise
+    import sys
 
-    rows = con.execute(f'SELECT count(*) FROM "{schema}".{TABLE}').fetchone()[0]
-    con.execute(f'ANALYZE "{schema}".{TABLE}')
-    log.info("presence: %s rows in %.1fs (%s)", f"{rows:,}", time.monotonic() - t0,
-             "full" if window is None else f"{window[0]}..{window[1]}")
-    return int(rows or 0)
+    from . import derived
+
+    return derived.rebuild(con, schema, (sys.modules[__name__],), source, window)[TABLE]

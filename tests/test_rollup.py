@@ -234,6 +234,140 @@ def test_a_second_refresh_does_not_double_the_totals(loaded):
     assert first == pytest.approx(second, abs=0.01)
 
 
+# ------------------------------------------------------ replacing without bloating
+
+def _relfilenode(warehouse, table: str) -> int:
+    """The physical file behind a table.
+
+    Asked for rather than `n_dead_tup`, which would be the more direct measurement
+    but comes from the statistics collector and is therefore updated asynchronously
+    -- a test reading it straight after a rebuild races the collector and fails
+    intermittently. The relfilenode is catalogue state, visible the moment the
+    transaction commits, and it answers the question that actually matters: whether
+    the old heap was dropped or merely tombstoned.
+    """
+    with warehouse._store.connect() as con:  # noqa: SLF001
+        row = con.execute(
+            "SELECT c.relfilenode FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = ? AND c.relname = ?",
+            [warehouse._rollup_schema, table]).fetchone()  # noqa: SLF001
+    return int(row[0])
+
+
+@pytest.mark.parametrize("table", ["costs_rollup", "resource_presence"])
+def test_a_full_rebuild_replaces_the_heap_rather_than_tombstoning_it(loaded, table):
+    """DELETE marks every row dead rather than reclaiming it.
+
+    Replacing a whole table that way writes a complete second copy into the heap
+    before the first can be reused. Measured on the real estate after one full
+    rebuild: 2,784,069 dead tuples against 2,781,983 live, and a heap at 861 B/row
+    against a real ~430 -- an entire extra copy.
+
+    A full rebuild now assembles the replacement in a staging table and swaps it in.
+    A new relfilenode is the evidence: the table is reading from a different file,
+    so the old heap was dropped outright and there is nothing left for VACUUM to
+    reclaim.
+    """
+    loaded.refresh_rollup()
+    before = _relfilenode(loaded, table)
+    loaded.refresh_rollup()
+    assert _relfilenode(loaded, table) != before, (
+        f"{table} was rewritten in place, which leaves the old rows dead in the heap")
+
+
+@pytest.mark.parametrize("table", ["costs_rollup", "resource_presence"])
+def test_a_windowed_rebuild_writes_in_place(loaded, table):
+    """Staging the whole table to replace one month of it would be slower for nothing.
+
+    A window replaces a bounded span, so the dead tuples it leaves are bounded by
+    that span and autovacuum reclaims them between runs. Keeping the same
+    relfilenode is what says the rebuild wrote in place.
+    """
+    import datetime as dt
+
+    loaded.refresh_rollup()
+    before = _relfilenode(loaded, table)
+    loaded.refresh_rollup(window=(dt.date(2026, 2, 1), dt.date(2026, 3, 1)))
+    assert _relfilenode(loaded, table) == before
+
+
+def test_a_full_rebuild_keeps_the_indexes_it_is_read_through(loaded):
+    """The swap drops the old table, so the indexes have to be rebuilt with it.
+
+    They are created after the rename rather than on the staging table, so they
+    take the names the table's own DDL gives them. Created on the staging table
+    they would keep a staging-derived name for ever, and the next rebuild would
+    collide with its own previous output.
+    """
+    from app import presence, rollup
+
+    loaded.refresh_rollup()
+    loaded.refresh_rollup()
+    with loaded._store.connect() as con:  # noqa: SLF001
+        found = {row[0] for row in con.execute(
+            "SELECT indexname FROM pg_indexes WHERE schemaname = ?",
+            [loaded._rollup_schema]).fetchall()}  # noqa: SLF001
+    for table in (rollup.TABLE, presence.TABLE):
+        assert f"{table}_period_idx" in found
+        assert f"{table}_sub_idx" in found
+
+
+def test_a_full_rebuild_leaves_no_staging_table_behind(loaded):
+    from app import derived, presence, rollup
+
+    loaded.refresh_rollup()
+    with loaded._store.connect() as con:  # noqa: SLF001
+        found = {row[0] for row in con.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = ?",
+            [loaded._rollup_schema]).fetchall()}  # noqa: SLF001
+    for module in (rollup, presence):
+        assert f"{module.TABLE}{derived.STAGING_SUFFIX}" not in found
+
+
+def test_a_failed_rebuild_leaves_the_previous_contents_in_place(loaded, monkeypatch):
+    """The swap must be as atomic as the DELETE and INSERT it replaces.
+
+    Staging plus a rename is more moving parts than a delete, so this checks the
+    property that actually matters: a rebuild that dies partway leaves the table a
+    reader can still use, holding exactly what the last good rebuild produced. It
+    dies between the two swaps, which is the moment with the most to go wrong --
+    the rollup has already been replaced when the presence table fails.
+    """
+    from app import derived
+
+    loaded.refresh_rollup()
+    with loaded.reader() as r:
+        before = r.rows('SELECT round(sum("BilledCost"), 2) AS c FROM costs_rollup')[0]["c"]
+
+    real_publish = derived.publish
+
+    def die_between_the_two_swaps(con, schema, module, staged):
+        if module.TABLE == "resource_presence":
+            raise RuntimeError("rebuild failed on purpose, after the rollup swapped")
+        return real_publish(con, schema, module, staged)
+
+    monkeypatch.setattr(derived, "publish", die_between_the_two_swaps)
+    assert loaded.refresh_rollup() == 0
+
+    monkeypatch.undo()
+    with loaded.reader() as r:
+        after = r.rows('SELECT round(sum("BilledCost"), 2) AS c FROM costs_rollup')[0]["c"]
+    assert after == pytest.approx(before, abs=0.01)
+
+
+def test_a_windowed_rebuild_reports_the_live_table_as_its_staging(loaded):
+    """`stage` returning the live table's own name is what tells `publish` not to swap."""
+    import datetime as dt
+
+    from app import derived, rollup
+
+    with loaded.connect() as con:
+        staged = derived.stage(con, loaded._rollup_schema, rollup,  # noqa: SLF001
+                               loaded._pg_table,  # noqa: SLF001
+                               (dt.date(2026, 2, 1), dt.date(2026, 3, 1)))
+    assert staged == rollup.TABLE
+
+
 def test_covers_refuses_what_it_cannot_answer():
     from app.rollup import covers
 
@@ -407,23 +541,25 @@ def test_a_windowed_rebuild_is_ignored_after_a_failed_rebuild(loaded, monkeypatc
     """
     import datetime as dt
 
-    from app import rollup as rollup_module
+    from app import derived as derived_module
 
     calls: list[object] = []
-    real = rollup_module.rebuild
+    real = derived_module.rebuild
 
-    def spy(con, schema, source, window=None):
+    def spy(con, schema, modules, source, window=None):
         calls.append(window)
-        return real(con, schema, source, window)
+        return real(con, schema, modules, source, window)
 
     def boom(*_args, **_kwargs):
         raise RuntimeError("rebuild failed on purpose")
 
-    monkeypatch.setattr(rollup_module, "rebuild", boom)
+    # `derived.rebuild` is the seam `refresh_rollup` goes through for both derived
+    # tables at once, so failing it fails the rebuild exactly as a real one would.
+    monkeypatch.setattr(derived_module, "rebuild", boom)
     assert loaded.refresh_rollup() == 0
 
     # The very next windowed request must be widened to a full rebuild.
-    monkeypatch.setattr(rollup_module, "rebuild", spy)
+    monkeypatch.setattr(derived_module, "rebuild", spy)
     loaded.refresh_rollup(window=(dt.date(2026, 2, 1), dt.date(2026, 3, 1)))
     assert calls == [None], "a window was honoured while the rollup was known stale"
 

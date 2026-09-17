@@ -569,17 +569,17 @@ class Warehouse:
                      "because the last rebuild did not complete", window[0], window[1])
             window = None
         try:
-            from . import jobs
+            from . import derived, jobs
             with jobs.coherent_rollup(self) as con:
-                rows = rollup.rebuild(jobs.RollupTransaction(con), self._rollup_schema,
-                                      self._pg_table, window)
-                # In the same transaction, so the two derived tables can never
-                # describe different generations of `costs`, and so the generation
-                # stamp `coherent_rollup` writes covers both or neither.
-                presence.rebuild(jobs.RollupTransaction(con), self._rollup_schema,
-                                 self._pg_table, window)
+                # Both tables in one call, so their contents describe the same
+                # generation of `costs` and the generation stamp `coherent_rollup`
+                # writes covers both or neither -- and so the exclusive locks their
+                # swaps need are taken together at the end, rather than one being
+                # held for the duration of the other's build.
+                counts = derived.rebuild(jobs.RollupTransaction(con), self._rollup_schema,
+                                         (rollup, presence), self._pg_table, window)
             self._rollup_full_required = False
-            return rows
+            return counts[rollup.TABLE]
         except Exception as exc:  # noqa: BLE001
             self._rollup_full_required = True
             log.warning("warehouse: could not rebuild the rollup (%s); "

@@ -331,7 +331,7 @@ def test_generation_commit_rollback_and_coherent_rollup(postgres_warehouse):
 
 
 def test_failed_rollup_keeps_publication_pending_until_unchanged_replay(postgres_warehouse, monkeypatch):
-    from app import exports, jobs, rollup
+    from app import derived, exports, jobs
     files = _report()
     class Reader:
         account, container = "offline", "focus"
@@ -346,9 +346,10 @@ def test_failed_rollup_keeps_publication_pending_until_unchanged_replay(postgres
             "required_metric": "FocusCost", "export_name": "owned",
             "run_identity": ("run", "2026-07-01"), "requested_window": ("2026-06-17", "2026-06-30")}
     with monkeypatch.context() as patch:
-        def fail(*args):
+        def fail(*args, **kwargs):
             raise RuntimeError("injected rollup failure")
-        patch.setattr(rollup, "rebuild", fail)
+        # The seam `refresh_rollup` rebuilds both derived tables through.
+        patch.setattr(derived, "rebuild", fail)
         with pytest.raises(RuntimeError, match="injected rollup"):
             asyncio.run(exports.ingest_export(**args))
     assert jobs.read_generation() == 1 and not jobs.generation_ready(1)

@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-import time
 from collections.abc import Iterable
 from typing import Any
 
@@ -157,29 +156,52 @@ def derive_sql(source: str) -> str:
     there so that routing a query to the rollup is never *wrong*, not so that every
     route is quick.
     """
-    return _select(source)
+    return select_sql(source)
 
 
-def create_sql(schema: str) -> list[str]:
-    """DDL for the rollup table and its indexes."""
+def table_sql(schema: str, table: str = TABLE) -> str:
+    """DDL for the rollup table, at whatever name it is being built under.
+
+    Parameterised by name so a full rebuild can assemble the replacement in a
+    staging table of the same shape. See `derived` for why that is worth doing.
+    """
     _validate()
     cols = ",\n  ".join(
         [f'"{d}" {"date" if d == "ChargePeriodStart" else "text"}' for d in DIMENSIONS]
         + [f'"{m}" double precision' for m in MEASURES]
         + ["charges bigint"]
     )
+    return f'CREATE TABLE IF NOT EXISTS "{schema}".{table} (\n  {cols}\n)'
+
+
+def index_sql(schema: str, table: str = TABLE) -> list[str]:
+    """The indexes the rollup is read through.
+
+    Named after `table` so that a staging rebuild, which creates them only after
+    the swap has given the table its real name, produces the same names a
+    first-time create would.
+    """
     return [
-        f'CREATE TABLE IF NOT EXISTS "{schema}".{TABLE} (\n  {cols}\n)',
         # Every dashboard query is bounded by a date window, so that column leads.
-        f'CREATE INDEX IF NOT EXISTS {TABLE}_period_idx '
-        f'ON "{schema}".{TABLE} ("ChargePeriodStart")',
+        f'CREATE INDEX IF NOT EXISTS {table}_period_idx '
+        f'ON "{schema}".{table} ("ChargePeriodStart")',
         # And most are then narrowed to a set of subscriptions.
-        f'CREATE INDEX IF NOT EXISTS {TABLE}_sub_idx '
-        f'ON "{schema}".{TABLE} (lower("SubAccountId"), "ChargePeriodStart")',
+        f'CREATE INDEX IF NOT EXISTS {table}_sub_idx '
+        f'ON "{schema}".{table} (lower("SubAccountId"), "ChargePeriodStart")',
     ]
 
 
-def _select(source: str, window: tuple[dt.date, dt.date] | None = None) -> str:
+def create_sql(schema: str) -> list[str]:
+    """DDL for the rollup table and its indexes."""
+    return [table_sql(schema), *index_sql(schema)]
+
+
+def select_sql(source: str, window: tuple[dt.date, dt.date] | None = None) -> str:
+    """The rollup grain computed from `source`.
+
+    Public, and named to match `presence.select_sql`, because `derived` drives both
+    modules through the same three functions.
+    """
     dims = ", ".join(f'"{d}"' for d in DIMENSIONS)
     sums = ", ".join(f'sum("{m}") AS "{m}"' for m in MEASURES)
     where = ""
@@ -218,49 +240,15 @@ def month_window(days: Iterable[dt.date]) -> tuple[dt.date, dt.date] | None:
 
 def rebuild(con: Any, schema: str, source: str,
             window: tuple[dt.date, dt.date] | None = None) -> int:
-    """Rebuild the rollup from the detail table.
+    """Rebuild the rollup alone from the detail table.
 
-    A rebuild rather than an incremental merge. The rollup is derived data whose
-    only job is to agree with the table it came from, and a rebuild cannot drift:
-    there is no partial-failure state where some rows were updated and others
-    were not, and no need to work out which individual rows an ingest touched.
-
-    `window` narrows that rebuild to a half-open `[lo, hi)` span of charge dates.
-    The property above is preserved *within the window*, because everything in it
-    is deleted and recomputed from source -- nothing is merged. What the caller
-    takes on is the obligation to pass a window that actually covers every day the
-    write touched; days outside it keep whatever the last rebuild produced. A
-    caller that cannot state that with certainty must pass `None` and rebuild the
-    lot, which is why that remains the default.
-
-    This matters at retention scale. A full rebuild costs one scan of all retained
-    history, and at a year of daily ingestion that is the same scan repeated every
-    day to correct one day's rows. A windowed rebuild scans the month that changed,
-    and because the window is snapped to month boundaries it prunes to the matching
-    `costs_fact` partitions instead of reading the rest of the year to discard it.
-
-    Inside a transaction, so readers see either the old rollup or the new one.
-    DELETE rather than DROP keeps the indexes and the table's permissions.
+    The mechanism, and the reasoning behind it, is `derived.rebuild`. This is the
+    one-table spelling of it, for callers that want only the rollup rebuilt.
+    `Warehouse.refresh_rollup` does not use it: it rebuilds both derived tables in
+    a single call so their swaps land together rather than one blocking the other.
     """
-    t0 = time.monotonic()
-    scope = ""
-    if window is not None:
-        lo, hi = window
-        scope = (f' WHERE "{PERIOD}" >= DATE \'{lo.isoformat()}\''
-                 f' AND "{PERIOD}" < DATE \'{hi.isoformat()}\'')
-    con.execute("BEGIN")
-    try:
-        con.execute(f'DELETE FROM "{schema}".{TABLE}{scope}')
-        con.execute(f'INSERT INTO "{schema}".{TABLE} {_select(source, window)}')
-        con.execute("COMMIT")
-    except Exception:
-        con.execute("ROLLBACK")
-        raise
+    import sys
 
-    rows = con.execute(f'SELECT count(*) FROM "{schema}".{TABLE}').fetchone()[0]
-    # The planner needs current statistics or it may still choose a sequential
-    # scan of the detail table for a query the rollup could answer.
-    con.execute(f'ANALYZE "{schema}".{TABLE}')
-    log.info("rollup: %s rows in %.1fs (%s)", f"{rows:,}", time.monotonic() - t0,
-             "full" if window is None else f"{window[0]}..{window[1]}")
-    return int(rows or 0)
+    from . import derived
+
+    return derived.rebuild(con, schema, (sys.modules[__name__],), source, window)[TABLE]
