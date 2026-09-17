@@ -54,6 +54,32 @@ _TOKEN_MARGIN = 300.0
 # checked against this rather than quoted.
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# A PostgreSQL memory setting: a number with an optional unit. Checked at startup so a
+# typo is a clear error on the first connection rather than an obscure one on every
+# connection, and because the value reaches the server through `set_config`, which does
+# take parameters -- this is a usability guard, not the injection defence.
+_SAFE_MEMORY = re.compile(r"^\d+(kB|MB|GB|TB)?$", re.IGNORECASE)
+
+# A PostgreSQL duration setting, guarded the same way and for the same reason. A bare
+# number means milliseconds, which is why `110` and `110s` are wildly different values
+# and a typo is worth catching at startup rather than at the first slow query.
+_SAFE_DURATION = re.compile(r"^\d+(us|ms|s|min|h|d)?$", re.IGNORECASE)
+
+
+class PoolBusy(TimeoutError):
+    """Every pooled connection is checked out and none came back in time.
+
+    A distinct type because the caller's correct response is the opposite of the one
+    for any other failure. The snapshot cache answers a failed read by falling back to
+    the origin route -- the right move when the cache is the broken part, and precisely
+    the wrong one here, since the origin needs a connection from the same exhausted
+    pool. It cannot succeed, and trying costs another borrower its place in the queue.
+
+    A subclass of `TimeoutError` rather than a new hierarchy: this is still a timeout,
+    and existing handlers that treat it as one stay correct.
+    """
+
+
 
 class _Cursor:
     """A psycopg cursor wearing the result API the call sites were written against.
@@ -164,6 +190,13 @@ class PostgresStore:
     deployment, which is exactly the kind that reaches a customer.
     """
 
+    # Declared on the class so an instance built without `__init__` still has them.
+    # The tuning tests construct a bare store through `__new__` to exercise one method
+    # in isolation, and a session setting that only exists after a full construction
+    # would turn those into AttributeError rather than the behaviour under test.
+    work_mem: str = ""
+    statement_timeout: str = ""
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._idle: list[Any] = []
@@ -193,6 +226,50 @@ class PostgresStore:
             raise RuntimeError(
                 f"PGSCHEMA={self.schema!r} is not a plain identifier. Use letters, "
                 "digits and underscores."
+            )
+        # How much memory one sort or hash node may use before it spills to disk.
+        #
+        # Opt-in, and unset means the server's own value, because the right number is a
+        # property of the server rather than of this application: `work_mem` is charged
+        # *per node*, so a query with three sorts can take three times what is configured
+        # here, and up to `PG_POOL_SIZE` connections can be doing that at once. A default
+        # chosen here without knowing the server's memory would be a guess applied to every
+        # deployment.
+        #
+        # It is worth configuring where the dashboard reads a large derived table. Measured
+        # on the 2.78M-row `resource_presence`: the top-resources query sorts 507,846 groups
+        # and needs about 90MB to do it, so at the common 64MB default it spills 73MB to
+        # temp files -- about a second of the eight that query took, paid on every request.
+        self.work_mem = os.getenv("PG_WORK_MEM", "").strip()
+        if self.work_mem and not _SAFE_MEMORY.match(self.work_mem):
+            raise RuntimeError(
+                f"PG_WORK_MEM={self.work_mem!r} is not a PostgreSQL memory value. "
+                "Use a number with an optional unit, for example 128MB."
+            )
+        # How long one *read* may run on the server before PostgreSQL cancels it.
+        #
+        # This exists because an application-level timeout cannot stop a database query.
+        # `asyncio.wait_for` around a snapshot build cancels the await; the worker thread,
+        # the pooled connection and the query itself carry on. Measured here: two reads
+        # still running eight minutes after the requests that issued them had gone, each
+        # still holding one of the eight pool slots. Slots lost that way are never
+        # returned, so the pool drains until every request fails -- the 500 is a leak
+        # reaching its conclusion, not a slow query.
+        #
+        # Server-side, so the bound holds whatever the client does. Set it below the
+        # caller's own timeout: PostgreSQL should end the query while the request is
+        # still waiting, so the connection comes back rather than being abandoned.
+        #
+        # Applied to readers only, by `Warehouse.connect(read_only=True)`. The rebuilds
+        # legitimately run for several minutes -- the presence table takes about 430s --
+        # and a limit meant for a dashboard tab would abort them every time. Pooled
+        # sessions serve both, so `_return_connection` resets it on the way back.
+        self.statement_timeout = os.getenv("PG_STATEMENT_TIMEOUT", "").strip()
+        if self.statement_timeout and not _SAFE_DURATION.match(self.statement_timeout):
+            raise RuntimeError(
+                f"PG_STATEMENT_TIMEOUT={self.statement_timeout!r} is not a PostgreSQL "
+                "duration. Use a number with an optional unit, for example 110s. A bare "
+                "number is milliseconds."
             )
         if not self.host:
             raise RuntimeError(
@@ -275,6 +352,13 @@ class PostgresStore:
         path += ["public", SHIM_SCHEMA]
         with conn.cursor() as cur:
             cur.execute(f"SET search_path TO {', '.join(path)}")
+            if self.work_mem:
+                # Through `set_config` rather than `SET`, which accepts no parameters.
+                # Session scope, not LOCAL: these connections are pooled and autocommit,
+                # so there is no enclosing transaction for LOCAL to belong to. Every
+                # borrower wants the same value, and `DISCARD TEMP` on release does not
+                # reset it, so it holds for the life of the connection.
+                cur.execute("SELECT set_config('work_mem', %s, false)", (self.work_mem,))
         return conn
 
     def check_readiness(self, tables: dict[str, tuple[str, ...]]) -> bool:
@@ -300,7 +384,7 @@ class PostgresStore:
     # ------------------------------------------------------------- pooling
     def connect(self) -> PostgresConnection:
         if not self._slots.acquire(timeout=self._pool_timeout):
-            raise TimeoutError("PostgreSQL connection pool is busy; retry shortly.")
+            raise PoolBusy("PostgreSQL connection pool is busy; retry shortly.")
         try:
             return self._checkout()
         except BaseException:
@@ -372,6 +456,12 @@ class PostgresStore:
         A connection in an aborted transaction is rolled back first: PostgreSQL refuses every
         subsequent statement on it otherwise, and the next borrower would inherit a session that
         fails everything for no visible reason.
+
+        `statement_timeout` is reset for the same reason the temp objects are dropped. It is
+        set per checkout by readers, and the next borrower may be a rebuild that runs for
+        several minutes; inheriting a dashboard's limit would abort it. `RESET` rather than
+        `DISCARD ALL`, which would also throw away the search path and `work_mem` that
+        `_open` established for the life of the connection.
         """
         try:
             if conn.closed:
@@ -380,6 +470,7 @@ class PostgresStore:
                 conn.rollback()
             with conn.cursor() as cur:
                 cur.execute("DISCARD TEMP")
+                cur.execute("RESET statement_timeout")
         except Exception:  # noqa: BLE001 - a connection we cannot reset is discarded
             try:
                 conn.close()

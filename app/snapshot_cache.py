@@ -39,6 +39,8 @@ from fastapi.routing import APIRoute, request_response
 from starlette.requests import Request
 from starlette.responses import Response
 
+from .store import PoolBusy
+
 calculation_context: ContextVar[tuple[str, str] | None] = ContextVar(
     "cloudlens_snapshot_calculation", default=None)
 
@@ -609,6 +611,17 @@ class SnapshotCache:
                     self.store.load, key, partition, self.clock(), context.selected)
                 if item is not None or completion_serial == self._completion_serial:
                     break
+        except PoolBusy as exc:
+            # Not a cache outage, so the fallback below is not the answer. The origin
+            # reads the warehouse through the same pool that just refused this request;
+            # calling it cannot succeed and only puts another waiter on the queue. Shed
+            # the request instead, and say when to come back.
+            self._log_failure("read", request, exc)
+            raise HTTPException(503, "The warehouse is busy; retry shortly.",
+                                headers={"Cache-Control": "private, no-store",
+                                         "X-CloudLens-Cache": "unavailable",
+                                         "X-CloudLens-Cache-Error": "pool_busy",
+                                         "Retry-After": "5"}) from exc
         except Exception as exc:
             # Cache outage must retain the original route's validation/error contract.
             self._log_failure("read", request, exc)

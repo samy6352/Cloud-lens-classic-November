@@ -21,6 +21,7 @@ from app.snapshot_cache import (
     cache_key,
     install_snapshot_routes,
 )
+from app.store import PoolBusy
 
 PATH = "/api/dashboard/executive"
 CONTEXT = CacheContext("oid:synthetic-reader", "synthetic-tenant", ("a", "b"), ("a",))
@@ -930,6 +931,43 @@ def test_store_failures_do_not_change_successful_route_contract():
         await cache.close()
 
     asyncio.run(scenario())
+
+
+def test_pool_exhaustion_sheds_the_request_instead_of_re_entering_the_pool(caplog):
+    """A busy pool is congestion, not a cache outage, and must not reach the origin.
+
+    The generic read-failure path falls back to the origin route, which is right when
+    the cache is the broken part. `PoolBusy` means every connection is checked out --
+    the origin reads through the same pool, so calling it cannot succeed and only adds
+    another waiter. The request is shed with a time to come back instead, and the
+    status has to be 503: the application did not fail, it declined.
+    """
+    async def scenario():
+        cache, auth = make_cache(), Authorize()
+        called = []
+
+        def busy(*args):
+            raise PoolBusy("PostgreSQL connection pool is busy; retry shortly.")
+
+        cache.store.load = busy
+
+        async def origin():
+            called.append(1)
+            return JSONResponse({"total": 12})
+
+        with pytest.raises(HTTPException) as raised:
+            await cache.get(request("days=30&private=must-not-log"), origin, auth)
+        await cache.close()
+        return raised.value, called
+
+    error, called = asyncio.run(scenario())
+    assert error.status_code == 503
+    assert error.headers["Retry-After"] == "5"
+    assert error.headers["X-CloudLens-Cache-Error"] == "pool_busy"
+    assert error.headers["Cache-Control"] == "private, no-store"
+    assert called == [], "the origin needs the same exhausted pool and must not be called"
+    assert "PoolBusy" in caplog.text
+    assert "must-not-log" not in caplog.text
 
 
 def test_read_failure_has_cache_unavailable_headers_and_sanitized_log(caplog):

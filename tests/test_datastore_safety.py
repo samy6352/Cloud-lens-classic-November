@@ -12,7 +12,7 @@ from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
@@ -153,6 +153,54 @@ def test_existing_subscription_identity_regression_offline(offline_warehouse, mo
         assert not result["failures"]
     finally:
         db.close()
+
+
+def test_statement_timeout_is_reader_scoped_and_reset_on_release(offline_warehouse, monkeypatch):
+    """The read limit must not outlive the checkout that asked for it.
+
+    An application timeout cannot stop a database query -- cancelling the await leaves
+    the thread, the connection and the query running -- so reads carry a server-side
+    limit and an abandoned build dies instead of keeping its pool slot forever.
+
+    The same pooled session is handed out later to a rebuild that legitimately runs for
+    minutes, so the limit has to come off on release. `work_mem` and the search path do
+    not: those belong to the connection rather than to one borrower.
+    """
+    from app import reporting
+    from app.store import PostgresStore
+
+    monkeypatch.setenv("PGHOST", "unused.invalid")
+    monkeypatch.setenv("PG_STATEMENT_TIMEOUT", "110s")
+    store = PostgresStore()
+
+    statements: list[tuple[str, object]] = []
+    con = Mock()
+    con.execute.side_effect = lambda sql, params=None: (
+        statements.append((sql, params)) or SimpleNamespace(fetchone=lambda: None))
+
+    wh = offline_warehouse.Warehouse.__new__(offline_warehouse.Warehouse)
+    wh._store, wh._pg_table = store, "public.costs"
+    monkeypatch.setattr(reporting, "view_predicate", lambda: "")
+
+    wh._prepare_connection(con, True, None, None, None)
+    assert any("set_config" in sql and params == ["110s"] for sql, params in statements), \
+        "a reader must carry the server-side limit"
+
+    statements.clear()
+    wh._prepare_connection(con, False, None, None, None)
+    assert not any("statement_timeout" in sql for sql, _ in statements), \
+        "a write connection must not inherit a limit meant for dashboard reads"
+
+    reset: list[str] = []
+    raw = MagicMock()
+    raw.closed = False
+    raw.info.transaction_status = 0
+    raw.cursor.return_value.__enter__.return_value.execute.side_effect = reset.append
+    store._return_connection(raw)
+    assert "RESET statement_timeout" in reset
+    assert "DISCARD TEMP" in reset
+    assert not any("work_mem" in statement for statement in reset), \
+        "work_mem belongs to the connection, not to one borrower"
 
 
 @pytest.mark.parametrize("failure", [

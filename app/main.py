@@ -55,6 +55,7 @@ from .snapshot_cache import (
     inner_cache_key,
     install_snapshot_routes,
 )
+from .store import PoolBusy
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("cloudlens")
@@ -862,8 +863,27 @@ class RequireAuth(BaseHTTPMiddleware):
         return response
 
 
-app.add_middleware(RequireAuth)
-# Starlette wraps in reverse registration order: route aliases before creating or
+@app.exception_handler(PoolBusy)
+async def _pool_busy(request: Request, exc: PoolBusy) -> JSONResponse:
+    """Load shedding, not a fault.
+
+    Every pooled connection was checked out and none came back within the pool
+    timeout. Nothing is broken and the request was never served, so the honest answer
+    is 503 with a time to come back -- a 500 would tell the browser, and whoever reads
+    the logs, that the application failed.
+
+    Registered globally because the pool is reached from routes that do not go through
+    the snapshot cache at all; without this, each one would have to know about the pool
+    to avoid reporting congestion as a crash.
+    """
+    log.warning("pool exhausted serving %s; shedding the request", request.url.path)
+    return JSONResponse(
+        {"detail": "The warehouse is busy; retry shortly."}, status_code=503,
+        headers={"Retry-After": "5", "Cache-Control": "private, no-store",
+                 "X-CloudLens-Cache-Error": "pool_busy"})
+
+
+app.add_middleware(RequireAuth)# Starlette wraps in reverse registration order: route aliases before creating or
 # checking host-only auth cookies, but retain the outer security/cache headers.
 app.add_middleware(
     CanonicalOriginMiddleware,

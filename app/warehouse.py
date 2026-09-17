@@ -794,6 +794,14 @@ class Warehouse:
     def _prepare_connection(self, con: Any, read_only: bool,
                             scope: list[str] | None, currency: str | None,
                             filters: dict[str, list[str]] | None) -> Any:
+        # Before the early exit below, because an unscoped reader is still a reader: it
+        # runs the same dashboard queries against the same tables and can be abandoned the
+        # same way. See `PostgresStore.statement_timeout` for why the bound has to be the
+        # server's rather than the caller's.
+        if read_only and self._store.statement_timeout:
+            con.execute("SELECT set_config('statement_timeout', ?, false)",
+                        [self._store.statement_timeout])
+
         target = (currency or "").upper()
         rate = None
         if target:
