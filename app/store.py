@@ -320,7 +320,12 @@ class PostgresStore:
             # A hung connection to a database behind a private endpoint should
             # surface as an error on one request, not as a stuck worker thread.
             connect_timeout=int(os.getenv("PG_CONNECT_TIMEOUT", "20")),
-            application_name="cloudlens",
+            # Overridable so that two instances against one database can be told
+            # apart in `pg_stat_activity`. Not cosmetic: profiling attributed 56.5s
+            # of one endpoint to a statement a *different* instance was running,
+            # because every backend called itself `cloudlens` and there was nothing
+            # in the view to separate them.
+            application_name=os.getenv("PG_APPLICATION_NAME", "cloudlens"),
         )
         if self.schema:
             # Created here rather than assumed, so pointing at an empty database is
