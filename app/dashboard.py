@@ -219,9 +219,9 @@ class Dashboard:
 
         # `cost` is what the cut is expressed in for both rankings, so the mover
         # threshold is taken on its own ordering but compared on the same column.
-        cuts = [f"(SELECT abs(g.cost - g.prior) FROM grouped g "
-                f"WHERE g.currency IS NOT DISTINCT FROM c.currency "
-                f"ORDER BY abs(g.cost - g.prior) DESC, g.name LIMIT 1 OFFSET 7) AS move_cut"
+        cuts = ["(SELECT abs(g.cost - g.prior) FROM grouped g "
+                "WHERE g.currency IS NOT DISTINCT FROM c.currency "
+                "ORDER BY abs(g.cost - g.prior) DESC, g.name LIMIT 1 OFFSET 7) AS move_cut"
                 ] if movers else []
         keep = ["cut.spend_cut IS NULL OR grouped.cost >= cut.spend_cut"]
         if movers:
@@ -232,7 +232,7 @@ class Dashboard:
         return reader.rows(
             f"WITH grouped AS MATERIALIZED ({query}), "
             "cut AS MATERIALIZED (SELECT c.currency, "
-            + ", ".join([threshold(f"g.cost DESC, g.name", limit, "spend_cut")] + cuts)
+            + ", ".join([threshold("g.cost DESC, g.name", limit, "spend_cut"), *cuts])
             + " FROM (SELECT DISTINCT currency FROM grouped) c), "
             "picked AS (SELECT grouped.* FROM grouped JOIN cut "
             "ON cut.currency IS NOT DISTINCT FROM grouped.currency "
