@@ -196,11 +196,6 @@ def index_sql(schema: str, table: str = TABLE) -> list[str]:
     ]
 
 
-def create_sql(schema: str) -> list[str]:
-    """DDL for the presence table and its indexes."""
-    return [table_sql(schema), *index_sql(schema)]
-
-
 def select_sql(source: str, window: tuple[dt.date, dt.date] | None = None) -> str:
     """The grain computed from `source`.
 

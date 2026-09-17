@@ -245,12 +245,22 @@ def _relfilenode(warehouse, table: str) -> int:
     intermittently. The relfilenode is catalogue state, visible the moment the
     transaction commits, and it answers the question that actually matters: whether
     the old heap was dropped or merely tombstoned.
+
+    Resolved through the published view to the side actually holding the rows. The
+    published name is a view, whose own relfilenode is 0 -- reading that would make
+    every comparison here trivially true and the tests meaningless.
     """
+    from app import derived, presence, rollup
+
+    module = rollup if table == rollup.TABLE else presence
     with warehouse._store.connect() as con:  # noqa: SLF001
+        active = derived.active_table(con, warehouse._rollup_schema, module)  # noqa: SLF001
+        assert active, f"{table} is not published over a side table"
         row = con.execute(
             "SELECT c.relfilenode FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
             "WHERE n.nspname = ? AND c.relname = ?",
-            [warehouse._rollup_schema, table]).fetchone()  # noqa: SLF001
+            [warehouse._rollup_schema, active]).fetchone()  # noqa: SLF001
+    assert int(row[0]) != 0, "a view has no heap; this must resolve to the side table"
     return int(row[0])
 
 
@@ -292,14 +302,13 @@ def test_a_windowed_rebuild_writes_in_place(loaded, table):
 
 
 def test_a_full_rebuild_keeps_the_indexes_it_is_read_through(loaded):
-    """The swap drops the old table, so the indexes have to be rebuilt with it.
+    """The published side has to carry the indexes, whichever side that is.
 
-    They are created after the rename rather than on the staging table, so they
-    take the names the table's own DDL gives them. Created on the staging table
-    they would keep a staging-derived name for ever, and the next rebuild would
-    collide with its own previous output.
+    They are created on the staged side before it is published, and named after it,
+    so the two sides never collide over an index name and the side being read always
+    has its own.
     """
-    from app import presence, rollup
+    from app import derived, presence, rollup
 
     loaded.refresh_rollup()
     loaded.refresh_rollup()
@@ -307,21 +316,53 @@ def test_a_full_rebuild_keeps_the_indexes_it_is_read_through(loaded):
         found = {row[0] for row in con.execute(
             "SELECT indexname FROM pg_indexes WHERE schemaname = ?",
             [loaded._rollup_schema]).fetchall()}  # noqa: SLF001
-    for table in (rollup.TABLE, presence.TABLE):
-        assert f"{table}_period_idx" in found
-        assert f"{table}_sub_idx" in found
+        for module in (rollup, presence):
+            active = derived.active_table(con, loaded._rollup_schema, module)  # noqa: SLF001
+            assert f"{active}_period_idx" in found
+            assert f"{active}_sub_idx" in found
 
 
-def test_a_full_rebuild_leaves_no_staging_table_behind(loaded):
+def test_a_full_rebuild_retires_the_side_it_replaced(loaded):
+    """Exactly one side survives a rebuild, so the copies cannot accumulate.
+
+    The retired side is dropped after the transaction commits. Nothing is reading
+    it here, so it must be gone rather than merely scheduled to go.
+    """
     from app import derived, presence, rollup
 
+    loaded.refresh_rollup()
     loaded.refresh_rollup()
     with loaded._store.connect() as con:  # noqa: SLF001
         found = {row[0] for row in con.execute(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = ?",
             [loaded._rollup_schema]).fetchall()}  # noqa: SLF001
-    for module in (rollup, presence):
-        assert f"{module.TABLE}{derived.STAGING_SUFFIX}" not in found
+        for module in (rollup, presence):
+            active = derived.active_table(con, loaded._rollup_schema, module)  # noqa: SLF001
+            sides = {f"{module.TABLE}{suffix}" for suffix in derived.SIDES}
+            assert found & sides == {active}, (
+                f"{module.TABLE} should have exactly the published side, found {found & sides}")
+
+
+def test_a_rebuild_succeeds_while_a_reader_holds_a_shadow_view(loaded):
+    """The defect this indirection exists for.
+
+    `Warehouse._shadow_rollup` gives a scoped connection a temp view of the same
+    name, which is a catalogue dependency on whatever that name resolves to. While
+    the published name was a table, the swap's `DROP TABLE` was refused for as long
+    as any dashboard was being read -- so the rebuild failed exactly when the
+    product was working, logged a warning, and quietly stopped refreshing.
+
+    The reader is held open across the whole rebuild, which is the case that used
+    to fail.
+    """
+    loaded.refresh_rollup()
+    with loaded.reader(scope=["11111111-1111-1111-1111-111111111111"]) as held:
+        held.rows("SELECT count(*) AS n FROM costs_rollup")
+        loaded.refresh_rollup()
+        # The held reader keeps working, on the side it started on.
+        assert held.rows("SELECT count(*) AS n FROM costs_rollup")[0]["n"] >= 0
+    with loaded.reader() as fresh:
+        assert fresh.rows("SELECT count(*) AS n FROM costs_rollup")[0]["n"] > 0
 
 
 def test_a_failed_rebuild_leaves_the_previous_contents_in_place(loaded, monkeypatch):
@@ -355,8 +396,12 @@ def test_a_failed_rebuild_leaves_the_previous_contents_in_place(loaded, monkeypa
     assert after == pytest.approx(before, abs=0.01)
 
 
-def test_a_windowed_rebuild_reports_the_live_table_as_its_staging(loaded):
-    """`stage` returning the live table's own name is what tells `publish` not to swap."""
+def test_a_windowed_rebuild_writes_into_the_published_side(loaded):
+    """A window replaces a span in place, so it writes to whichever side is published.
+
+    It must not build the other side: the rows outside the window live only on the
+    published one, and a windowed rebuild does not recompute them.
+    """
     import datetime as dt
 
     from app import derived, rollup
@@ -365,7 +410,9 @@ def test_a_windowed_rebuild_reports_the_live_table_as_its_staging(loaded):
         staged = derived.stage(con, loaded._rollup_schema, rollup,  # noqa: SLF001
                                loaded._pg_table,  # noqa: SLF001
                                (dt.date(2026, 2, 1), dt.date(2026, 3, 1)))
-    assert staged == rollup.TABLE
+        active = derived.active_table(con, loaded._rollup_schema, rollup)  # noqa: SLF001
+    assert staged == active
+    assert staged != rollup.TABLE, "the published name is a view, never a write target"
 
 
 def test_covers_refuses_what_it_cannot_answer():

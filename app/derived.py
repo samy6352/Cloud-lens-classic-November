@@ -32,31 +32,68 @@ one.
 
 What this does instead
 ----------------------
-A full rebuild builds the replacement in a staging table beside the live one, then
-swaps it in. The long part -- scanning 5.8M rows and writing 2.8M -- happens
-against a table nothing else can see, so nothing is locked while it runs. Only the
-swap itself needs `ACCESS EXCLUSIVE`, and that is a `DROP`, a `RENAME` and the
-index builds.
+A full rebuild builds the replacement in the *inactive* one of two tables beside
+the live one, then repoints a view at it. The long part -- scanning 5.8M rows and
+writing 2.8M -- happens against a table nothing else can see, so nothing is locked
+while it runs. Only the repoint needs an exclusive lock, and that is a catalogue
+update on a view rather than anything touching data.
 
-Indexes are created after the swap rather than before it. Two reasons: an index
-built on a populated table is faster than one maintained row by row during the
-load, and the index ends up with the name the live table's DDL gives it. Creating
-them on the staging table would leave them named after the staging table forever,
-and the next rebuild would then collide with its own previous output.
+Why a view rather than a rename
+-------------------------------
+The published name is a view, and readers bind to it rather than to the table
+holding the rows. That is not indirection for its own sake: it is what lets the
+rebuild finish at all.
 
-A windowed rebuild keeps `DELETE` and `INSERT`. It replaces one month rather than
-the whole table, so the dead tuples are bounded by that month and autovacuum
-reclaims them between runs; staging the whole table to replace a twelfth of it
-would be slower and would lose nothing.
+`Warehouse._shadow_rollup` and `_shadow_presence` give every scoped connection a
+temp view of the same name, so an unqualified read cannot see outside the caller's
+subscriptions. A temp view referring to a table is a *dependency* on it, recorded
+in the catalogue, and PostgreSQL refuses to drop a table anything still depends
+on. Swapping by `DROP` and `RENAME` therefore failed whenever a dashboard was
+being read:
+
+    cannot drop table costs_rollup because other objects depend on it
+    DETAIL:  view pg_temp_52.costs_rollup depends on table costs_rollup
+
+The rebuild logged that and kept the previous generation, so nothing broke
+visibly and the data simply stopped being refreshed -- a silent freshness
+failure, and the worst kind, because the dashboard went on answering confidently
+with figures that were quietly getting older. It also failed *more* the better
+things were working, since the shadow only refers to the derived table on the
+fast path: the one taken when the rollup is fresh enough to be worth reading.
+
+With a view in the middle, the shadows depend on the view. `CREATE OR REPLACE
+VIEW` redefines it without dropping it, so those dependencies survive the swap,
+and the retired table -- which nothing refers to any more -- can then be dropped.
+Readers that were already running keep reading the table they started on.
+
+Two fixed names rather than a staging suffix, because each side keeps its own
+indexes under its own names. Nothing has to be renamed, so nothing has to be
+renamed back after a failure.
+
+A windowed rebuild keeps `DELETE` and `INSERT`, applied to the active table
+directly. It replaces one month rather than the whole table, so the dead tuples
+are bounded by that month and autovacuum reclaims them between runs; staging the
+whole table to replace a twelfth of it would be slower and would lose nothing.
+The active table is addressed explicitly rather than through the view: a view
+this simple is auto-updatable, so writing through it would appear to work and
+would hide which copy was actually being changed.
 
 Why the swaps land together
 ---------------------------
 `Warehouse.refresh_rollup` rebuilds both derived tables in one transaction so they
 can never describe different generations of `costs`. If each swapped as it
-finished, the first table's `ACCESS EXCLUSIVE` lock would be held for the whole of
-the second table's build -- 356 s of blocking, which is the problem `TRUNCATE` was
-rejected for. `rebuild` therefore stages every table first and publishes them all
-at the end, so the locks are taken back to back at the very end of the transaction.
+finished, the first table's lock would be held for the whole of the second
+table's build. `rebuild` therefore stages every table first and publishes them all
+at the end, so the swaps are taken back to back at the very end of the
+transaction.
+
+Retiring the old copy happens after that transaction commits, not inside it. A
+reader part-way through a query still holds the table it started on, and `DROP`
+would wait for it -- inside the transaction that would mean holding the swap's
+locks for as long as the slowest reader. Outside it, with a short `lock_timeout`,
+the space comes back immediately in the ordinary case and waits for the next
+rebuild in the rare one. It cannot accumulate: with two names, the next full
+rebuild drops whichever side it is about to build into.
 """
 from __future__ import annotations
 
@@ -68,10 +105,11 @@ from typing import Any, Protocol
 
 log = logging.getLogger("cloudlens.derived")
 
-# Suffix for the table a full rebuild is assembled in. Dropped at the start of
-# every full rebuild, and rolled back with the transaction on failure, so a crashed
-# rebuild cannot leave one behind for the next to trip over.
-STAGING_SUFFIX = "_rebuild"
+# The two names the rows actually live under. The published name is a view naming
+# one of them; a full rebuild fills the other and repoints the view. Fixed names
+# rather than a staging suffix, so each side keeps its own indexes under its own
+# names and nothing is ever renamed.
+SIDES = ("_a", "_b")
 
 
 class Derived(Protocol):
@@ -91,6 +129,74 @@ class Derived(Protocol):
                    window: tuple[dt.date, dt.date] | None = None) -> str: ...
 
 
+def active_table(con: Any, schema: str, module: Any) -> str | None:
+    """Which side the published view currently names, or None if there is no view.
+
+    Read from the catalogue rather than tracked in a column of our own. A stored
+    marker is a second source of truth that can disagree with the view after a
+    crash between the swap and the marker write; `pg_depend` cannot, because it is
+    the same record PostgreSQL uses to decide what may be dropped.
+    """
+    row = con.execute(
+        "SELECT t.relname FROM pg_class v "
+        "JOIN pg_namespace n ON n.oid = v.relnamespace "
+        "JOIN pg_rewrite r ON r.ev_class = v.oid "
+        "JOIN pg_depend d ON d.objid = r.oid AND d.classid = 'pg_rewrite'::regclass "
+        "JOIN pg_class t ON t.oid = d.refobjid AND t.relkind = 'r' "
+        "WHERE n.nspname = ? AND v.relname = ? AND v.relkind = 'v' AND t.oid <> v.oid "
+        "LIMIT 1",
+        [schema, module.TABLE]).fetchone()
+    return row[0] if row else None
+
+
+def ensure(con: Any, schema: str, module: Any) -> None:
+    """Make the published name a view over one of the two sides, whatever it is now.
+
+    Idempotent, and safe to run on every boot. Three states to land from:
+
+    * Nothing exists yet -- create the `_a` side and the view over it.
+    * The name is still a plain table, from before this indirection existed --
+      rename it to `_a` in place and put the view over it. The rows are kept: it
+      is the current generation's data, and re-deriving it would be a needless
+      rebuild on the first boot after an upgrade.
+    * The view is already there -- confirm the side it names still exists, and do
+      nothing.
+    """
+    existing = active_table(con, schema, module)
+    if existing:
+        con.execute(module.table_sql(schema, existing))
+        for statement in module.index_sql(schema, existing):
+            con.execute(statement)
+        return
+
+    kind = con.execute(
+        "SELECT relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = ? AND c.relname = ?", [schema, module.TABLE]).fetchone()
+    side = f"{module.TABLE}{SIDES[0]}"
+    if kind and kind[0] == "r":
+        # Upgrade in place. The indexes come with the table and keep their old
+        # names; `index_sql` is IF NOT EXISTS against the new name, so the next
+        # rebuild creates the correctly-named ones on the other side and this
+        # copy's stragglers leave with it when it is retired.
+        con.execute(f'ALTER TABLE "{schema}".{module.TABLE} RENAME TO {side}')
+    elif kind and kind[0] == "v":
+        # A view that depends on nothing we recognise -- an empty or hand-made
+        # definition. Replaced below.
+        pass
+    con.execute(module.table_sql(schema, side))
+    for statement in module.index_sql(schema, side):
+        con.execute(statement)
+    con.execute(f'CREATE OR REPLACE VIEW "{schema}".{module.TABLE} AS '
+                f'SELECT * FROM "{schema}".{side}')
+
+
+def _inactive(con: Any, schema: str, module: Any) -> str:
+    """The side a full rebuild should be assembled in: whichever is not published."""
+    active = active_table(con, schema, module)
+    first, second = (f"{module.TABLE}{suffix}" for suffix in SIDES)
+    return second if active == first else first
+
+
 def _scope(module: Any, window: tuple[dt.date, dt.date]) -> str:
     lo, hi = window
     return (f' WHERE "{module.PERIOD}" >= DATE \'{lo.isoformat()}\''
@@ -99,42 +205,89 @@ def _scope(module: Any, window: tuple[dt.date, dt.date]) -> str:
 
 def stage(con: Any, schema: str, module: Any, source: str,
           window: tuple[dt.date, dt.date] | None) -> str:
-    """Write the new contents, and return the relation now holding them.
+    """Write the new contents, and return the table now holding them.
 
-    Windowed: in place, because only a bounded span is being replaced. Full: into a
-    staging table, which `publish` swaps in. Either way the caller must go on to
-    call `publish`, which is what makes the rebuild visible and countable.
+    Windowed: in place on the active side, because only a bounded span is being
+    replaced. Full: into the inactive side, which `publish` then names. Either way
+    the caller must go on to call `publish`, which is what makes the rebuild
+    visible and countable.
+
+    Both address a table directly rather than the published view. The view is
+    auto-updatable, so writing through it would silently succeed while leaving
+    which copy was modified up to PostgreSQL -- correct today and quietly wrong
+    the moment the definition grows past a bare `SELECT *`.
     """
+    ensure(con, schema, module)
     if window is not None:
-        con.execute(f'DELETE FROM "{schema}".{module.TABLE}{_scope(module, window)}')
-        con.execute(f'INSERT INTO "{schema}".{module.TABLE} '
+        active = active_table(con, schema, module)
+        con.execute(f'DELETE FROM "{schema}".{active}{_scope(module, window)}')
+        con.execute(f'INSERT INTO "{schema}".{active} '
                     f'{module.select_sql(source, window)}')
-        return module.TABLE
+        return active
 
-    staging = f"{module.TABLE}{STAGING_SUFFIX}"
-    con.execute(f'DROP TABLE IF EXISTS "{schema}".{staging}')
-    con.execute(module.table_sql(schema, staging))
-    con.execute(f'INSERT INTO "{schema}".{staging} {module.select_sql(source, None)}')
-    return staging
+    target = _inactive(con, schema, module)
+    # Dropped rather than truncated: a previous rebuild may have been interrupted
+    # after building this side but before naming it, and its indexes would then be
+    # maintained row by row through the load for nothing.
+    con.execute(f'DROP TABLE IF EXISTS "{schema}".{target}')
+    con.execute(module.table_sql(schema, target))
+    con.execute(f'INSERT INTO "{schema}".{target} {module.select_sql(source, None)}')
+    return target
 
 
 def publish(con: Any, schema: str, module: Any, staged: str) -> int:
-    """Put a staged rebuild in place, and leave the planner able to use the result.
+    """Name the staged side from the published view, so readers start seeing it.
+
+    The swap is `CREATE OR REPLACE VIEW`, which redefines the view without
+    dropping it. That distinction is the whole point: the temp views carrying each
+    connection's subscription scope depend on this view, and dropping it would be
+    refused while any dashboard was being read.
+
+    Indexes are created before the swap, not after. The staged side is not
+    published yet, so nothing can read it and the build blocks nobody -- and an
+    index built on a populated table is cheaper than one maintained row by row
+    during the load. They are named after the side they belong to, so the two
+    copies never collide.
 
     `ANALYZE` is not optional. Without current statistics the planner may still
     choose a sequential scan of the detail table for a query the derived table
     could have answered, which is the entire cost this table exists to avoid --
-    and a freshly swapped table has no statistics at all.
+    and a freshly built side has no statistics at all.
     """
-    if staged != module.TABLE:
-        con.execute(f'DROP TABLE IF EXISTS "{schema}".{module.TABLE}')
-        con.execute(f'ALTER TABLE "{schema}".{staged} RENAME TO {module.TABLE}')
-        for statement in module.index_sql(schema, module.TABLE):
-            con.execute(statement)
-
-    rows = con.execute(f'SELECT count(*) FROM "{schema}".{module.TABLE}').fetchone()[0]
-    con.execute(f'ANALYZE "{schema}".{module.TABLE}')
+    for statement in module.index_sql(schema, staged):
+        con.execute(statement)
+    rows = con.execute(f'SELECT count(*) FROM "{schema}".{staged}').fetchone()[0]
+    con.execute(f'ANALYZE "{schema}".{staged}')
+    con.execute(f'CREATE OR REPLACE VIEW "{schema}".{module.TABLE} AS '
+                f'SELECT * FROM "{schema}".{staged}')
     return int(rows or 0)
+
+
+def retire(con: Any, schema: str, module: Any) -> None:
+    """Drop the side the published view no longer names.
+
+    Called after the rebuild transaction commits. A reader that started before the
+    swap still holds the old table and `DROP` waits for it; inside the transaction
+    that would mean holding the swap's locks for as long as the slowest reader.
+
+    `lock_timeout` rather than an unbounded wait, and failure is logged rather
+    than raised: the rebuild has already succeeded and is already visible, so a
+    copy that could not be dropped is wasted space and nothing worse. It cannot
+    accumulate -- the next full rebuild drops whichever side it builds into.
+    """
+    stale = _inactive(con, schema, module)
+    try:
+        con.execute("SET lock_timeout = '5s'")
+        con.execute(f'DROP TABLE IF EXISTS "{schema}".{stale}')
+    except Exception as exc:  # noqa: BLE001 - space, not correctness
+        log.info("derived: %s is still being read and was left in place (%s); "
+                 "the next full rebuild will reclaim it", stale, str(exc)[:120])
+    finally:
+        try:
+            con.execute("RESET lock_timeout")
+        except Exception:  # noqa: BLE001
+            log.debug("derived: could not reset lock_timeout", exc_info=True)
+
 
 
 def rebuild(con: Any, schema: str, modules: Sequence[Any], source: str,
@@ -177,6 +330,12 @@ def rebuild(con: Any, schema: str, modules: Sequence[Any], source: str,
     except Exception:
         con.execute("ROLLBACK")
         raise
+
+    # After the commit, never inside it: dropping the retired copy waits for
+    # readers that are still on it, and the swap's locks must not be held for that.
+    if window is None:
+        for module in modules:
+            retire(con, schema, module)
 
     scope = "full" if window is None else f"{window[0]}..{window[1]}"
     for table, rows in counts.items():

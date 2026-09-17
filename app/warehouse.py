@@ -1038,6 +1038,8 @@ class Warehouse:
         })
 
     def _init_schema(self) -> None:
+        from . import derived
+
         cols = ",\n  ".join(
             f'"{c}" {"DOUBLE" if c in NUMERIC else ("DATE" if c == "ChargePeriodStart" else "VARCHAR")}'
             for c in COLUMNS
@@ -1120,10 +1122,12 @@ class Warehouse:
             self._merge_subscription_spellings(con)
             self._create_indexes(con)
             self._drop_outdated_derived(con, schema)
-            for statement in rollup.create_sql(schema):
-                con.execute(statement)
-            for statement in presence.create_sql(schema):
-                con.execute(statement)
+            # The published names are views over one of two sides; `ensure` creates
+            # or upgrades that arrangement. See `derived` for why the indirection
+            # exists -- in short, it is what lets a rebuild swap the contents while
+            # a dashboard is holding a scoped view of them.
+            derived.ensure(con, schema, rollup)
+            derived.ensure(con, schema, presence)
             self._rollup_schema = schema
             self._ensure_query_role(con)
 
@@ -1139,20 +1143,33 @@ class Warehouse:
         rebuilt by the refresh that follows. The generation stamp is what stops an empty
         one being read in the meantime -- a table that has not been rebuilt is behind the
         detail table by definition, so `_rollup_fresh` refuses it and reads `costs`.
+
+        Both sides go, and the view with them. The shape is wrong on whichever side is
+        published, and the retired side is older still; leaving either would mean the
+        next boot found a stale shape and rebuilt again. `CASCADE` because the published
+        name is a view over the side being dropped, and dropping it is the point here
+        rather than something to be preserved.
         """
+        from . import derived
+
         for module in (rollup, presence):
             expected = set(module.DIMENSIONS) | set(getattr(module, "MEASURES", []))
             if module is rollup:
                 expected.add("charges")
+            active = derived.active_table(con, schema, module) or module.TABLE
             found = {row[0] for row in con.execute(
                 "SELECT column_name FROM information_schema.columns "
                 "WHERE table_schema = ? AND table_name = ?",
-                [schema, module.TABLE]).fetchall()}
+                [schema, active]).fetchall()}
             if found and found != expected:
                 log.info("warehouse: rebuilding %s; its columns no longer match the grain "
                          "(missing %s, extra %s)", module.TABLE,
                          sorted(expected - found) or "none", sorted(found - expected) or "none")
-                con.execute(f'DROP TABLE IF EXISTS "{schema}".{module.TABLE}')
+                con.execute(f'DROP VIEW IF EXISTS "{schema}".{module.TABLE}')
+                for suffix in derived.SIDES:
+                    con.execute(
+                        f'DROP TABLE IF EXISTS "{schema}".{module.TABLE}{suffix} CASCADE')
+                con.execute(f'DROP TABLE IF EXISTS "{schema}".{module.TABLE} CASCADE')
 
     # The command that moves a relation between schemas depends on what it is; ALTER TABLE
     # accepts some of these but not all, and errors rather than doing the right thing.
