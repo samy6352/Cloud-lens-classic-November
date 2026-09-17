@@ -1528,7 +1528,7 @@ async def subscriptions(request: Request) -> JSONResponse:
     # itself, and it sets up the export pipeline that the backfill's API route never touches.
     # Letting both run means two ingests writing the same rows while a progress card claims to
     # be the one doing the work.
-    awaiting_setup = onboarding.settled() is None and not await offload(warehouse.row_count)
+    awaiting_setup = onboarding.settled() is None and not await offload(warehouse.has_rows)
 
     if os.getenv("USER_BACKFILL", "true").lower() != "false" and not awaiting_setup:
         try:
@@ -2279,7 +2279,7 @@ async def onboarding_scan(request: Request, months: int = 3) -> JSONResponse:
 
     user = require_schedule_writer(request)
     allowed = await permitted(user)
-    if await offload(warehouse.row_count):
+    if await offload(warehouse.has_rows):
         # Somebody else got there first, or a refresh landed while this page was open. Not an
         # error: the outcome they wanted has already happened.
         raise HTTPException(409, "This deployment already has cost data loaded.")

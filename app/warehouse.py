@@ -2753,6 +2753,29 @@ class Warehouse:
         except Exception:  # noqa: BLE001
             return 0
 
+    def has_rows(self) -> bool:
+        """Whether the warehouse holds any cost row at all.
+
+        `row_count() > 0` answers this too, and that is what the callers used to do --
+        but it answers it by counting all of them. On the real estate that is a
+        5.8M-row aggregate taking 1.6-1.9s, and `EXISTS` answers the same question
+        from the first row it finds, in about a millisecond:
+
+            SELECT count(*) FROM costs              1.571s / 1.661s / 1.775s
+            SELECT EXISTS (SELECT 1 FROM costs)     0.001s / 0.001s / 0.000s
+
+        The cost matters because the subscription picker asks it on every page load,
+        so it was 1.9s of every first paint to establish something a single row
+        settles. Callers that publish the count itself still use `row_count`; this is
+        only for the ones that were throwing the number away.
+        """
+        try:
+            with self.connect(read_only=True) as con:
+                return bool(con.execute(
+                    "SELECT EXISTS (SELECT 1 FROM costs)").fetchone()[0])
+        except Exception:  # noqa: BLE001
+            return False
+
 
 
 def _report_failure(body: dict, metric: str) -> str:
