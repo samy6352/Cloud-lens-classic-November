@@ -212,7 +212,16 @@ def source(monkeypatch):
         def rows(self, sql, limit=200):
             state.queries.append((sql, limit, reporting.selected_month()))
             if "AS hi" in sql:
-                return [{"hi": state.hi}]
+                # `_completed_data` selects two columns from one row: the latest
+                # charge day, and the day the source was published. Returning only
+                # `hi` models a row the query cannot produce, and the caller reads
+                # `published_day` without a guard because it never has to.
+                # Published the day after the last charge day, which is what an
+                # import that completed a day's data looks like -- it makes `hi`
+                # itself the last completed day, which is the window every test
+                # below is written against.
+                published = date.fromisoformat(state.hi) + timedelta(days=1)
+                return [{"hi": state.hi, "published_day": published.isoformat()}]
             if "AS day" in sql:
                 return copy.deepcopy(state.daily[:limit])
             return copy.deepcopy(state.rows[:limit])
