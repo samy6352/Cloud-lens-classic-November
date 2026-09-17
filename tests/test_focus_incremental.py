@@ -95,13 +95,15 @@ class MemoryWarehouse:
         self.db.create_function("now", 0, lambda: "2026-09-14")
         self.state = {}
         self.rollups = 0
+        self.rollup_windows = []
 
     @contextmanager
     def connect(self, **kwargs):
         yield self.db
 
-    async def refresh_rollup_async(self):
+    async def refresh_rollup_async(self, window=None):
         self.rollups += 1
+        self.rollup_windows.append(window)
 
     def summary(self):
         return {"rows": self.db.execute("SELECT COUNT(*) FROM costs").fetchone()[0]}
@@ -457,6 +459,79 @@ def test_unchanged_retry_repairs_interrupted_post_commit_rollup(monkeypatch, mem
     result, _ = ingest(monkeypatch, report([charge()]))
     assert_counts(result, 0, 1, 0, 0, 1)
     assert rebuild.await_count == 2 and memory.snapshot() == before
+
+
+def _mark_derived_current(memory):
+    """Say the derived tables hold the generation `costs` is now at.
+
+    What `Warehouse.refresh_rollup` stamps on a successful rebuild. The offline
+    warehouse's rebuild is a no-op that never writes it, so without this every
+    import looks like one retrying after an interrupted rebuild -- which is the
+    case the skip must *not* apply to.
+    """
+    memory.db.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES "
+        "('data_rollup_generation', (SELECT value FROM meta WHERE key='data_generation'))")
+
+
+def test_the_rebuild_is_narrowed_to_the_months_a_change_landed_in(monkeypatch, memory):
+    """A windowed rebuild scans the months that changed, not all retained history.
+
+    The cost of a full rebuild is one scan of every month ever ingested, so under a
+    daily FOCUS sync it grows with retention while the change stays one day wide.
+    """
+    ingest(monkeypatch, report([charge("2026-08-01"), charge("2026-08-02", 4)]))
+    assert memory.rollup_windows == [(date(2026, 8, 1), date(2026, 9, 1))]
+
+    memory.rollup_windows.clear()
+    result, _ = ingest(monkeypatch, report(
+        [charge("2026-08-01"), charge("2026-08-02", 99)], run="restated"))
+    # One day moved, so one month is rebuilt -- not the two days' worth of months.
+    assert result["changed_days"] == 1
+    assert memory.rollup_windows == [(date(2026, 8, 1), date(2026, 9, 1))]
+
+
+def test_a_change_spanning_two_months_rebuilds_both_of_them(monkeypatch, memory):
+    """The window is snapped outwards to whole months, so it can never exclude a changed day."""
+    blobs = report([charge("2026-07-30"), charge("2026-08-02", 4)],
+                   start="2026-07-01", end="2026-08-31")
+    ingest(monkeypatch, blobs)
+    assert memory.rollup_windows == [(date(2026, 7, 1), date(2026, 9, 1))]
+
+
+def test_an_import_that_changed_nothing_leaves_current_derived_tables_alone(monkeypatch, memory):
+    """The scheduled sync's ordinary outcome: the export has not moved, so there is nothing to do.
+
+    Both spellings of "nothing changed" are covered -- the same run re-offered, which
+    is certified by its receipts and short-circuits before reading any data, and a
+    fresh run whose rows reconcile to no change at all.
+    """
+    blobs = report([charge()])
+    args = {"subscription_id": "sub-a", "scope": ["sub-a"],
+            "run_identity": ("run", "2026-09-01")}
+    ingest(monkeypatch, blobs, **args)
+    _mark_derived_current(memory)
+
+    memory.rollup_windows.clear()
+    repeated, _ = ingest(monkeypatch, blobs, **args)
+    assert repeated["skipped_unchanged_run"] and memory.rollup_windows == []
+
+    restated, _ = ingest(monkeypatch, report([charge()], run="restated"))
+    assert restated["changed_days"] == 0 and memory.rollup_windows == []
+
+
+def test_an_unchanged_import_still_repairs_derived_tables_left_behind(monkeypatch, memory):
+    """The skip is decided by the generation stamp, not by "did this import write anything".
+
+    An import that changes nothing must still rebuild when a previous one failed after
+    committing costs, or the staleness would never age out.
+    """
+    ingest(monkeypatch, report([charge()]))
+    memory.rollup_windows.clear()
+    restated, _ = ingest(monkeypatch, report([charge()], run="restated"))
+    assert restated["changed_days"] == 0
+    # No stamp was written, so the tables are behind and get a full rebuild.
+    assert memory.rollup_windows == [None]
 
 
 @pytest.mark.parametrize("failure", ["insert", "log"])

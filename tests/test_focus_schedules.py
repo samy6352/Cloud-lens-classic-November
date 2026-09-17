@@ -315,13 +315,14 @@ class MemoryWarehouse:
         self.db.execute("CREATE TABLE meta (key TEXT PRIMARY KEY,value TEXT,updated_at TEXT)")
         self.db.create_function("now", 0, lambda: datetime.now(UTC).isoformat())
         self.state = {}
+        self.rollup_windows = []
 
     @contextmanager
     def connect(self, **kwargs):
         yield self.db
 
-    async def refresh_rollup_async(self):
-        pass
+    async def refresh_rollup_async(self, window=None):
+        self.rollup_windows.append(window)
 
     async def quick_ingest(self, *args, **kwargs):
         raise AssertionError("Quick Azure reads must be mocked")

@@ -707,12 +707,65 @@ def _reconcile_focus(con: Any, records: list[list[Any]],
     return {
         "incremental": True,
         "changed_days": len(changed),
+        # The days themselves, not merely how many there were. The derived tables are
+        # rebuilt only for the months an import actually touched, and a count cannot
+        # say which months those are. Deduplicated across subscriptions because the
+        # rebuild window is a span of charge dates, not a per-subscription thing.
+        "changed_dates": sorted({day for _, day in changed}),
         "unchanged_days": len(unchanged),
         "inserted_rows": len(replacements),
         "deleted_rows": sum(existing[day] for day in changed),
         "unchanged_rows": sum(incoming[day] for day in unchanged),
         "preserved_newer_days": len(protected),
     }
+
+
+def _derived_is_current() -> bool:
+    """Whether the derived tables already describe the generation `costs` is at.
+
+    The generation is advanced inside the write transaction, and only when that
+    write actually changed something. So this single question answers both of the
+    ones the caller has: an import that changed nothing leaves the tables current
+    and needs no rebuild at all, and an import whose previous rebuild failed or was
+    interrupted leaves them stale and gets one even though it changed nothing
+    itself. Cheap -- two rows of `meta`.
+    """
+    from . import jobs
+
+    with warehouse.connect(read_only=True) as con:
+        return jobs.rollup_current(con)
+
+
+def _rebuild_window(changes: dict[str, Any]) -> tuple[date, date] | None:
+    """The whole-month span to rebuild the derived tables over, or None for all of it.
+
+    A full rebuild costs one scan of every retained month. That was acceptable when
+    the data was loaded once; under the customer's daily FOCUS sync it is the same
+    scan of a year of history repeated every day to correct one day's rows, so the
+    cost of staying fresh grows with retention while the change stays constant.
+
+    `_reconcile_focus` already knows exactly which days it replaced, so the rebuild
+    can be narrowed to the months those fall in -- and because `month_window` snaps
+    outwards to month boundaries, that prunes to the matching `costs` partitions.
+
+    None means "rebuild everything", and is returned for anything this cannot state
+    with certainty: a non-incremental import, which deletes and reloads whole
+    windows rather than reconciling days, and an unparseable date. Returning a
+    narrow window on uncertain input is the one way this can leave a quietly stale
+    dashboard, so it declines the optimisation instead of guessing. `refresh_rollup`
+    independently ignores any window when the previous rebuild did not complete.
+    """
+    from .rollup import month_window
+
+    if not changes.get("incremental"):
+        return None
+    days = []
+    for value in changes.get("changed_dates") or []:
+        try:
+            days.append(date.fromisoformat(str(value)[:10]))
+        except (TypeError, ValueError):
+            return None
+    return month_window(days)
 
 
 async def describe_export(account: str | None = None, container: str | None = None,
@@ -1027,7 +1080,13 @@ async def ingest_export(
 
             applied = await asyncio.to_thread(already_applied)
             if applied:
-                await warehouse.refresh_rollup_async()
+                # Every day in this run is already certified by a matching receipt, so
+                # nothing is being written. The derived tables therefore only need
+                # rebuilding if an earlier run left them behind the current generation;
+                # otherwise this whole poll costs nothing, which matters because the
+                # scheduled sync takes this path every time the export has not moved.
+                if not await asyncio.to_thread(_derived_is_current):
+                    await warehouse.refresh_rollup_async()
                 from . import jobs
                 for event_id in {r.get("publication_id") for r in applied} - {None}:
                     await jobs.publish_generation([coverage_sub], windows, event_id=event_id)
@@ -1306,9 +1365,12 @@ async def ingest_export(
         changes = await asyncio.to_thread(_write)
         warehouse.state.pop("writing", None)
         # Also retry on an unchanged snapshot: a prior import may have committed costs but
-        # failed (or been interrupted) before rebuilding the derived dashboard tables.
+        # failed (or been interrupted) before rebuilding the derived dashboard tables. The
+        # generation stamp distinguishes the two, so an import that changed nothing and
+        # found the tables current does no work here at all.
         await jobs.phase("warming-cache")
-        await warehouse.refresh_rollup_async()
+        if not await asyncio.to_thread(_derived_is_current):
+            await warehouse.refresh_rollup_async(_rebuild_window(changes))
         if changes.get("changed_days"):
             from . import jobs
             await jobs.publish_generation(sorted(subs), windows, generation=changes["generation"],
