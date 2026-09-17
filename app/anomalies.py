@@ -279,14 +279,31 @@ def _severity(delta: float, z: float) -> str:
 
 def _rows(con: Any, dimension: str, days: int, *,
           start: str | None = None, end: str | None = None,
-          currency: str | None = None) -> list[tuple]:
-    """Daily cost per key for one dimension. The dimension name is from a fixed map, never input."""
+          currency: str | None = None,
+          aggregate: str = "costs", named: str = "costs") -> list[tuple]:
+    """Daily cost per key for one dimension. The dimension name is from a fixed map, never input.
+
+    Which relation answers this depends on the dimension, because the two derived
+    grains carry different ones. `SubAccountName` is in the rollup and not in the
+    presence table; `ResourceName` is the reverse; `MeterName` is in neither and
+    has to come from the detail table. Decided by asking the grain rather than by
+    listing dimensions here, so that widening a grain cannot leave this behind.
+    """
     if dimension not in DIMENSIONS:
         raise AnomalyError(f"Cannot analyse by {dimension!r}.")
-    from . import reporting
+    from . import presence, reporting, rollup
+
+    if dimension in rollup.SERVABLE:
+        source = aggregate
+    elif dimension in presence.GROUPABLE:
+        # `named` rather than the presence table by name: under a converted currency
+        # that money cannot be converted, and `named` is already `costs` in that case.
+        source = named
+    else:
+        source = "costs"
 
     if end is None:
-        edge = con.execute('SELECT max("ChargePeriodStart") FROM costs').fetchone()
+        edge = con.execute(f'SELECT max("ChargePeriodStart") FROM {source}').fetchone()
         if not edge or not edge[0]:
             return []
         end = str(edge[0])[:10]
@@ -300,16 +317,16 @@ def _rows(con: Any, dimension: str, days: int, *,
     return con.execute(
         f'SELECT coalesce(nullif("{dimension}", \'\'), \'(none)\') AS k, '
         '"ChargePeriodStart" AS d, sum("BilledCost") AS c '
-        f"FROM costs WHERE \"ChargePeriodStart\" >= DATE '{since}' "
+        f"FROM {source} WHERE \"ChargePeriodStart\" >= DATE '{since}' "
         f"AND \"ChargePeriodStart\" <= DATE '{end}' {currency_filter} "
         'GROUP BY 1, 2 ORDER BY 2'
     ).fetchall()
 
 
 def _coverage(con: Any, scope: list[str] | None, start: date,
-              end: date) -> tuple[set[str], dict[str, Any]]:
+              end: date, source: str = "costs") -> tuple[set[str], dict[str, Any]]:
     subjects = scope if scope is not None else [
-        row[0] for row in con.execute('SELECT DISTINCT "SubAccountId" FROM costs').fetchall()]
+        row[0] for row in con.execute(f'SELECT DISTINCT "SubAccountId" FROM {source}').fetchall()]
     def canonical(sub):
         value = str(sub).strip().lower()
         return value.split("/subscriptions/", 1)[1].split("/", 1)[0] if "/subscriptions/" in value else value
@@ -369,7 +386,7 @@ def analyse(scope: list[str] | None = None, days: int = 60,
     which is indefensible: the events did not change, only the units.
     """
     from . import currency as fx
-    from . import reporting
+    from . import reporting, rollup
     from .warehouse import warehouse
 
     days = reporting.period_days(days)
@@ -379,8 +396,14 @@ def analyse(scope: list[str] | None = None, days: int = 60,
     with reporting.select(None):
         con = warehouse.connect(read_only=True, scope=scope, currency=display_currency, filters=filters)
     try:
+        # The rollup where it can answer this connection. The span is a min, a max
+        # and a row count -- all of which the rollup holds, the count as the sum of
+        # the `charges` each group stands for. Measured at 44s of this endpoint's
+        # 45.7s before routing: the whole tab was waiting on three numbers.
+        agg, _, named = warehouse.relations(con, scope, display_currency, filters)
         span = con.execute(
-            'SELECT min("ChargePeriodStart"), max("ChargePeriodStart"), count(*) FROM costs'
+            f'SELECT min("ChargePeriodStart"), max("ChargePeriodStart"), '
+            f'{rollup.charges_sql(agg)} FROM {agg}'
         ).fetchone()
 
         if not span or not span[2]:
@@ -393,9 +416,9 @@ def analyse(scope: list[str] | None = None, days: int = 60,
         start = bounds[0] if bounds else end - timedelta(days=days - 1)
         history_start = start - timedelta(days=WINDOW * 4)
         as_of = min(end, date.fromisoformat(str(span[1])[:10]))
-        covered, coverage = _coverage(con, scope, history_start, as_of)
+        covered, coverage = _coverage(con, scope, history_start, as_of, agg)
         history_currencies = con.execute(
-            'SELECT DISTINCT "ChargePeriodStart", "BillingCurrency" FROM costs '
+            f'SELECT DISTINCT "ChargePeriodStart", "BillingCurrency" FROM {agg} '
             f'WHERE "ChargePeriodStart" >= DATE \'{history_start.isoformat()}\' '
             f'AND "ChargePeriodStart" <= DATE \'{as_of.isoformat()}\''
         ).fetchall()
@@ -413,7 +436,7 @@ def analyse(scope: list[str] | None = None, days: int = 60,
         codes = {
             str(row[0] or "").strip().upper()
             for row in con.execute(
-                f'SELECT DISTINCT "BillingCurrency" FROM costs WHERE {period}').fetchall()
+                f'SELECT DISTINCT "BillingCurrency" FROM {agg} WHERE {period}').fetchall()
         }
         currency = next(iter(codes)) if len(codes) == 1 and fx.currency_code(next(iter(codes))) else None
         results: list[dict[str, Any]] = []
@@ -427,7 +450,8 @@ def analyse(scope: list[str] | None = None, days: int = 60,
             assessed: set[str] = set()
             for dim in dimensions:
                 found = detect(_rows(con, dim, days, start=history_start.isoformat(),
-                                    end=end.isoformat(), currency=code), dim,
+                                    end=end.isoformat(), currency=code,
+                                    aggregate=agg, named=named), dim,
                               min_delta=MIN_DELTA * scale, min_baseline=MIN_BASELINE * scale,
                               money_scale=scale, covered_days=covered,
                               as_of=as_of.isoformat(), assessed_days=assessed)

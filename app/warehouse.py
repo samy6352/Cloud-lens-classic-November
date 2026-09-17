@@ -974,6 +974,24 @@ class Warehouse:
         finally:
             con.close()
 
+    def relations(self, con: Any, scope: list[str] | None = None,
+                  currency: str | None = None,
+                  filters: dict[str, list[str]] | None = None) -> tuple[str, str, str]:
+        """The same routing decision `reader()` makes, for a caller holding a connection.
+
+        Not every module can use `reader()`. `anomalies` opens its connection itself
+        and passes it to helpers that read tuples rather than dicts, and converting
+        it wholesale would be a large change to working code for no benefit. But it
+        asks the same questions, and it should get the same answer: this is the one
+        place that decision lives, and a second copy of it would be a second thing
+        to get wrong.
+
+        Pass the same `scope`, `currency` and `filters` the connection was opened
+        with. Passing anything else names a relation carrying a different scope from
+        the one the connection can see, which is the one mistake here that is silent.
+        """
+        return self._derived_sources(con, scope, currency, filters)
+
     def _derived_sources(self, con: Any, scope: list[str] | None,
                          currency: str | None,
                          filters: dict[str, list[str]] | None) -> tuple[str, str, str]:

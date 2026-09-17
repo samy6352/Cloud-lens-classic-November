@@ -43,6 +43,15 @@ def rid(name, sub=SUB_A):
 
 
 def install_warehouse(monkeypatch, value):
+    # Doubles that stand in for the warehouse must answer `relations`, which is how a
+    # caller holding a raw connection asks which relation to read. These fixtures hold
+    # only `costs`, so that is the honest answer for them.
+    #
+    # Guarded rather than assumed: some tests here install a bare `object()` because
+    # the warehouse is never reached at all, and a bare object has no `__dict__` to
+    # attach to. Those cases need nothing, so failing to attach is the right outcome.
+    if not hasattr(value, "relations") and hasattr(value, "__dict__"):
+        value.relations = lambda *args, **kwargs: ("costs", "costs", "costs")
     module = ModuleType("app.warehouse")
     module.warehouse = value
     monkeypatch.setitem(sys.modules, "app.warehouse", module)

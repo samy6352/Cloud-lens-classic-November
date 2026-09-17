@@ -321,6 +321,46 @@ def test_the_summary_cannot_see_past_its_scope(loaded):
     assert scoped["subscriptions"] == 1
 
 
+# ------------------------------------------------------------------- anomalies
+
+def _anomalies(warehouse, monkeypatch, **kwargs):
+    """`anomalies.analyse` against this fixture's warehouse rather than the global one."""
+    import app.anomalies as anomalies
+    import app.warehouse as wh_mod
+
+    monkeypatch.setattr(wh_mod, "warehouse", warehouse)
+    return anomalies.analyse(**kwargs)
+
+
+def _on_the_detail_table(monkeypatch, warehouse):
+    """Make `relations` name `costs` for all three routes, as it does when stale."""
+    monkeypatch.setattr(type(warehouse), "relations",
+                        lambda self, *a, **k: ("costs", "costs", "costs"))
+
+
+def test_the_anomaly_tab_is_the_same_either_way(loaded, monkeypatch):
+    """The tab published 44s of its 45.7s waiting on `min/max/count(*) FROM costs`.
+
+    Routing that to the rollup is only legitimate if the answer does not move --
+    including the dimensions the rollup cannot serve, which must still reach the
+    detail table. `MeterName` is in neither grain and `ResourceName` only in the
+    presence table, so this exercises all three routes in one payload.
+    """
+    dims = ("ServiceName", "SubAccountName", "ResourceName", "MeterName")
+    routed = _anomalies(loaded, monkeypatch, scope=None, days=30, dimensions=dims)
+    _on_the_detail_table(monkeypatch, loaded)
+    _same(routed, _anomalies(loaded, monkeypatch, scope=None, days=30, dimensions=dims))
+
+
+def test_a_scoped_anomaly_tab_is_the_same_either_way(loaded, monkeypatch):
+    one = [str(uuid.UUID(int=2))]
+    routed = _anomalies(loaded, monkeypatch, scope=one, days=30,
+                        dimensions=("ServiceName",))
+    _on_the_detail_table(monkeypatch, loaded)
+    _same(routed, _anomalies(loaded, monkeypatch, scope=one, days=30,
+                             dimensions=("ServiceName",)))
+
+
 # ------------------------------------------------------- resource presence table
 
 def _counts(reader, table: str, where: str = "") -> list[dict]:
