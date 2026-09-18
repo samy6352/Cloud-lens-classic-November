@@ -73,6 +73,22 @@ param appServicePlanSku string = 'B1'
 @description('PostgreSQL compute SKU.')
 param postgresSku string = 'Standard_B1ms'
 
+@description('PostgreSQL major version. Central India offers 11-18.')
+param postgresVersion string = '16'
+
+@description('Storage type. Premium_LRS ties IOPS to capacity; PremiumV2_LRS provisions IOPS and throughput independently of size.')
+@allowed([
+  'Premium_LRS'
+  'PremiumV2_LRS'
+])
+param postgresStorageType string = 'Premium_LRS'
+
+@description('Provisioned IOPS, PremiumV2_LRS only.')
+param postgresIops int = 3000
+
+@description('Provisioned throughput MB/sec, PremiumV2_LRS only.')
+param postgresThroughput int = 125
+
 @description('PostgreSQL storage in GB.')
 param postgresStorageGb int = 32
 
@@ -131,6 +147,10 @@ module stack 'modules/stack.bicep' = {
     developerClientIp: developerClientIp
     appServicePlanSku: appServicePlanSku
     postgresSku: postgresSku
+    postgresVersion: postgresVersion
+    postgresStorageType: postgresStorageType
+    postgresIops: postgresIops
+    postgresThroughput: postgresThroughput
     postgresStorageGb: postgresStorageGb
     aiLocation: aiLocation
     modelName: modelName

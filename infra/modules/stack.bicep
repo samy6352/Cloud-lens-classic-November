@@ -72,6 +72,23 @@ param appServicePlanSku string
 @description('PostgreSQL compute SKU.')
 param postgresSku string
 
+@description('PostgreSQL major version. Kept as a parameter rather than pinned: the local baseline this deployment is measured against runs 18, and silently deploying an older engine hides the difference.')
+param postgresVersion string = '16'
+
+@description('Storage type. Premium_LRS welds IOPS to capacity (32GB = 120 IOPS, the trap the first deployment fell into); PremiumV2_LRS buys IOPS independently of size.')
+@allowed([
+  'Premium_LRS'
+  'PremiumV2_LRS'
+])
+param postgresStorageType string = 'Premium_LRS'
+
+@description('Provisioned IOPS. PremiumV2_LRS only; ignored for Premium_LRS, where IOPS follow the disk tier.')
+param postgresIops int = 3000
+
+@description('Provisioned storage throughput in MB/sec. PremiumV2_LRS only.')
+param postgresThroughput int = 125
+
+
 @description('PostgreSQL storage in GB.')
 param postgresStorageGb int
 
@@ -361,11 +378,20 @@ resource postgres 'Microsoft.DBforPostgreSQL/flexibleServers@2024-08-01' = {
   tags: tags
   sku: {
     name: postgresSku
-    tier: startsWith(postgresSku, 'Standard_B') ? 'Burstable' : 'GeneralPurpose'
+    // Three tiers, not two. E-series is MemoryOptimized and is rejected outright
+    // if offered as GeneralPurpose, which is what the original two-way test did.
+    tier: startsWith(postgresSku, 'Standard_B') ? 'Burstable' : (startsWith(postgresSku, 'Standard_E') ? 'MemoryOptimized' : 'GeneralPurpose')
   }
   properties: {
-    version: '16'
-    storage: {
+    version: postgresVersion
+    // autoGrow belongs to Premium_LRS, where capacity and IOPS are the same dial.
+    // PremiumV2_LRS provisions them separately and rejects autoGrow.
+    storage: postgresStorageType == 'PremiumV2_LRS' ? {
+      storageSizeGB: postgresStorageGb
+      type: 'PremiumV2_LRS'
+      iops: postgresIops
+      throughput: postgresThroughput
+    } : {
       storageSizeGB: postgresStorageGb
       autoGrow: 'Enabled'
     }

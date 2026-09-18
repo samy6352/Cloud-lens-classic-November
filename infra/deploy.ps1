@@ -75,6 +75,31 @@ param(
     [ValidateRange(1, 1000000)]
     [int]$ModelCapacity = 30,
 
+    # Database sizing. Previously absent, so every deployment silently took the
+    # Bicep defaults (Standard_B1ms / 32GB / B1) regardless of the estate it was
+    # being asked to serve.
+    [string]$PostgresSku = 'Standard_B1ms',
+
+    [ValidateRange(32, 65536)]
+    [int]$PostgresStorageGb = 32,
+
+    [ValidateSet('11', '12', '13', '14', '15', '16', '17', '18')]
+    [string]$PostgresVersion = '16',
+
+    # Premium_LRS ties IOPS to capacity: 32GB buys 120 IOPS. PremiumV2_LRS
+    # provisions IOPS and throughput separately, which is both cheaper and
+    # faster for a working set that cannot be cached.
+    [ValidateSet('Premium_LRS', 'PremiumV2_LRS')]
+    [string]$PostgresStorageType = 'Premium_LRS',
+
+    [ValidateRange(360, 80000)]
+    [int]$PostgresIops = 3000,
+
+    [ValidateRange(25, 1200)]
+    [int]$PostgresThroughput = 125,
+
+    [string]$AppServicePlanSku = 'B1',
+
     # Subscriptions the application should be able to read cost data from.
     # Defaults to the subscription being deployed into.
     [string[]]$CostScopeSubscriptions = @(),
@@ -316,6 +341,13 @@ $templateParameters = @(
     "modelName=$ModelName"
     "modelSku=$ModelSku"
     "modelCapacity=$ModelCapacity"
+    "postgresSku=$PostgresSku"
+    "postgresStorageGb=$PostgresStorageGb"
+    "postgresVersion=$PostgresVersion"
+    "postgresStorageType=$PostgresStorageType"
+    "postgresIops=$PostgresIops"
+    "postgresThroughput=$PostgresThroughput"
+    "appServicePlanSku=$AppServicePlanSku"
     "entraAppUniqueName=$EntraAppUniqueName"
     "deployEntraApp=$((-not $SkipEntra -and -not $EntraClientId).ToString().ToLower())"
     "authDelegatedArm=$((-not $AllowAppIdentityFallback).ToString().ToLower())"
