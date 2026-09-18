@@ -460,9 +460,11 @@ def test_filter_costs_are_currency_buckets_not_a_mixed_sum(monkeypatch):
     monkeypatch.setattr(main, "current_user", lambda request: user)
     monkeypatch.setattr(main, "permitted", AsyncMock(return_value=["a"]))
     calls = []
+    budgets = []
     @contextmanager
-    def reader(scope, currency=None):
+    def reader(scope, currency=None, budget_ms=None):
         calls.append(currency)
+        budgets.append(budget_ms)
         def rows(sql, *args):
             if "max(" in sql:
                 return [{"d": "2026-09-14"}]
@@ -477,6 +479,10 @@ def test_filter_costs_are_currency_buckets_not_a_mixed_sum(monkeypatch):
     assert item["cost"] is None and item["currency"] is None
     assert item["currency_buckets"] == {"USD": 1, "EUR": 2}
     assert calls == [None]
+    # The filter bar must bound its own database time. Unbounded, this query holds one of a
+    # small pool of connections for the server's full statement timeout on a large estate,
+    # and it is a secondary control that already degrades to "unavailable".
+    assert budgets == [main.FILTER_BUDGET_MS] and main.FILTER_BUDGET_MS > 0
 
 
 def test_csv_disconnect_waits_for_fetch_before_closing_context(monkeypatch):

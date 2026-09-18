@@ -951,7 +951,8 @@ class Warehouse:
     @contextmanager
     def reader(self, scope: list[str] | None = None,
                currency: str | None = None,
-               filters: dict[str, list[str]] | None = None) -> Iterator[Reader]:
+               filters: dict[str, list[str]] | None = None,
+               budget_ms: int | None = None) -> Iterator[Reader]:
         """One read-only connection reused across a burst of internal queries.
 
         Opening a connection is the expensive part — and under a scope it also rebuilds the
@@ -966,9 +967,23 @@ class Warehouse:
         money should read. Each is the derived table whenever that can answer this
         connection exactly, and `costs` otherwise, so a caller writes one query and
         gets the fast path when the fast path is correct.
+
+        `budget_ms` is for a caller that would rather fail early than hold a connection.
+        The pool is small, so a query that is going to exceed the server's bound anyway
+        spends that whole time occupying a slot every other request is queueing for --
+        which is how one slow secondary control took the whole dashboard down with it.
+        It can only ever *tighten* the bound: `LEAST` against the current setting means a
+        caller cannot award itself more time than the server allows, and `NULLIF` treats
+        an unlimited server bound as no competitor rather than as zero.
         """
         con = self.connect(read_only=True, scope=scope, currency=currency, filters=filters)
         try:
+            if budget_ms and budget_ms > 0:
+                con.execute(
+                    "SELECT set_config('statement_timeout', (EXTRACT(EPOCH FROM LEAST("
+                    "NULLIF(current_setting('statement_timeout'), '0')::interval, "
+                    "make_interval(secs => ? / 1000.0))) * 1000)::bigint::text, false)",
+                    [budget_ms])
             aggregate, counted, named = self._derived_sources(con, scope, currency, filters)
             yield Reader(con, aggregate, counted, named)
         finally:

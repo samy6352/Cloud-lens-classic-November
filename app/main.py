@@ -1132,6 +1132,18 @@ ENV_TAG = (
     "TRY_CAST(\"Tags\" AS JSON) #>> '{Environment}')"
 )
 
+# How long the filter bar may hold a database connection before giving up.
+#
+# It is a secondary control and already degrades to "unavailable" when its query fails, so
+# the only thing a long wait buys is a pool slot held against every other request. On the
+# real estate the query needs 171s -- well past the server's 110s bound -- so it never
+# succeeded and spent 110s of a 8-connection pool failing. Three page loads were enough to
+# take the dashboard from 9.8s to a 180s timeout.
+#
+# Deliberately not zero: on an estate where this completes, it should still complete. This
+# only removes the part of the wait that was never going to produce an answer.
+FILTER_BUDGET_MS = int(os.getenv("FILTER_TIMEOUT_MS", "15000"))
+
 
 def request_filters(request: Request) -> dict[str, list[str]] | None:
     """The filter bar's selection, read from `?rg=a,b&region=eastus`.
@@ -4781,7 +4793,8 @@ async def filter_values(request: Request, days: int = 30, scope: str = "",
 
     def collect() -> dict[str, Any]:
         out: dict[str, Any] = {}
-        with warehouse.reader(picked or None, currency=currency or None) as r:
+        with warehouse.reader(picked or None, currency=currency or None,
+                              budget_ms=FILTER_BUDGET_MS) as r:
             # Anchored to the newest data, not to today: a warehouse that ends last Friday would
             # otherwise offer an empty list every Monday.
             newest = r.rows('SELECT max("ChargePeriodStart") AS d FROM costs', 1)
