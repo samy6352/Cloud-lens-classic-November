@@ -98,6 +98,22 @@ param pgWorkMem string = ''
 @description('Session statement_timeout for application connections. Empty means no cap.')
 param pgStatementTimeout string = ''
 
+@description('Ingest cost data on first boot when the warehouse is empty.')
+param autoIngest bool = true
+
+@description('Run the daily refresh.')
+param autoRefresh bool = true
+
+@description('Allow username/password sign-in alongside Entra.')
+param authAllowLocal bool = false
+
+@description('Local accounts as name:hash:role, PBKDF2 hashed.')
+@secure()
+param authUsers string = ''
+
+@description('Schema the warehouse owns. Empty uses `public`.')
+param pgSchema string = ''
+
 @description('PostgreSQL storage in GB.')
 param postgresStorageGb int = 32
 
@@ -163,6 +179,11 @@ module stack 'modules/stack.bicep' = {
     partitionCosts: partitionCosts
     pgWorkMem: pgWorkMem
     pgStatementTimeout: pgStatementTimeout
+    autoIngest: autoIngest
+    autoRefresh: autoRefresh
+    authAllowLocal: authAllowLocal
+    authUsers: authUsers
+    pgSchema: pgSchema
     postgresStorageGb: postgresStorageGb
     aiLocation: aiLocation
     modelName: modelName

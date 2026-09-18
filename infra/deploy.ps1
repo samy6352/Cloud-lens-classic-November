@@ -109,6 +109,21 @@ param(
 
     [string]$PgStatementTimeout = '',
 
+    # Off for a deployment whose data is loaded by other means: a boot with an
+    # empty warehouse would otherwise ingest this subscription's own costs and
+    # mix them into a restored estate. Production runs -AutoIngest:$false.
+    [bool]$AutoIngest = $true,
+
+    [bool]$AutoRefresh = $true,
+
+    # Username/password sign-in alongside Entra, as production runs.
+    [bool]$AuthAllowLocal = $false,
+
+    # name:hash:role, PBKDF2. Never a plaintext password.
+    [string]$AuthUsers = '',
+
+    [string]$PgSchema = '',
+
     [string]$AppServicePlanSku = 'B1',
 
     # Subscriptions the application should be able to read cost data from.
@@ -361,6 +376,11 @@ $templateParameters = @(
     "partitionCosts=$($PartitionCosts.IsPresent.ToString().ToLower())"
     "pgWorkMem=$PgWorkMem"
     "pgStatementTimeout=$PgStatementTimeout"
+    "autoIngest=$($AutoIngest.ToString().ToLower())"
+    "autoRefresh=$($AutoRefresh.ToString().ToLower())"
+    "authAllowLocal=$($AuthAllowLocal.ToString().ToLower())"
+    "authUsers=$AuthUsers"
+    "pgSchema=$PgSchema"
     "appServicePlanSku=$AppServicePlanSku"
     "entraAppUniqueName=$EntraAppUniqueName"
     "deployEntraApp=$((-not $SkipEntra -and -not $EntraClientId).ToString().ToLower())"

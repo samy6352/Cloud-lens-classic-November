@@ -97,6 +97,22 @@ param pgWorkMem string = ''
 @description('Session statement_timeout for application connections. Empty means no cap, which lets one slow query hold a pool slot indefinitely.')
 param pgStatementTimeout string = ''
 
+@description('Let the application ingest cost data on first boot when the warehouse is empty. False for a deployment whose data is loaded by other means, so a boot cannot mix its own subscription into a restored estate.')
+param autoIngest bool = true
+
+@description('Run the daily refresh. False pins the warehouse to exactly what was loaded.')
+param autoRefresh bool = true
+
+@description('Allow username/password sign-in alongside Entra. Production runs with this enabled.')
+param authAllowLocal bool = false
+
+@description('Local accounts as name:hash:role, PBKDF2 hashed. Never a plaintext password.')
+@secure()
+param authUsers string = ''
+
+@description('Schema the warehouse owns. Empty uses `public`.')
+param pgSchema string = ''
+
 
 @description('PostgreSQL storage in GB.')
 param postgresStorageGb int
@@ -713,6 +729,26 @@ resource webApp 'Microsoft.Web/sites@2023-12-01' = {
         {
           name: 'PG_STATEMENT_TIMEOUT'
           value: pgStatementTimeout
+        }
+        {
+          name: 'AUTO_INGEST'
+          value: autoIngest ? 'true' : 'false'
+        }
+        {
+          name: 'AUTO_REFRESH'
+          value: autoRefresh ? 'true' : 'false'
+        }
+        {
+          name: 'AUTH_ALLOW_LOCAL'
+          value: authAllowLocal ? 'true' : 'false'
+        }
+        {
+          name: 'AUTH_USERS'
+          value: authUsers
+        }
+        {
+          name: 'PGSCHEMA'
+          value: pgSchema
         }
         {
           name: 'ARCHIVE_ACCOUNT'
