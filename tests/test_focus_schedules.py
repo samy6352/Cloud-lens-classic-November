@@ -290,10 +290,20 @@ class OfflineConnection(sqlite3.Connection):
 
 
 def test_oversized_export_leaves_existing_rows_untouched(monkeypatch, memory):
+    """A refused export must leave the warehouse exactly as it was.
+
+    Anchored to the decoded-bytes limit, which is what still bounds a single file.
+    The row limit this used to use is gone: EXPORT_MAX_ROWS refused any export over
+    100,000 rows and a real customer month is 5.8M, so it was not protecting the
+    importer from a pathological export, it was stopping it doing its job. Rows are
+    streamed into a staging table in batches now, so size costs bounded memory rather
+    than a refusal -- but a file that will not fit in memory to decode at all is still
+    refused, and must still change nothing.
+    """
     ingest(monkeypatch, report("old", "2026-08-10", "2026-08-11", 10))
     before = memory.snapshot()
-    monkeypatch.setattr(exports, "EXPORT_MAX_ROWS", 0)
-    with pytest.raises(exports.ExportError, match="row limit"):
+    monkeypatch.setattr(exports, "EXPORT_MAX_BYTES", 1)
+    with pytest.raises(exports.ExportError, match="memory safety"):
         ingest(monkeypatch, report("new", "2026-08-20", "2026-08-21", 20))
     assert memory.snapshot() == before
 
@@ -374,8 +384,18 @@ def memory(monkeypatch):
     monkeypatch.setattr(exports, "warehouse", wh)
     import app.warehouse as module
     monkeypatch.setattr(module, "warehouse", wh)
-    monkeypatch.setattr(exports, "insert_rows", lambda con, rows: con.executemany(
-        "INSERT INTO costs VALUES (" + ",".join("?" for _ in COLUMNS) + ")", rows))
+    # Patched on the warehouse module rather than on `exports`, because the importer
+    # now stages each parsed batch through the bulk helper rather than inserting a
+    # list of rows itself. `table` is honoured so staged rows go to the staging table
+    # and not straight into `costs`.
+    def offline_insert(con, rows, table="costs", **kwargs):
+        if not rows:
+            return 0
+        con.executemany(f"INSERT INTO {table} VALUES ("
+                        + ",".join("?" for _ in COLUMNS) + ")", rows)
+        return len(rows)
+    monkeypatch.setattr(module, "insert_rows", offline_insert)
+    monkeypatch.setattr(module, "ensure_partitions_between", lambda *a, **k: [])
     yield wh
     wh.db.close()
 

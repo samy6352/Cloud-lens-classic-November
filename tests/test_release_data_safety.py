@@ -180,7 +180,10 @@ class ExportSafety(unittest.TestCase):
         self.assertEqual(self.snapshot(), self.before)
 
     def test_insert_failure_rolls_back_delete_and_log(self):
-        with patch.object(exports, "insert_rows", side_effect=RuntimeError("insert failed")), \
+        # Patched on the warehouse module, which is where `staging` reads it from: the
+        # importer copies each parsed batch through the bulk helper rather than
+        # inserting a list of rows itself.
+        with patch("app.warehouse.insert_rows", side_effect=RuntimeError("insert failed")), \
                 self.assertRaisesRegex(RuntimeError, "insert failed"):
             self.ingest([charge()])
         self.assertEqual(self.snapshot(), self.before)

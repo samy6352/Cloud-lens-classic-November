@@ -143,7 +143,7 @@ def test_older_wide_run_preserves_newer_compact_correction(postgres_warehouse, m
 def test_sas_focus_change_invalidates_only_changed_day_receipts(
         postgres_warehouse, monkeypatch, fail_first):
     from app import exports, jobs
-    from app.warehouse import COLUMNS_INDEX
+    from app.warehouse import COLUMNS_INDEX, insert_rows
 
     wh = postgres_warehouse
     original = _report()
@@ -176,7 +176,7 @@ def test_sas_focus_change_invalidates_only_changed_day_receipts(
     other = _cost_row()
     other[COLUMNS_INDEX["SubAccountId"]] = "sub-b"
     with jobs.transaction() as con:
-        exports.insert_rows(con, [other, _cost_row("2026-07-01")])
+        insert_rows(con, [other, _cost_row("2026-07-01")])
         jobs._put(con, other_key, {"run_id": "other-sub"})
         jobs._put(con, outside_key, {"run_id": "outside-window"})
     before = {key: wh.get_meta(key) for key in (changed_key, zero_key, other_key, outside_key)}
@@ -204,9 +204,13 @@ def test_sas_focus_change_invalidates_only_changed_day_receipts(
     original_totals = totals()
     if fail_first:
         with monkeypatch.context() as patch:
-            def fail_insert(*args):
+            def fail_insert(*args, **kwargs):
                 raise RuntimeError("injected SAS write failure")
-            patch.setattr(exports, "insert_rows", fail_insert)
+            # Patched on the warehouse module, which is where `staging` reads it from:
+            # the importer now copies each parsed batch through the bulk helper rather
+            # than inserting a list of rows itself.
+            from app import warehouse as warehouse_mod
+            patch.setattr(warehouse_mod, "insert_rows", fail_insert)
             with pytest.raises(RuntimeError, match="injected SAS write failure"):
                 asyncio.run(exports.ingest_export(**sas_args))
         assert totals() == original_totals

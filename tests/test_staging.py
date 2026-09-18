@@ -104,7 +104,7 @@ def test_the_sql_reconciler_agrees_with_the_counter_it_replaced(postgres_warehou
             if stored:
                 insert_rows(con, stored)
 
-            staged = staging.Staged(con, f"t{case}")
+            staged = staging.Staged(lambda: con, f"t{case}")
             staged.create()
             staged.add(incoming)
             answer = staged.changed_days(windows, set())
@@ -131,7 +131,7 @@ def test_a_protected_day_is_never_reported_as_changed(postgres_warehouse):
         con.execute("DELETE FROM costs")
         insert_rows(con, [_row(keys, "sub-a", "2026-08-01", 5, "r1"),
                           _row(keys, "sub-a", "2026-08-02", 5, "r1")])
-        staged = staging.Staged(con, "prot")
+        staged = staging.Staged(lambda: con, "prot")
         staged.create()
         # Both days differ from what is stored, but the first is spoken for.
         staged.add([_row(keys, "sub-a", "2026-08-01", 99, "r1"),
@@ -153,7 +153,7 @@ def test_a_day_outside_the_declared_window_is_left_alone(postgres_warehouse):
         con.execute("BEGIN")
         con.execute("DELETE FROM costs")
         insert_rows(con, [_row(keys, "sub-a", "2026-07-15", 5, "r1")])
-        staged = staging.Staged(con, "win")
+        staged = staging.Staged(lambda: con, "win")
         staged.create()
         staged.add([_row(keys, "sub-a", "2026-08-01", 5, "r1")])
         # July is stored and absent from the import, but the window is August only.

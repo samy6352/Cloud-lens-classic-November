@@ -120,18 +120,33 @@ class MemoryWarehouse:
             'FROM costs ORDER BY 1,2,3,4').fetchall()
 
 
-def insert(con, records):
-    return con.executemany("INSERT INTO costs VALUES (" + ",".join("?" for _ in COLUMNS) + ")",
-                           records)
+def insert(con, records, table="costs", **kwargs):
+    """The offline stand-in for `warehouse.insert_rows`, which is COPY on PostgreSQL.
+
+    Takes `table` because the importer stages rows into a table of its own before
+    reconciling them, and a helper hard-coded to `costs` would send them straight
+    into the warehouse instead.
+    """
+    if not records:
+        return 0
+    con.executemany(f"INSERT INTO {table} VALUES ("
+                    + ",".join("?" for _ in COLUMNS) + ")", records)
+    return len(records)
 
 
 @pytest.fixture
 def memory(monkeypatch):
     from app import jobs
+    from app import warehouse as warehouse_mod
     monkeypatch.setattr(jobs, "publish_generation", AsyncMock())
     wh = MemoryWarehouse()
     monkeypatch.setattr(exports, "warehouse", wh)
-    monkeypatch.setattr(exports, "insert_rows", insert)
+    # The importer stages rows through `warehouse.insert_rows`, which is COPY against
+    # PostgreSQL. Offline that has to be a plain executemany into SQLite -- patched on
+    # the warehouse module because that is where `staging` reads it from.
+    monkeypatch.setattr(warehouse_mod, "insert_rows", insert)
+    monkeypatch.setattr(warehouse_mod, "ensure_partitions_between",
+                        lambda *args, **kwargs: [])
     monkeypatch.setattr(exports.azure, "request",
                         AsyncMock(side_effect=AssertionError("No Azure calls in offline tests")))
     yield wh
@@ -420,20 +435,42 @@ def test_overlapping_windows_and_rows_in_wrong_file_are_not_summed(monkeypatch, 
     assert memory.snapshot() == before
 
 
-@pytest.mark.parametrize("limit", ["rows", "files", "manifests"])
+@pytest.mark.parametrize("limit", ["files", "manifests"])
 def test_safety_caps_never_import_partial_delta(monkeypatch, memory, limit):
+    """A cap that trips must leave the warehouse exactly as it was.
+
+    The row cap that used to be tested here is gone. EXPORT_MAX_ROWS refused any
+    export larger than 100,000 rows, and a real customer month is 5.8M -- so it was
+    not protecting the importer from a pathological export, it was the reason the
+    importer could not take a real estate. Rows are now streamed into a staging table
+    in batches, so the size of an export costs bounded memory rather than a refusal.
+    The file and manifest caps remain, because those bound how much work one run may
+    take on rather than how large a legitimate export may be.
+    """
     ingest(monkeypatch, report([charge()]))
     before, args = memory.snapshot(), {}
     blobs = report([charge(billed=90), charge("2026-08-02")])
-    if limit == "rows":
-        monkeypatch.setattr(exports, "EXPORT_MAX_ROWS", 1)
-    elif limit == "files":
+    if limit == "files":
         args["max_files"] = 0
     else:
         monkeypatch.setenv("EXPORT_MAX_MANIFESTS", "0")
     with pytest.raises(exports.ExportError):
         ingest(monkeypatch, blobs, **args)
     assert memory.snapshot() == before
+
+
+def test_an_export_larger_than_the_old_row_cap_is_imported_rather_than_refused(
+        monkeypatch, memory):
+    """The whole point of staging: 100,000 rows was a ceiling, not a batch.
+
+    Parsed in batches small enough that several are needed, so the batching itself is
+    exercised rather than merely configured.
+    """
+    monkeypatch.setattr(exports, "PARSE_BATCH", 40)
+    rows = [charge(f"2026-08-{(i % 28) + 1:02d}", billed=i % 7) for i in range(250)]
+    result, _ = ingest(monkeypatch, report(rows))
+    assert result["rows"] == 250
+    assert len(memory.snapshot()) == 250
 
 
 def test_replay_reconciles_intervening_other_source_under_writer_lock(monkeypatch, memory):
@@ -536,13 +573,17 @@ def test_an_unchanged_import_still_repairs_derived_tables_left_behind(monkeypatc
 
 @pytest.mark.parametrize("failure", ["insert", "log"])
 def test_transaction_rolls_back_all_changed_days_and_log_on_failure(monkeypatch, memory, failure):
+    from app import warehouse as warehouse_mod
+
     ingest(monkeypatch, report([charge(), charge("2026-08-02", 4)]))
     before, logs = memory.snapshot(), memory.logs()
     if failure == "insert":
-        def failing_insert(con, records):
-            insert(con, records[:1])
+        # Fails part-way through staging a batch, which is where a dropped connection
+        # or a bad row would. Nothing may reach `costs` from a run that ends this way.
+        def failing_insert(con, records, table="costs", **kwargs):
+            insert(con, records[:1], table)
             raise RuntimeError("offline insert failure")
-        monkeypatch.setattr(exports, "insert_rows", failing_insert)
+        monkeypatch.setattr(warehouse_mod, "insert_rows", failing_insert)
     else:
         memory.db.fail_log = True
     with pytest.raises(RuntimeError, match="offline"):
@@ -551,7 +592,7 @@ def test_transaction_rolls_back_all_changed_days_and_log_on_failure(monkeypatch,
     assert not memory.db.in_transaction and memory.state["status"] == "failed"
     assert memory.rollups == 1
     memory.db.fail_log = False
-    monkeypatch.setattr(exports, "insert_rows", insert)
+    monkeypatch.setattr(warehouse_mod, "insert_rows", insert)
     repeated, _ = ingest(monkeypatch, report([charge(billed=30), charge("2026-08-02", 40)]))
     assert_counts(repeated, 2, 0, 2, 2, 0)
 

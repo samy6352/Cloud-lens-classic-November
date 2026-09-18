@@ -39,8 +39,8 @@ import json
 import logging
 import os
 import re
-from collections import Counter
 from collections.abc import Iterable
+from contextlib import ExitStack, nullcontext
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from urllib.parse import urlparse
@@ -48,6 +48,7 @@ from uuid import uuid4
 
 import httpx
 
+from . import staging
 from .cost import (
     ARM,
     CostError,
@@ -65,7 +66,6 @@ from .warehouse import (
     _nullable_number,
     _to_date,
     canonical_sub_id,
-    insert_rows,
     warehouse,
 )
 
@@ -501,7 +501,14 @@ def _map_header(header: list[str]) -> dict[str, int]:
 
 
 EXPORT_MAX_BYTES = 64 * 1024 * 1024
-EXPORT_MAX_ROWS = 100_000
+# How many parsed rows are held before being copied into the staging table. This is
+# the whole of the importer's row-shaped memory now: a batch, not an export.
+#
+# It replaces EXPORT_MAX_ROWS, which was 100,000 and was a cap rather than a batch --
+# an export larger than it was refused outright. A real customer month is 5.8M rows,
+# so that limit was not protecting the importer from a pathological export, it was
+# stopping it from doing its job.
+PARSE_BATCH = int(os.getenv("EXPORT_PARSE_BATCH", "50000"))
 
 
 def _export_payload(raw: bytes) -> bytes:
@@ -538,8 +545,10 @@ def _rows_from_parquet(raw: bytes) -> tuple[list[str], Iterable[list[str]]]:
     raw = _export_payload(raw)
     reader = pq.ParquetFile(io.BytesIO(raw))
     header = list(reader.schema_arrow.names)
-    if reader.metadata.num_rows > EXPORT_MAX_ROWS:
-        raise ExportError("Export row limit exceeded; no data was changed.")
+    # No row-count ceiling: rows are yielded in batches and staged as they are parsed,
+    # so a large partition costs a batch rather than all of it. `EXPORT_MAX_BYTES`
+    # below still bounds what a single file may decode to, which is the memory this
+    # function actually holds.
 
     def rows():
         decoded_bytes = 0
@@ -559,7 +568,16 @@ def _read_any(name: str, raw: bytes) -> tuple[list[str], Iterable[list[str]]]:
 
 def _load_rows(header: list[str], reader: Iterable[list[str]],
                fallback_sub: str | None,
-               metric: str | None = None) -> tuple[list[list[Any]], int]:
+               metric: str | None = None,
+               flush: Any = None,
+               batch: int = PARSE_BATCH) -> tuple[list[list[Any]], int]:
+    """Parse an export's rows into warehouse column order.
+
+    `flush`, when given, is handed each batch of `batch` parsed rows and the list is
+    then dropped, so a single multi-million-row blob costs one batch of memory rather
+    than all of it. Callers that omit it get every row back at once, which is what the
+    tests and the small-export paths want.
+    """
     idx = _map_header(header)
     billing = _BillingMapping(header, metric)
     if "BilledCost" not in idx:
@@ -575,8 +593,9 @@ def _load_rows(header: list[str], reader: Iterable[list[str]],
     records: list[list[Any]] = []
     skipped = 0
     for row in reader:
-        if len(records) + skipped >= EXPORT_MAX_ROWS:
-            raise ExportError("Export row limit exceeded; no data was changed.")
+        if flush is not None and len(records) >= batch:
+            flush(records)
+            records = []
         if not row:
             continue
         rec: list[Any] = []
@@ -655,55 +674,42 @@ def _focus_windows(manifests: list[Manifest]) -> dict[str, tuple[str, str]]:
     return files
 
 
-def _reconcile_focus(con: Any, records: list[list[Any]],
-                     windows: dict[str, list[tuple[str, str]]], *,
-                     protected: set[tuple[str, str]] | None = None) -> dict[str, Any]:
+def _reconcile_staged(con: Any, staged: Any,
+                      windows: dict[str, list[tuple[str, str]]], *,
+                      protected: set[tuple[str, str]] | None = None) -> dict[str, Any]:
     """Compare complete row multisets under the writer lock; replace only changed days.
 
-    There is no natural usage-row key. Counting identical rows, rather than deduplicating
-    them or comparing summed money, preserves legitimate duplicates and zero-net credits.
-    The in-memory stage is bounded by EXPORT_MAX_ROWS; existing rows are streamed so a
-    previous over-import does not require another full snapshot in memory.
+    There is no natural usage-row key. Comparing identical rows by multiplicity, rather
+    than deduplicating them or comparing summed money, preserves legitimate duplicates
+    and zero-net credits.
+
+    The comparison happens in the database rather than in this process. It used to read
+    every incoming row into a `Counter` and stream the stored rows past it, which is why
+    the importer was capped at 100,000 rows: a real customer month is 5.8M, and holding
+    it cost several gigabytes before the stored side was even looked at. `staging`
+    answers the same question with `EXCEPT ALL` in both directions -- see its module
+    docstring for why `ALL` is what makes the two equivalent.
     """
-    keys = list(COLUMNS)
-    i_date, i_sub = keys.index("ChargePeriodStart"), keys.index("SubAccountId")
     protected = protected or set()
-    records = [row for row in records if (row[i_sub], row[i_date]) not in protected]
-    names = ",".join(f'"{column}"' for column in keys)
-    remaining = Counter(tuple(row) for row in records)
-    incoming = Counter((row[i_sub], row[i_date]) for row in records)
-    existing: Counter[tuple[str, str]] = Counter()
-    changed: set[tuple[str, str]] = set()
-    for sub, periods in sorted(windows.items()):
-        for start, end in periods:
-            cursor = con.execute(
-                f'SELECT {names} FROM costs WHERE "SubAccountId" = ? '
-                'AND "ChargePeriodStart" BETWEEN ? AND ?', [sub, start, end])
-            while batch := cursor.fetchmany(1024):
-                for values in batch:
-                    row = list(values)
-                    # PostgreSQL returns DATE objects; the staged parser uses ISO strings.
-                    row[i_date] = str(row[i_date])
-                    day = (sub, row[i_date])
-                    if day in protected:
-                        continue
-                    existing[day] += 1
-                    value = tuple(row)
-                    if remaining[value]:
-                        remaining[value] -= 1
-                    else:
-                        changed.add(day)
-    changed.update((row[i_sub], row[i_date]) for row, count in remaining.items() if count)
-    unchanged = (incoming.keys() | existing.keys()) - changed
-    replacements = [row for row in records if (row[i_sub], row[i_date]) in changed]
-    for sub, day in sorted(changed):
+    if protected:
+        # Days a newer compact correction already owns are not this run's to restate,
+        # so they leave the comparison entirely rather than being filtered out of it.
+        staged.drop_protected(protected)
+
+    changed = staged.changed_days(windows, protected)
+    incoming = staged.day_rows()
+    deleted = staged.stored_rows_on(changed)
+
+    for sub, day in changed:
         # A scoped SAS import may not issue receipts of its own. Never leave an
         # older run's receipt certifying a day whose row multiset is being changed.
         con.execute("DELETE FROM meta WHERE key = ?", [f"focus-day:{sub}:{day}"])
         con.execute('DELETE FROM costs WHERE "SubAccountId" = ? AND "ChargePeriodStart" = ?',
                     [sub, day])
-    if replacements:
-        insert_rows(con, replacements)
+    inserted = staged.publish(changed) if changed else 0
+
+    changed_set = set(changed)
+    unchanged = [day for day in incoming if day not in changed_set]
     return {
         "incremental": True,
         "changed_days": len(changed),
@@ -713,8 +719,8 @@ def _reconcile_focus(con: Any, records: list[list[Any]],
         # rebuild window is a span of charge dates, not a per-subscription thing.
         "changed_dates": sorted({day for _, day in changed}),
         "unchanged_days": len(unchanged),
-        "inserted_rows": len(replacements),
-        "deleted_rows": sum(existing[day] for day in changed),
+        "inserted_rows": inserted,
+        "deleted_rows": deleted,
         "unchanged_rows": sum(incoming[day] for day in unchanged),
         "preserved_newer_days": len(protected),
     }
@@ -963,6 +969,11 @@ async def ingest_export(
     warehouse.state = {"status": "running", "started": started.isoformat(timespec="seconds"),
                        "metric": metric, "total": 0, "done": 0, "rows": 0, "failed": 0,
                        "empty": 0, "progress": 0.0, "source": f"{reader.account}/{reader.container}"}
+    # Named before the try so the finally can always clean them up, including when the
+    # run fails before it gets as far as staging anything.
+    resources = ExitStack()
+    staged: Any = None
+    total_rows = 0
     try:
         # Prefer the run's own manifest over inferring a run from blob names and timestamps.
         # The old heuristic took every data file sharing the newest minute-prefix, which merges
@@ -1110,7 +1121,17 @@ async def ingest_export(
         # FOCUS run that has no periods in it.
         warehouse.state["unit"] = "file"
 
-        all_records: list[list[Any]] = []
+        # Rows go into an unlogged staging table as they are parsed, not into a list.
+        # A real customer month is 5.8M rows at 576-810 bytes each, so accumulating them
+        # here needed several gigabytes before reconciliation even began -- which is what
+        # EXPORT_MAX_ROWS existed to prevent, and why the importer could not take a real
+        # estate at all. `staging` answers everything the list used to answer.
+        #
+        # Given a factory rather than a connection: an export that fails validation must
+        # not have opened a database session at all, so the connection is taken on the
+        # first batch that is genuinely staged. The stack releases it in the `finally`.
+        staged = staging.Staged(
+            lambda: resources.enter_context(warehouse.connect()), uuid4().hex)
         file_counts: dict[str, int] = {}
         skipped = 0
         source_bytes = 0
@@ -1147,46 +1168,59 @@ async def ingest_export(
             # Parsing is pure Python over every row of a multi-megabyte CSV, so it goes to a
             # thread for the same reason the write does: on the event loop it stops the app
             # answering anything, including the poll that draws this progress bar.
+            #
+            # Each batch is checked and copied in as it is parsed, rather than the whole
+            # blob being held and checked at the end. Every row still passes through
+            # exactly one batch, so the checks see all of them; what changes is that a
+            # multi-million-row partition costs one batch of memory instead of all of it.
+            basis = list(COLUMNS).index("BillingCostBasis")
+            period = focus_periods.get(b["name"])
+            seen = {"rows": 0}
+
+            def take(records: list[list[Any]], *, _b=b, _period=period,
+                     _basis=basis, _seen=seen) -> None:
+                if required_metric == "FocusCost":
+                    if any(r[_basis] != "FOCUS" for r in records):
+                        raise ExportError(
+                            "The selected file contains non-FOCUS cost data. No data was "
+                            "changed. Use Quick refresh or select a FOCUS export.")
+                    if coverage_sub and any(r[i_sub] != coverage_sub for r in records):
+                        raise ExportError(
+                            "The FOCUS subscription export contains another subscription. "
+                            "No data was changed.")
+                    if any(not _period[0] <= r[i_date] <= _period[1] for r in records):
+                        raise ExportError(
+                            "The FOCUS file contains a date outside its manifest period. "
+                            "No data was changed.")
+                    for sub in {r[i_sub] for r in records if r[i_sub]}:
+                        if selected_subs is None or sub in selected_subs:
+                            periods = windows.setdefault(sub, [])
+                            bounded = requested_window or _period
+                            if bounded not in periods:
+                                periods.append(bounded)
+                _seen["rows"] += len(records)
+                staged.add(records)
+
             recs, sk = await asyncio.to_thread(
-                _load_rows, header, rows, subscription_id, b.get("metric") or metric)
-            if required_metric == "FocusCost":
-                basis = list(COLUMNS).index("BillingCostBasis")
-                if any(r[basis] != "FOCUS" for r in recs):
-                    raise ExportError(
-                        "The selected file contains non-FOCUS cost data. No data was changed. "
-                        "Use Quick refresh or select a FOCUS export."
-                    )
-                period = focus_periods[b["name"]]
-                if coverage_sub and any(r[i_sub] != coverage_sub for r in recs):
-                    raise ExportError(
-                        "The FOCUS subscription export contains another subscription. "
-                        "No data was changed.")
-                if any(not period[0] <= r[i_date] <= period[1] for r in recs):
-                    raise ExportError(
-                        "The FOCUS file contains a date outside its manifest period. "
-                        "No data was changed.")
-                for sub in {r[i_sub] for r in recs if r[i_sub]}:
-                    if selected_subs is None or sub in selected_subs:
-                        periods = windows.setdefault(sub, [])
-                        bounded = requested_window or period
-                        if bounded not in periods:
-                            periods.append(bounded)
-            file_counts[b["name"]] = len(recs) + sk
-            if (incremental or b.get("rows")) and b["rows"] != len(recs) + sk:
+                _load_rows, header, rows, subscription_id, b.get("metric") or metric,
+                take)
+            await asyncio.to_thread(take, recs)
+            recs = []
+            observed_rows = seen["rows"] + sk
+            file_counts[b["name"]] = observed_rows
+            if (incremental or b.get("rows")) and b["rows"] != observed_rows:
                 raise ExportError(
                     f"The export declares {b['rows']:,} row(s) in {b['name']} but "
-                    f"{len(recs) + sk:,} were read. No data was changed."
+                    f"{observed_rows:,} were read. No data was changed."
                 )
-            if len(all_records) + len(recs) > EXPORT_MAX_ROWS:
-                raise ExportError("Complete export exceeds the row safety limit; no data was changed.")
-            all_records.extend(recs)
             skipped += sk
             # Downloading is nearly all of the wall time here, so the bar tracks it directly and
             # stops just short of full — the database write still has to happen.
             warehouse.state["done"] = n
-            warehouse.state["rows"] = len(all_records)
+            warehouse.state["rows"] = staged.rows
             warehouse.state["progress"] = round(min(n / len(latest), 1.0) * 0.9, 3)
         warehouse.state.pop("fetching", None)
+        await asyncio.to_thread(staged.index)
         from . import jobs
         await jobs.phase("validating")
 
@@ -1195,7 +1229,7 @@ async def ingest_export(
                 f"The FOCUS run contains {skipped} unusable row(s). No data was changed.")
         empty_covered = (bool(coverage_sub) and bool(manifests_used)
                          and all(m.row_count == 0 for m in manifests_used))
-        if not all_records and not empty_covered:
+        if not staged.rows and not empty_covered:
             raise ExportError(
                 f"Read {len(latest)} file(s) but found no usable rows — {skipped} row(s) were "
                 "skipped for a missing date. The export schema or subscription coverage "
@@ -1212,7 +1246,7 @@ async def ingest_export(
             if requested_window and manifest.byte_count != sum(b.bytes for b in manifest.blobs):
                 raise ExportError("FOCUS manifest byte counts disagree. No data was changed.")
 
-        if replace and any(not str(r[i_sub] or "").strip() for r in all_records):
+        if replace and await asyncio.to_thread(staged.has_rows_without_subscription):
             raise ExportError(
                 "Cannot replace an export containing rows without SubAccountId. Supply an "
                 "authoritative subscription_id for this export, or use a subscription-attributed "
@@ -1220,24 +1254,22 @@ async def ingest_export(
             )
         excluded = 0
         if requested_window:
-            all_records = [r for r in all_records if requested_window[0] <= r[i_date] <= requested_window[1]]
+            await asyncio.to_thread(staged.restrict_to_window, *requested_window)
             empty_covered = bool(coverage_sub and manifests_used)
         if selected_subs is not None:
-            retained = [r for r in all_records if r[i_sub] in selected_subs]
-            excluded = len(all_records) - len(retained)
-            all_records = retained
-            if not all_records and not empty_covered:
+            excluded = await asyncio.to_thread(staged.restrict_to_subscriptions, selected_subs)
+            if not staged.rows and not empty_covered:
                 raise ExportError(
                     "The complete export contains no rows for the selected subscriptions. "
                     "No data was changed."
                 )
-        dates = [r[i_date] for r in all_records if r[i_date]]
-        lo = min(dates) if dates else min(start for periods in windows.values() for start, _ in periods)
-        hi = max(dates) if dates else max(end for periods in windows.values() for _, end in periods)
-        subs = {r[i_sub] for r in all_records if r[i_sub]} | set(windows)
-        day_rows = Counter((r[i_sub], r[i_date]) for r in all_records)
-        receipts = [(key, {**receipt, "day_rows": day_rows[(coverage_sub, key.rsplit(":", 1)[1])]})
-                    for key, receipt in receipts]
+        first, last = await asyncio.to_thread(staged.span)
+        lo = first or min(start for periods in windows.values() for start, _ in periods)
+        hi = last or max(end for periods in windows.values() for _, end in periods)
+        subs = await asyncio.to_thread(staged.subscriptions) | set(windows)
+        day_rows = await asyncio.to_thread(staged.day_rows)
+        receipts = [(key, {**receipt, "day_rows": day_rows.get(
+            (coverage_sub, key.rsplit(":", 1)[1]), 0)}) for key, receipt in receipts]
         if replace and not incremental:
             for sub in subs:
                 if manifests_used:
@@ -1252,19 +1284,23 @@ async def ingest_export(
                             raise ExportError("Invalid manifest period; no data was changed.")
                         windows[sub].append((start, end))
                 else:
-                    sub_days = [r[i_date] for r in all_records if r[i_sub] == sub]
-                    windows[sub] = [(min(sub_days), max(sub_days))]
+                    lo_day, hi_day = await asyncio.to_thread(staged.days_for, sub)
+                    windows[sub] = [(lo_day, hi_day)]
 
         # Writing is its own phase and takes real time — tens of thousands of rows through
         # the database — so it says so rather than leaving the bar at 90% with no explanation.
         warehouse.state["loading"] = 0
-        warehouse.state["writing"] = len(all_records)
+        warehouse.state["writing"] = staged.rows
         warehouse.state["progress"] = 0.92
         publication_id = str(uuid4())
+        total_rows = staged.rows
 
         def _write() -> dict[str, Any]:
             changes: dict[str, Any] = {}
-            with warehouse.connect() as con:
+            # The connection the rows were staged on, because the staging table belongs to
+            # it and this is the transaction that reads from it. Not closed here: the run
+            # owns it and drops the staging table on the way out.
+            with nullcontext(staged.connection()) as con:
                 # One transaction, for the same reason `Warehouse._replace` uses one: the
                 # connection is in autocommit, so without an explicit BEGIN the DELETE commits
                 # on its own and any failure during the insert -- a dropped blob connection, a
@@ -1289,7 +1325,7 @@ async def ingest_export(
                                 new = datetime.fromisoformat(receipt["submitted"].replace("Z", "+00:00"))
                                 if old.replace(tzinfo=old.tzinfo or UTC) > new.replace(tzinfo=new.tzinfo or UTC):
                                     protected.add((coverage_sub, key.rsplit(":", 1)[1]))
-                        changes = _reconcile_focus(con, all_records, windows, protected=protected)
+                        changes = _reconcile_staged(con, staged, windows, protected=protected)
                     elif replace:
                         for sub, periods in sorted(windows.items()):
                             for start, end in periods:
@@ -1300,20 +1336,21 @@ async def ingest_export(
                                     'AND "SubAccountId" = ?',
                                     [start, end, sub],
                                 )
-                    # Named columns via the shared bulk helper. This was a positional
+                    # `INSERT ... SELECT` from the staging table. This was a positional
                     # `INSERT INTO costs VALUES (...)` executed per row: positional couples the
                     # write to today's COLUMNS order, which ALTER TABLE quietly breaks, and
-                    # per-row execution is what made a FOCUS load take minutes.
+                    # per-row execution is what made a FOCUS load take minutes. The rows never
+                    # come back into Python at all now.
                     if not incremental:
-                        insert_rows(con, all_records)
-                    if changes.get("changed_days") or (not incremental and all_records):
+                        staged.publish()
+                    if changes.get("changed_days") or (not incremental and total_rows):
                         jobs.advance_generation(con)
                         changes["generation"] = int(con.execute(
                             "SELECT value FROM meta WHERE key=?", [jobs.GENERATION_KEY]).fetchone()[0])
                     con.execute(
                         "INSERT INTO ingest_log VALUES (?,?,?,?,?,?,?)",
                         [subscription_id or ",".join(sorted(subs))[:200], reader.account,
-                         f"{lo}..{hi}", len(all_records), started, "ok",
+                         f"{lo}..{hi}", total_rows, started, "ok",
                          f"export {reader.container}/{prefix} ({len(latest)} file(s))"],
                     )
                     for key, receipt in receipts:
@@ -1381,6 +1418,13 @@ async def ingest_export(
         raise
     finally:
         await reader.close()
+        # The staging table belongs to this run, whether it succeeded or not. Dropped
+        # rather than left for the next import to find: it is unlogged and rebuilt from
+        # the export, so there is nothing in it worth keeping. The connection is then
+        # released by the stack that entered it.
+        if staged is not None:
+            await asyncio.to_thread(staged.drop)
+        await asyncio.to_thread(resources.close)
 
     # Full runs were validated before scope filtering and before any writes. Rows outside
     # the explicit subscription selection are intentionally excluded, not a manifest shortfall.
@@ -1396,7 +1440,7 @@ async def ingest_export(
         "manifest_bytes": getattr(reader, "manifest_bytes", 0),
         "requested_window": requested_window,
         "manifests": list({r["fingerprint"]: r for _, r in receipts}.values()),
-        "rows": len(all_records),
+        "rows": total_rows,
         "rows_inspected": sum(file_counts.values()),
         "skipped_rows": skipped,
         "excluded_rows": excluded,

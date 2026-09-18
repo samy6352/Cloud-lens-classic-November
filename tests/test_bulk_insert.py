@@ -294,12 +294,16 @@ def writes_rows_with_executemany(path):
 
 wh = open("app/warehouse.py", encoding="utf-8").read()
 warehouse_callers = calls_insert_rows("app/warehouse.py")
-export_callers = calls_insert_rows("app/exports.py")
+# The FOCUS/export path reaches the bulk helper through `staging`, which is what copies
+# each parsed batch in. `exports.py` itself no longer touches rows: it stages them and
+# then publishes with INSERT ... SELECT, so the rows never come back into Python at all.
+export_callers = calls_insert_rows("app/staging.py")
 check("the quick and report paths use it", bool(warehouse_callers))
 check("the FOCUS/export path uses it", bool(export_callers))
 check("neither writes rows with executemany any more",
       not writes_rows_with_executemany("app/warehouse.py")
-      and not writes_rows_with_executemany("app/exports.py"))
+      and not writes_rows_with_executemany("app/exports.py")
+      and not writes_rows_with_executemany("app/staging.py"))
 check("a failed COPY is logged rather than swallowed silently",
       "copy bulk load failed" in wh)
 

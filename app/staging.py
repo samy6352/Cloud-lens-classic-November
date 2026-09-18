@@ -70,15 +70,47 @@ class Staged:
     connection is to hand, and is dropped explicitly when the run ends.
     """
 
-    def __init__(self, con: Any, suffix: str) -> None:
-        self.con = con
+    def __init__(self, connect: Any, suffix: str) -> None:
+        # A factory rather than a connection, because an import must be able to fail
+        # validation without touching the database at all -- not merely without
+        # writing to `costs`, but without so much as opening a session. The connection
+        # is acquired on the first batch that is actually staged.
+        self._connect = connect
+        self._con: Any = None
         # The suffix comes from a uuid4, but it reaches DDL, so it is filtered to
         # characters that cannot end a quoted identifier rather than trusted.
         self.table = f"{TABLE}_{''.join(c for c in suffix if c.isalnum())[:32]}"
         self._rows = 0
+        self._created = False
+
+    @property
+    def con(self) -> Any:
+        """The connection this run stages on, opened on first use."""
+        if self._con is None:
+            self._con = self._connect()
+        return self._con
+
+    def connection(self) -> Any:
+        """The same connection, for the caller's write transaction.
+
+        Named rather than reached through `con` at the call site so that it is clear
+        the importer is deliberately joining the staging session, not opening a
+        second one that could not see the staged rows.
+        """
+        return self.con
 
     # ---------------------------------------------------------------- lifecycle
     def create(self) -> None:
+        """Make the staging table, once, on first use.
+
+        Lazy on purpose. An import validates the export -- its schema, its manifest,
+        its declared row counts -- before it is entitled to write anything, and
+        creating a table is a write. A run that is refused during validation must
+        leave the database exactly as it found it, including having created nothing,
+        so this is called from `add` rather than up front.
+        """
+        if self._created:
+            return
         from .warehouse import COLUMNS, NUMERIC
 
         cols = ",\n  ".join(
@@ -86,10 +118,20 @@ class Staged:
                          else "double precision" if c in NUMERIC else "text")
             for c in COLUMNS)
         self.con.execute(f'DROP TABLE IF EXISTS "{self.table}"')
-        self.con.execute(f'CREATE UNLOGGED TABLE "{self.table}" (\n  {cols}\n)')
+        # Unlogged where the engine has it. The table is rebuilt from the export on any
+        # failure, so there is nothing in it worth replaying from the write-ahead log --
+        # and skipping the WAL is most of the cost of writing it. SQLite, which the
+        # offline tests run on, has no such concept and takes the plain form.
+        try:
+            self.con.execute(f'CREATE UNLOGGED TABLE "{self.table}" (\n  {cols}\n)')
+        except Exception:  # noqa: BLE001 - a durable staging table is still a staging table
+            self.con.execute(f'CREATE TABLE "{self.table}" (\n  {cols}\n)')
+        self._created = True
 
     def drop(self) -> None:
         """Remove the staging table. Never raises: the import has already finished."""
+        if not self._created:
+            return
         try:
             self.con.execute(f'DROP TABLE IF EXISTS "{self.table}"')
         except Exception:  # noqa: BLE001 - space, not correctness
@@ -101,11 +143,17 @@ class Staged:
 
         Built after loading rather than before: an index maintained row by row
         through a COPY costs more than one built once over a populated table.
+
+        Named explicitly rather than left to the server. An anonymous `CREATE INDEX
+        ON t (...)` is a PostgreSQL extension; naming it is both portable and the
+        only way the index can be referred to afterwards.
         """
+        if not self._created:
+            return
         self.con.execute(
-            f'CREATE INDEX ON "{self.table}" '
+            f'CREATE INDEX "{self.table}_sub_period_idx" ON "{self.table}" '
             '(lower("SubAccountId"), "ChargePeriodStart")')
-        self.con.execute("ANALYZE \"" + self.table + '"')
+        self.con.execute(f'ANALYZE "{self.table}"')
 
     # ------------------------------------------------------------------- filling
     def add(self, records: list[list[Any]]) -> int:
@@ -113,7 +161,8 @@ class Staged:
         from .warehouse import insert_rows
 
         if not records:
-            return 0
+            return self._rows
+        self.create()
         self._rows += insert_rows(self.con, records, table=f'"{self.table}"')
         return self._rows
 
@@ -123,11 +172,15 @@ class Staged:
         return self._rows
 
     def count(self) -> int:
+        if not self._created:
+            return 0
         return int(self.con.execute(
             f'SELECT count(*) FROM "{self.table}"').fetchone()[0] or 0)
 
     def span(self) -> tuple[str | None, str | None]:
         """The first and last charge date present, as ISO strings."""
+        if not self._created:
+            return None, None
         row = self.con.execute(
             f'SELECT min("ChargePeriodStart"), max("ChargePeriodStart") '
             f'FROM "{self.table}"').fetchone()
@@ -135,14 +188,20 @@ class Staged:
                 str(row[1]) if row and row[1] else None)
 
     def subscriptions(self) -> set[str]:
+        if not self._created:
+            return set()
         return {r[0] for r in self.con.execute(
             f'SELECT DISTINCT "SubAccountId" FROM "{self.table}" '
             'WHERE "SubAccountId" IS NOT NULL').fetchall() if r[0]}
 
     def has_rows_without_subscription(self) -> bool:
+        if not self._created:
+            return False
+        # `trim` rather than PostgreSQL's `btrim`: both engines the warehouse runs on
+        # understand the standard spelling.
         return bool(self.con.execute(
             f'SELECT EXISTS (SELECT 1 FROM "{self.table}" '
-            "WHERE \"SubAccountId\" IS NULL OR btrim(\"SubAccountId\") = '')").fetchone()[0])
+            "WHERE \"SubAccountId\" IS NULL OR trim(\"SubAccountId\") = '')").fetchone()[0])
 
     def day_rows(self) -> dict[tuple[str, str], int]:
         """How many rows landed on each (subscription, day).
@@ -151,11 +210,15 @@ class Staged:
         the one result the importer still holds in memory, and it is what the
         per-day receipts are written from.
         """
+        if not self._created:
+            return {}
         return {(r[0], str(r[1])): int(r[2]) for r in self.con.execute(
             f'SELECT "SubAccountId", "ChargePeriodStart", count(*) '
             f'FROM "{self.table}" GROUP BY 1, 2').fetchall()}
 
     def days_for(self, sub: str) -> tuple[str | None, str | None]:
+        if not self._created:
+            return None, None
         row = self.con.execute(
             f'SELECT min("ChargePeriodStart"), max("ChargePeriodStart") '
             f'FROM "{self.table}" WHERE "SubAccountId" = ?', [sub]).fetchone()
@@ -165,6 +228,8 @@ class Staged:
     # ------------------------------------------------------------------ narrowing
     def restrict_to_window(self, lo: str, hi: str) -> int:
         """Drop rows outside the requested window. Returns how many were removed."""
+        if not self._created:
+            return 0
         before = self.count()
         self.con.execute(
             f'DELETE FROM "{self.table}" WHERE "ChargePeriodStart" < ? '
@@ -175,6 +240,8 @@ class Staged:
 
     def restrict_to_subscriptions(self, subs: set[str]) -> int:
         """Drop rows outside the selected subscriptions. Returns how many were removed."""
+        if not self._created:
+            return 0
         if not subs:
             removed = self.count()
             self.con.execute(f'DELETE FROM "{self.table}"')
@@ -191,6 +258,8 @@ class Staged:
 
     def drop_protected(self, protected: set[tuple[str, str]]) -> None:
         """Forget rows for days a newer correction already owns."""
+        if not self._created:
+            return
         for sub, day in sorted(protected):
             self.con.execute(
                 f'DELETE FROM "{self.table}" WHERE "SubAccountId" = ? '
@@ -204,7 +273,14 @@ class Staged:
 
         Both directions, because a day changes when a row arrives, when one is
         removed, and when the same row arrives a different number of times.
-        `EXCEPT ALL` rather than `EXCEPT` is what preserves that last case.
+
+        Expressed as a signed count rather than `EXCEPT ALL` in both directions. Each
+        side is grouped by the whole row, the staged side counted positive and the
+        stored side negative, and any row whose totals do not cancel is a difference.
+        That keeps multiplicity -- two identical charges are a group of two, so a
+        correction dropping one of them does not cancel -- which a plain `EXCEPT`
+        would lose, and unlike `EXCEPT ALL` it is understood by every engine the
+        warehouse runs on, including the SQLite the offline tests use.
 
         Scoped to the declared windows: a day the export does not cover is not
         being restated, and comparing it would delete history this run never saw.
@@ -218,14 +294,25 @@ class Staged:
                 params += [sub, start, end]
         if not spans:
             return []
+        # The table is made here if nothing was staged, because an export that
+        # legitimately contains no rows for a day still has to be compared: every
+        # stored row on that day is then a difference, and the day is a removal. By
+        # this point validation has passed and the write transaction is open, so
+        # creating it is no longer a write the import was not entitled to make.
+        self.create()
         scope = " OR ".join(spans)
-        stored = f'SELECT {cols} FROM costs WHERE {scope}'
-        staged = f'SELECT {cols} FROM "{self.table}" WHERE {scope}'
+        grouped = ", ".join(str(i + 1) for i in range(len(_columns())))
         rows = self.con.execute(
-            "SELECT DISTINCT \"SubAccountId\", \"ChargePeriodStart\" FROM ("
-            f"({staged} EXCEPT ALL {stored}) UNION ALL ({stored} EXCEPT ALL {staged})"
-            ") d",
-            params + params + params + params).fetchall()
+            f'SELECT DISTINCT "SubAccountId", "ChargePeriodStart" FROM ('
+            f"  SELECT {cols} FROM ("
+            f"    SELECT {cols}, count(*) AS n FROM \"{self.table}\" WHERE {scope} "
+            f"    GROUP BY {grouped}"
+            f"    UNION ALL "
+            f"    SELECT {cols}, -count(*) AS n FROM costs WHERE {scope} "
+            f"    GROUP BY {grouped}"
+            f"  ) sides GROUP BY {grouped} HAVING sum(n) <> 0"
+            f") d",
+            params + params).fetchall()
         return sorted({(r[0], str(r[1])) for r in rows} - protected)
 
     def stored_rows_on(self, days: list[tuple[str, str]]) -> int:
@@ -246,6 +333,8 @@ class Staged:
         """
         from .warehouse import ensure_partitions_between
 
+        if not self._created:
+            return 0
         cols = _quoted()
         if days is None:
             lo, hi = self.span()
