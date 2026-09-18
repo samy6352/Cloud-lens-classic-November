@@ -44,6 +44,8 @@ import logging
 from collections.abc import Iterable
 from typing import Any
 
+from . import derived
+
 log = logging.getLogger("cloudlens.rollup")
 
 TABLE = "costs_rollup"
@@ -67,6 +69,16 @@ DIMENSIONS = [
     # for its money. Measured on the real estate before adding it: three distinct values
     # across 5.8M rows, so it costs the grain essentially nothing.
     "PublisherName",
+    # The two dimensions the filter bar could not answer from here, so it scanned
+    # 5,821,770 detail rows to find seven values between them -- 7.6-8.5s, against
+    # 0.10-0.12s for the three it could. Measured before adding them: the grain goes
+    # from 68,698 rows to 74,267, an 8.1% increase, because both correlate almost
+    # entirely with the service already in the grain.
+    #
+    # They also make the rollup able to *narrow* itself by `charge` and `pricing`,
+    # which previously sent any filtered query to the detail table.
+    "ChargeCategory",
+    "PricingModel",
 ]
 
 # The date column the rollup is windowed and retained by. Named off DIMENSIONS
@@ -123,25 +135,16 @@ def covers(group_by: list[str], measures: list[str]) -> bool:
             and all(m in MEASURES for m in measures))
 
 
-# The filter-bar dimensions the rollup can narrow itself. The rest of the bar --
-# `charge` and `pricing`, and `env`, which is read out of the `Tags` document --
-# names columns this grain does not carry, so a connection using any of them has
-# to answer from the detail table instead.
-FILTERABLE = frozenset({"rg", "service", "region"})
+# The filter-bar dimensions the rollup can narrow itself by, worked out from the grain
+# rather than listed again -- so adding a column above cannot leave this behind. `env`
+# names the `Tags` document, which no grain carries, so a connection filtering on it
+# still has to answer from the detail table.
+FILTERABLE = derived.filterable(DIMENSIONS)
 
 
 def serves_filters(filters: dict[str, list[str]] | None) -> bool:
-    """Whether every dimension the caller narrowed is one the rollup holds.
-
-    Only dimensions with something actually selected count. An empty list adds no
-    predicate, so a filter bar that merely *offers* `charge` does not disqualify
-    the rollup until somebody picks a value from it.
-    """
-    return all(
-        key in FILTERABLE
-        for key, values in (filters or {}).items()
-        if any(v and v.strip() for v in (values or []))
-    )
+    """Whether every dimension the caller narrowed is one the rollup holds."""
+    return derived.serves_filters(filters, FILTERABLE)
 
 
 def derive_sql(source: str) -> str:

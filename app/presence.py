@@ -73,6 +73,8 @@ import datetime as dt
 import logging
 from typing import Any
 
+from . import derived
+
 log = logging.getLogger("cloudlens.presence")
 
 TABLE = "resource_presence"
@@ -119,6 +121,18 @@ COUNTABLE = frozenset({"ResourceId", "ServiceName", "SubAccountId", "RegionName"
 # something the dashboard shows, and `ResourceName` beside it is what the per-resource
 # view actually groups on.
 GROUPABLE = frozenset(DIMENSIONS) - {"ResourceId"}
+
+# The filter-bar dimensions this table can narrow itself by, worked out from its own
+# grain. It used to borrow the rollup's answer, which was true only while the two
+# grains happened to agree about which filter columns they held -- the moment the
+# rollup gained `ChargeCategory` and `PricingModel`, borrowing would have had this
+# table accept a `charge` filter it has no column to apply.
+FILTERABLE = derived.filterable(DIMENSIONS)
+
+
+def serves_filters(filters: dict[str, list[str]] | None) -> bool:
+    """Whether every dimension the caller narrowed is one this grain holds."""
+    return derived.serves_filters(filters, FILTERABLE)
 
 
 def _validate() -> None:

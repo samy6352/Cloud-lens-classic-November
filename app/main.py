@@ -4800,17 +4800,14 @@ async def filter_values(request: Request, days: int = 30, scope: str = "",
 
     def collect() -> dict[str, Any]:
         out: dict[str, Any] = {}
-        # Split by what can answer them. The first three are columns of the rollup's grain,
-        # so the pre-aggregated table answers them exactly and in a fraction of the time --
-        # measured on the real estate, the same 301 values in 0.19s against 22.9s from the
-        # detail table. The other two name columns no derived grain carries, so they still
-        # cost a scan, and they are asked for separately so that cost falls only on them.
+        # Every column here is now part of the rollup's grain, so `Reader.agg` answers
+        # all five exactly. Before `ChargeCategory` and `PricingModel` were added to it,
+        # those two alone scanned 5,821,770 detail rows to find seven values between
+        # them -- 7.6-8.5s against 0.10-0.12s for the three the rollup already held.
         rollup_dims = (
             ("rg", '"ResourceGroup"'),
             ("service", '"ServiceName"'),
             ("region", '"RegionName"'),
-        )
-        detail_dims = (
             ("charge", '"ChargeCategory"'),
             ("pricing", '"PricingModel"'),
         )
@@ -4860,22 +4857,19 @@ async def filter_values(request: Request, days: int = 30, scope: str = "",
                 return {"dimensions": {}, "empty": True}
             from .reporting import start_sql
             since = start_sql(hi, window)
-            for key, _ in rollup_dims + detail_dims:
+            for key, _ in rollup_dims:
                 out[key] = []
             out["env"] = []
 
-            # `Reader.agg` is the rollup only when it can answer this connection exactly --
-            # a converted currency or a filter outside the grain puts it back on the detail
-            # table, and then there is nothing to be gained by asking twice.
-            groups = ((rollup_dims, r.agg), (detail_dims, "costs")) if r.agg != "costs" else (
-                (rollup_dims + detail_dims, "costs"),)
-            for dims, source in groups:
-                try:
-                    absorb(r.rows(by_column(dims, source, since), 10000))
-                except Exception as exc:  # noqa: BLE001 - one group, not the whole bar
-                    unavailable.extend(key for key, _ in dims)
-                    log.info("filter values: %s not available in time (%s)",
-                             ", ".join(key for key, _ in dims), str(exc)[:120])
+            # `Reader.agg` is the rollup when it can answer this connection exactly, and
+            # `costs` when it cannot -- a converted currency, or a filter on `env`. Either
+            # way the same query reads the same five columns; only the speed differs.
+            try:
+                absorb(r.rows(by_column(rollup_dims, r.agg, since), 10000))
+            except Exception as exc:  # noqa: BLE001 - the bar, not the page
+                unavailable.extend(key for key, _ in rollup_dims)
+                log.info("filter values: %s not available in time (%s)",
+                         ", ".join(key for key, _ in rollup_dims), str(exc)[:120])
 
         # `env` is not a column. It is read out of the `Tags` document per row, which on the
         # real estate costs about 161s of the 171s the combined query used to need -- so the

@@ -473,13 +473,14 @@ def test_filter_costs_are_currency_buckets_not_a_mixed_sum(monkeypatch):
                 # The environment tag is asked for on its own connection, under a tighter
                 # bound, so that when it cannot be produced the other five still can.
                 return [{"d": "env", "v": "prod", "currency": "USD", "c": 3}]
-            if "GROUP BY lower(rg), currency" in sql:
-                sources.append("rollup" if "costs_rollup" in sql else "detail")
-                return [{"d": "rg", "v": "shared", "currency": "USD", "c": 1},
-                        {"d": "rg", "v": "shared", "currency": "EUR", "c": 2}]
+            assert "GROUP BY lower(rg), currency" in sql
+            # All five in one query now: `ChargeCategory` and `PricingModel` joined the
+            # rollup's grain, so nothing here has to fall back to the detail table.
             assert "GROUP BY lower(charge), currency" in sql
-            sources.append("charge/pricing from costs" if " FROM costs " in sql else "?")
-            return [{"d": "charge", "v": "Usage", "currency": "USD", "c": 4}]
+            sources.append("rollup" if "costs_rollup" in sql else "detail")
+            return [{"d": "rg", "v": "shared", "currency": "USD", "c": 1},
+                    {"d": "rg", "v": "shared", "currency": "EUR", "c": 2},
+                    {"d": "charge", "v": "Usage", "currency": "USD", "c": 4}]
         yield SimpleNamespace(rows=rows, agg="costs_rollup")
     monkeypatch.setattr(warehouse.warehouse, "reader", reader)
     response = asyncio.run(main.filter_values(SimpleNamespace(), scope="a"))
@@ -492,9 +493,9 @@ def test_filter_costs_are_currency_buckets_not_a_mixed_sum(monkeypatch):
     assert payload["dimensions"]["charge"][0]["value"] == "Usage"
     assert "unavailable_dimensions" not in payload
     assert calls == [None, None]
-    # The grain dimensions come from the rollup, which answers them exactly and in a
-    # fraction of the time; only the two columns no grain carries pay for a scan.
-    assert sources == ["rollup", "charge/pricing from costs"]
+    # One query, from the rollup. Before charge and pricing were in the grain this took
+    # two -- and the second scanned 5.8M detail rows to find seven values.
+    assert sources == ["rollup"]
     # Both must bound their own database time, and the environment tag -- the one dimension
     # that is read out of the Tags document per row -- must be bounded at least as tightly.
     assert budgets == [main.FILTER_BUDGET_MS, main.FILTER_ENV_BUDGET_MS]
@@ -516,8 +517,6 @@ def test_a_slow_environment_tag_does_not_take_the_other_filters_with_it(monkeypa
                 return [{"d": "2026-09-14"}]
             if "'env'" in sql:
                 raise RuntimeError("canceling statement due to statement timeout")
-            if "GROUP BY lower(charge), currency" in sql:
-                raise RuntimeError("canceling statement due to statement timeout")
             return [{"d": "region", "v": "uksouth", "currency": "USD", "c": 7}]
         yield SimpleNamespace(rows=rows, agg="costs_rollup")
 
@@ -527,8 +526,9 @@ def test_a_slow_environment_tag_does_not_take_the_other_filters_with_it(monkeypa
     payload = json.loads(response.body)
     assert payload["dimensions"]["region"][0]["value"] == "uksouth"
     assert payload["dimensions"]["env"] == []
-    # The two that could not be produced are named; the three the rollup answers survive.
-    assert payload["unavailable_dimensions"] == ["charge", "pricing", "env"]
+    # Said out loud, because an empty list is otherwise indistinguishable from an estate
+    # that tags nothing at all.
+    assert payload["unavailable_dimensions"] == ["env"]
     assert "unavailable" not in payload
 
 

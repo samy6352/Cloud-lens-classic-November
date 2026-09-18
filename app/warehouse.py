@@ -33,7 +33,7 @@ from typing import Any, ClassVar
 
 import httpx
 
-from . import presence, rollup, schema_v2, store
+from . import derived, presence, rollup, schema_v2, store
 from .sqldialect import SHIM_SCHEMA, strip_literals
 
 log = logging.getLogger("cloudlens.warehouse")
@@ -682,14 +682,14 @@ class Warehouse:
     # a view definition, so it must never be anything but one of these. The *values* are bound
     # through a temp table and may be free text; the column name cannot be.
     #
+    # Quoted from the same map the derived tables work their `FILTERABLE` sets out from, so
+    # "which column does this filter name" has one answer. A second copy here would let a
+    # derived table claim to serve a filter this applies to a different column.
+    #
     # `env` is deliberately absent — Azure has no environment field, it is a convention people
     # implement with tags, so it is handled separately against `Tags`.
     FILTER_COLUMNS: ClassVar[dict[str, str]] = {
-        "rg": '"ResourceGroup"',
-        "service": '"ServiceName"',
-        "region": '"RegionName"',
-        "charge": '"ChargeCategory"',
-        "pricing": '"PricingModel"',
+        key: f'"{column}"' for key, column in derived.FILTER_COLUMNS.items()
     }
 
     def _filter_sql(self, con: Any, filters: dict[str, list[str]] | None) -> str:
@@ -883,7 +883,7 @@ class Warehouse:
         these columns -- and if something does, it reads NULL rather than a number
         that is silently in the wrong currency.
         """
-        if rollup.serves_filters(filters) and self._rollup_fresh(con):
+        if presence.serves_filters(filters) and self._rollup_fresh(con):
             money_ok = presence.serves_money(rate)
             columns = ", ".join(
                 [f"'{target}' AS \"BillingCurrency\""
@@ -935,17 +935,19 @@ class Warehouse:
 
         The fast path reuses `where` verbatim, which is sound because every column
         it can mention -- `SubAccountId` from the scope, `ResourceGroup`,
-        `ServiceName` and `RegionName` from the filter bar, `ChargePeriodStart`
-        from the reporting period -- is part of the rollup's grain.
+        `ServiceName`, `RegionName`, `ChargeCategory` and `PricingModel` from the
+        filter bar, `ChargePeriodStart` from the reporting period -- is part of the
+        rollup's grain. `serves_filters` is what guarantees that, and it is derived
+        from the grain rather than written out, so the two cannot drift.
         """
         if rate is None and rollup.serves_filters(filters) and self._rollup_fresh(con):
             con.execute(f'CREATE TEMP VIEW {rollup.TABLE} AS SELECT * '
                         f'FROM "{self._rollup_schema}".{rollup.TABLE} {where}')
             return
         # A converted currency needs PricingCurrency, ExchangeRatePricingToBilling and
-        # BillingCostBasis; `charge`, `pricing` and `env` name ChargeCategory,
-        # PricingModel and the Tags document. None of those survive into the grain, so
-        # the rollup cannot answer these exactly and the detail table has to.
+        # BillingCostBasis, and `env` names the Tags document. None of those survive
+        # into the grain, so the rollup cannot answer these exactly and the detail
+        # table has to.
         con.execute(f"CREATE TEMP VIEW {rollup.TABLE} AS {rollup.derive_sql('costs')}")
 
     @contextmanager

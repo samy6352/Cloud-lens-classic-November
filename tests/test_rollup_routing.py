@@ -108,8 +108,31 @@ def test_an_offered_but_unused_filter_does_not_disqualify_the_rollup(loaded):
     """An empty selection adds no predicate, so it must not force the slow path."""
     from app.rollup import serves_filters
 
-    assert serves_filters({"charge": [], "service": ["Storage"]})
-    assert not serves_filters({"charge": ["Usage"]})
+    assert serves_filters({"env": [], "service": ["Storage"]})
+    # `env` is read out of the Tags document rather than stored, so no grain can ever
+    # carry it. `charge` and `pricing` used to stand here too and no longer can: they
+    # are columns of the rollup now, which is the point of putting them in the grain.
+    assert not serves_filters({"env": ["prod"]})
+
+
+def test_the_grain_decides_which_filters_each_derived_table_serves(loaded):
+    """Each table answers for its own grain, rather than borrowing another's answer.
+
+    `presence` used to call `rollup.serves_filters`, which was true only while the two
+    grains agreed about which filter columns they held. The moment the rollup gained
+    `ChargeCategory` and `PricingModel`, borrowing would have had `presence` accept a
+    `charge` filter it has no column to apply -- a silently wrong resource count.
+    """
+    from app import presence, rollup
+
+    assert "charge" in rollup.FILTERABLE and "pricing" in rollup.FILTERABLE
+    assert "charge" not in presence.FILTERABLE and "pricing" not in presence.FILTERABLE
+    assert rollup.serves_filters({"charge": ["Usage"]})
+    assert not presence.serves_filters({"charge": ["Usage"]})
+    # Both still serve what both actually hold.
+    for module in (rollup, presence):
+        assert module.serves_filters({"rg": ["shared"], "region": ["uksouth"]})
+        assert not module.serves_filters({"env": ["prod"]})
 
 
 # ----------------------------------------------------------------------- scope

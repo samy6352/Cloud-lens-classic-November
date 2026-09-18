@@ -111,6 +111,42 @@ log = logging.getLogger("cloudlens.derived")
 # names and nothing is ever renamed.
 SIDES = ("_a", "_b")
 
+# Which column each filter-bar dimension names. One map, because two copies of it
+# drift: the set of filters a derived table can serve is a property of its grain, and
+# working that out per module from the same map means adding a column to one grain
+# cannot silently widen what another claims to serve.
+#
+# `env` is deliberately absent. It is not a column -- it is read out of the `Tags`
+# document -- so no grain can carry it and every filter on it needs the detail table.
+FILTER_COLUMNS = {
+    "rg": "ResourceGroup",
+    "service": "ServiceName",
+    "region": "RegionName",
+    "charge": "ChargeCategory",
+    "pricing": "PricingModel",
+}
+
+
+def filterable(dimensions: Sequence[str]) -> frozenset[str]:
+    """The filter-bar dimensions a grain of `dimensions` can narrow itself by."""
+    held = set(dimensions)
+    return frozenset(key for key, column in FILTER_COLUMNS.items() if column in held)
+
+
+def serves_filters(filters: dict[str, list[str]] | None,
+                   allowed: frozenset[str]) -> bool:
+    """Whether every dimension the caller narrowed is one this grain holds.
+
+    Only dimensions with something actually selected count. An empty list adds no
+    predicate, so a filter bar that merely *offers* a dimension does not disqualify
+    the derived table until somebody picks a value from it.
+    """
+    return all(
+        key in allowed
+        for key, values in (filters or {}).items()
+        if any(v and v.strip() for v in (values or []))
+    )
+
 
 class Derived(Protocol):
     """What this module needs of `rollup` and `presence`.
