@@ -2895,18 +2895,37 @@ def ensure_partitions_for(con: Any, records: Sequence[Sequence[Any]],
     default partition means a partition that could not be created costs a slower
     query rather than a rejected charge, so this must never fail a load.
     """
-    schema = _partitioned_target(con, table)
-    if schema is None:
-        return []
     days = _charge_dates(records)
     if not days:
         return []
+    return ensure_partitions_between(con, days[0], days[-1], table)
+
+
+def ensure_partitions_between(con: Any, first: Any, last: Any,
+                              table: str = "costs") -> list[str]:
+    """The same, for a caller that knows the span but is not holding the rows.
+
+    The streaming importer writes through `INSERT ... SELECT` from a staging table,
+    so it never has the batch in Python to hand to `ensure_partitions_for` -- but it
+    does know the range, which is all this needs.
+    """
+    schema = _partitioned_target(con, table)
+    if schema is None:
+        return []
     try:
-        return schema_v2.ensure_partitions(con, schema, days[0], days[-1])
+        return schema_v2.ensure_partitions(con, schema, _as_date(first), _as_date(last))
     except Exception as exc:  # noqa: BLE001
         log.warning("warehouse: could not create partitions for %s..%s (%s); "
-                    "rows will land in the default partition", days[0], days[-1], exc)
+                    "rows will land in the default partition", first, last, exc)
         return []
+
+
+def _as_date(value: Any) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value)[:10])
 
 
 def insert_rows(con: Any, records: Sequence[Sequence[Any]],
