@@ -461,6 +461,7 @@ def test_filter_costs_are_currency_buckets_not_a_mixed_sum(monkeypatch):
     monkeypatch.setattr(main, "permitted", AsyncMock(return_value=["a"]))
     calls = []
     budgets = []
+    sources = []
     @contextmanager
     def reader(scope, currency=None, budget_ms=None):
         calls.append(currency)
@@ -468,21 +469,67 @@ def test_filter_costs_are_currency_buckets_not_a_mixed_sum(monkeypatch):
         def rows(sql, *args):
             if "max(" in sql:
                 return [{"d": "2026-09-14"}]
-            assert "GROUP BY lower(rg), currency" in sql
-            return [{"d": "rg", "v": "shared", "currency": "USD", "c": 1},
-                    {"d": "rg", "v": "shared", "currency": "EUR", "c": 2}]
-        yield SimpleNamespace(rows=rows)
+            if "'env'" in sql:
+                # The environment tag is asked for on its own connection, under a tighter
+                # bound, so that when it cannot be produced the other five still can.
+                return [{"d": "env", "v": "prod", "currency": "USD", "c": 3}]
+            if "GROUP BY lower(rg), currency" in sql:
+                sources.append("rollup" if "costs_rollup" in sql else "detail")
+                return [{"d": "rg", "v": "shared", "currency": "USD", "c": 1},
+                        {"d": "rg", "v": "shared", "currency": "EUR", "c": 2}]
+            assert "GROUP BY lower(charge), currency" in sql
+            sources.append("charge/pricing from costs" if " FROM costs " in sql else "?")
+            return [{"d": "charge", "v": "Usage", "currency": "USD", "c": 4}]
+        yield SimpleNamespace(rows=rows, agg="costs_rollup")
     monkeypatch.setattr(warehouse.warehouse, "reader", reader)
     response = asyncio.run(main.filter_values(SimpleNamespace(), scope="a"))
     import json
-    item = json.loads(response.body)["dimensions"]["rg"][0]
+    payload = json.loads(response.body)
+    item = payload["dimensions"]["rg"][0]
     assert item["cost"] is None and item["currency"] is None
     assert item["currency_buckets"] == {"USD": 1, "EUR": 2}
-    assert calls == [None]
-    # The filter bar must bound its own database time. Unbounded, this query holds one of a
-    # small pool of connections for the server's full statement timeout on a large estate,
-    # and it is a secondary control that already degrades to "unavailable".
-    assert budgets == [main.FILTER_BUDGET_MS] and main.FILTER_BUDGET_MS > 0
+    assert payload["dimensions"]["env"][0]["value"] == "prod"
+    assert payload["dimensions"]["charge"][0]["value"] == "Usage"
+    assert "unavailable_dimensions" not in payload
+    assert calls == [None, None]
+    # The grain dimensions come from the rollup, which answers them exactly and in a
+    # fraction of the time; only the two columns no grain carries pay for a scan.
+    assert sources == ["rollup", "charge/pricing from costs"]
+    # Both must bound their own database time, and the environment tag -- the one dimension
+    # that is read out of the Tags document per row -- must be bounded at least as tightly.
+    assert budgets == [main.FILTER_BUDGET_MS, main.FILTER_ENV_BUDGET_MS]
+    assert 0 < main.FILTER_ENV_BUDGET_MS <= main.FILTER_BUDGET_MS
+
+
+def test_a_slow_environment_tag_does_not_take_the_other_filters_with_it(monkeypatch):
+    """The environment tag costs 161s of the 171s the combined query needed on the real
+    estate, so asking for all six together made the five cheap ones unavailable too --
+    the filter bar came back empty rather than merely short of one dimension."""
+    from app import main, warehouse
+    monkeypatch.setattr(main, "current_user", lambda request: SimpleNamespace(admin=True))
+    monkeypatch.setattr(main, "permitted", AsyncMock(return_value=["a"]))
+
+    @contextmanager
+    def reader(scope, currency=None, budget_ms=None):
+        def rows(sql, *args):
+            if "max(" in sql:
+                return [{"d": "2026-09-14"}]
+            if "'env'" in sql:
+                raise RuntimeError("canceling statement due to statement timeout")
+            if "GROUP BY lower(charge), currency" in sql:
+                raise RuntimeError("canceling statement due to statement timeout")
+            return [{"d": "region", "v": "uksouth", "currency": "USD", "c": 7}]
+        yield SimpleNamespace(rows=rows, agg="costs_rollup")
+
+    monkeypatch.setattr(warehouse.warehouse, "reader", reader)
+    response = asyncio.run(main.filter_values(SimpleNamespace(), scope="a"))
+    import json
+    payload = json.loads(response.body)
+    assert payload["dimensions"]["region"][0]["value"] == "uksouth"
+    assert payload["dimensions"]["env"] == []
+    # The two that could not be produced are named; the three the rollup answers survive.
+    assert payload["unavailable_dimensions"] == ["charge", "pricing", "env"]
+    assert "unavailable" not in payload
 
 
 def test_csv_disconnect_waits_for_fetch_before_closing_context(monkeypatch):
