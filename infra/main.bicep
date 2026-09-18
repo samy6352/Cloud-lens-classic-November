@@ -89,6 +89,15 @@ param postgresIops int = 3000
 @description('Provisioned throughput MB/sec, PremiumV2_LRS only.')
 param postgresThroughput int = 125
 
+@description('Create a new `costs` table partitioned by month. Must be correct before the application first starts; it cannot convert an existing table.')
+param partitionCosts bool = false
+
+@description('Session work_mem for application connections. Empty keeps the server default.')
+param pgWorkMem string = ''
+
+@description('Session statement_timeout for application connections. Empty means no cap.')
+param pgStatementTimeout string = ''
+
 @description('PostgreSQL storage in GB.')
 param postgresStorageGb int = 32
 
@@ -151,6 +160,9 @@ module stack 'modules/stack.bicep' = {
     postgresStorageType: postgresStorageType
     postgresIops: postgresIops
     postgresThroughput: postgresThroughput
+    partitionCosts: partitionCosts
+    pgWorkMem: pgWorkMem
+    pgStatementTimeout: pgStatementTimeout
     postgresStorageGb: postgresStorageGb
     aiLocation: aiLocation
     modelName: modelName

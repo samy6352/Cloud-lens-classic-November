@@ -98,6 +98,17 @@ param(
     [ValidateRange(25, 1200)]
     [int]$PostgresThroughput = 125,
 
+    # Partition a NEW costs table by month. Read once at application import and
+    # unable to convert a table that already exists, so it has to be right before
+    # the app first starts. Passed through the template rather than set afterwards
+    # with `az webapp config appsettings set`: appSettings is declared in the
+    # Bicep, so a later deployment discards anything the CLI added.
+    [switch]$PartitionCosts,
+
+    [string]$PgWorkMem = '',
+
+    [string]$PgStatementTimeout = '',
+
     [string]$AppServicePlanSku = 'B1',
 
     # Subscriptions the application should be able to read cost data from.
@@ -347,6 +358,9 @@ $templateParameters = @(
     "postgresStorageType=$PostgresStorageType"
     "postgresIops=$PostgresIops"
     "postgresThroughput=$PostgresThroughput"
+    "partitionCosts=$($PartitionCosts.IsPresent.ToString().ToLower())"
+    "pgWorkMem=$PgWorkMem"
+    "pgStatementTimeout=$PgStatementTimeout"
     "appServicePlanSku=$AppServicePlanSku"
     "entraAppUniqueName=$EntraAppUniqueName"
     "deployEntraApp=$((-not $SkipEntra -and -not $EntraClientId).ToString().ToLower())"

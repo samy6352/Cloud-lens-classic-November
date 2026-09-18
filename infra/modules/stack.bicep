@@ -88,6 +88,15 @@ param postgresIops int = 3000
 @description('Provisioned storage throughput in MB/sec. PremiumV2_LRS only.')
 param postgresThroughput int = 125
 
+@description('Create a new `costs` table partitioned by month. Read once at import; it cannot convert a table that already exists, so it must be correct before the application first starts.')
+param partitionCosts bool = false
+
+@description('Session work_mem for application connections. Empty keeps the server default. Applies per sort node and per pooled connection, so size it against the server, not the query.')
+param pgWorkMem string = ''
+
+@description('Session statement_timeout for application connections. Empty means no cap, which lets one slow query hold a pool slot indefinitely.')
+param pgStatementTimeout string = ''
+
 
 @description('PostgreSQL storage in GB.')
 param postgresStorageGb int
@@ -687,6 +696,23 @@ resource webApp 'Microsoft.Web/sites@2023-12-01' = {
         {
           name: 'PGSSLMODE'
           value: 'require'
+        }
+        // Runtime tuning belongs in the template, not in a CLI call afterwards.
+        // appSettings is declared here in full, so anything set with
+        // `az webapp config appsettings set` is silently discarded by the next
+        // deployment -- which is exactly how the first CloudLens-Scale database
+        // came up unpartitioned despite the setting having been applied.
+        {
+          name: 'CLOUDLENS_PARTITION_COSTS'
+          value: partitionCosts ? '1' : ''
+        }
+        {
+          name: 'PG_WORK_MEM'
+          value: pgWorkMem
+        }
+        {
+          name: 'PG_STATEMENT_TIMEOUT'
+          value: pgStatementTimeout
         }
         {
           name: 'ARCHIVE_ACCOUNT'
