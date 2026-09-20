@@ -424,7 +424,22 @@ def assemble(daily: list[dict], groups: list[dict], window: dict,
     }
 
 
-def _sql_cte(window: dict) -> str:
+def _sql_cte(window: dict | None, source: str = "costs", where: str = "") -> str:
+    """The normalise/classify/value chain every Billing aggregate is computed over.
+
+    Shared by two callers with different jobs, which is why the source and the date
+    predicate are parameters rather than literals:
+
+    * `build`, reading the detail table for one statement period. Passes `window`.
+    * `billing_rollup.select_sql`, precomputing the same values at ingest across
+      whatever span the derived framework is rebuilding. Passes `where`.
+
+    One definition rather than two, because the rollup's stored measures are only
+    correct while they are computed exactly as the query they replace computes them.
+    A second copy of this classification would be a second thing to keep in step,
+    and the failure mode is a Billing statement that disagrees with the detail table
+    by however much the two copies drifted.
+    """
     def token(column: str) -> str:
         return f"regexp_replace(lower(coalesce(\"{column}\", '')), '[^a-z0-9]', '', 'g')"
 
@@ -432,11 +447,18 @@ def _sql_cte(window: dict) -> str:
         return f"""CASE WHEN "{column}" > '-Infinity'::float8 AND "{column}" < 'Infinity'::float8 THEN "{column}" END"""
 
     known = "basis_token IN ('focus','actualcost','amortizedcost')"
+    if window is not None:
+        where = (f"WHERE \"ChargePeriodStart\" BETWEEN DATE '{window['previous_start']}'"
+                 f" AND DATE '{window['end']}'")
     return f"""
     WITH normalized AS (
       SELECT "ChargePeriodStart", "BillingCostBasis", "BilledCost", "InvoiceCost",
         "ListCost", "ContractedCost", "EffectiveCost", "SubAccountName", "ResourceName",
         "ResourceGroup", "ServiceName", "BenefitId", {token('ChargeCategory')} AS category,
+        -- Carried raw as well as tokenised: the tokens drive classification, but the
+        -- filter bar compares against the stored column, so a grain that holds only
+        -- the token cannot narrow itself by `charge`, `pricing` or `region`.
+        "ChargeCategory", "PricingModel", "RegionName",
         {token('CommitmentDiscountStatus')} AS status,
         {token('CommitmentDiscountType')} AS ctype,
         {token('PricingModel')} AS model, {token('BillingCostBasis')} AS basis_token,
@@ -445,8 +467,8 @@ def _sql_cte(window: dict) -> str:
         coalesce(nullif(lower("ResourceId"), ''), 'unallocated:' ||
           lower(coalesce("ResourceGroup", '')) || ':' || lower(coalesce("ResourceName", '')) ||
           ':' || lower(coalesce("ServiceName", ''))) AS resource_id
-      FROM costs
-      WHERE "ChargePeriodStart" BETWEEN DATE '{window['previous_start']}' AND DATE '{window['end']}'
+      FROM {source}
+      {where}
     ), classified AS (
       SELECT *, (category IN ('unusedreservation','unusedsavingsplan') OR (
           status = 'unused' AND basis_token IN ('focus','amortizedcost')
@@ -499,37 +521,71 @@ def _sql_measures() -> str:
     return ",\n".join(parts)
 
 
+def _sql_remeasures(prefix: str = "") -> str:
+    """The same measures, re-aggregated from a table that already holds them.
+
+    Every measure `_sql_measures` produces is a `count` or a `sum`, so every one is
+    additive and a coarser cut is the sum of the finer rows beneath it. That is the
+    whole property the rollup rests on: `reservation_savings_total` was filtered to
+    `kind = 'reservation'` when it was computed, so the classification is already
+    inside the stored number and does not need to be in the grain to be re-applied.
+
+    Driven off `_empty()` rather than a list written out here, because `_empty()` is
+    already the canonical set of measure names -- it is what `_merge` iterates and
+    what `_metrics` indexes. Sharing it means a measure cannot be added to the
+    aggregate without also being re-aggregated, which is the drift that would show
+    up as a Billing total quietly short by one metric.
+    """
+    return ",\n".join(f'coalesce(sum({prefix}"{name}"), 0) AS "{name}"' for name in _empty())
+
+
 def build(scopes: list[str] | None, currency: str = "", month: str | None = None,
           filters: dict | None = None, *, today: date | None = None, warehouse: Any = None) -> dict:
+    """A statement for one calendar month, and the month before it for comparison.
+
+    Read from `billing_rollup`, which holds these fifty measures already aggregated
+    at a grain every cut below is a coarser view of. The warehouse decides what that
+    name resolves to: the precomputed table when it is current and the filter bar has
+    stayed inside its grain, or the same computation over the scoped detail table when
+    it has not. Either way the SQL here is the same, and so is the answer -- the only
+    difference is whether the 315 classification predicates are evaluated now or were
+    evaluated at ingest.
+    """
     from . import reporting
 
     window = statement_period(month, today)
     currency = normalize_currency(currency)
     if warehouse is None:
         from .warehouse import warehouse
-    cte, measures = _sql_cte(window), _sql_measures()
+    measures = _sql_remeasures()
     stat_columns = ", ".join(_empty())
-    # Billing's own SQL already bounds current AND previous calendar months.
+    # The rollup is scoped and filtered by the warehouse but not bounded by date, so
+    # the statement period is applied here. Both calendar months, because the
+    # month-over-month comparison needs the previous one.
+    period = (f'WHERE "ChargePeriodStart" BETWEEN DATE \'{window["previous_start"]}\''
+              f' AND DATE \'{window["end"]}\'')
     with reporting.select(None), warehouse.reader(scopes, None, filters) as reader:
+        source = reader.bill
         # One SQL statement gives totals and breakdowns the same MVCC snapshot during ingest.
-        result = reader.rows(cte + f""",
-          daily AS (
+        result = reader.rows(f"""
+          WITH daily AS (
             SELECT "ChargePeriodStart" AS day, currency, "BillingCostBasis" AS basis,
-              {measures} FROM valued GROUP BY 1, 2, 3
+              {measures} FROM {source} {period} GROUP BY 1, 2, 3
           ),
           grouped AS (
             SELECT currency,
               CASE WHEN grouping(resource_id)=0 THEN 'resources'
                    WHEN grouping("ServiceName")=0 THEN 'services' ELSE 'subscriptions' END AS bucket,
               CASE WHEN grouping(resource_id)=0 THEN resource_id
-                   WHEN grouping("ServiceName")=0 THEN coalesce("ServiceName",'') ELSE sub_id END AS id,
+                   WHEN grouping("ServiceName")=0 THEN coalesce("ServiceName",'') ELSE "SubAccountId" END AS id,
               CASE WHEN grouping(resource_id)=0 THEN min("ResourceName")
                    WHEN grouping("ServiceName")=0 THEN "ServiceName" ELSE min("SubAccountName") END AS name,
-              CASE WHEN grouping(sub_id)=0 THEN sub_id END AS subscription_id,
+              CASE WHEN grouping("SubAccountId")=0 THEN "SubAccountId" END AS subscription_id,
               CASE WHEN grouping(resource_id)=0 THEN min("ResourceGroup") END AS resource_group,
               {measures}
-            FROM valued WHERE "ChargePeriodStart" >= DATE '{window['start']}'
-            GROUP BY GROUPING SETS ((currency,sub_id),(currency,"ServiceName"),(currency,sub_id,resource_id))
+            FROM {source} WHERE "ChargePeriodStart"
+              BETWEEN DATE '{window['start']}' AND DATE '{window['end']}'
+            GROUP BY GROUPING SETS ((currency,"SubAccountId"),(currency,"ServiceName"),(currency,"SubAccountId",resource_id))
           ), ranked AS (
             SELECT *, row_number() OVER (
               PARTITION BY currency,bucket ORDER BY abs(recorded_cost_total) DESC,id,subscription_id) AS rank,

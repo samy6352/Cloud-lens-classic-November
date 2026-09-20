@@ -33,10 +33,16 @@ from typing import Any, ClassVar
 
 import httpx
 
-from . import derived, presence, rollup, schema_v2, store
+from . import billing_rollup, derived, presence, rollup, schema_v2, store
 from .sqldialect import SHIM_SCHEMA, strip_literals
 
 log = logging.getLogger("cloudlens.warehouse")
+
+# Every derived table, in one place. Adding a module here is what puts it into the
+# rebuild, the boot-time `ensure`, the column check, and the generation stamp's
+# roster together -- the four had drifted apart once, and a table that was rebuilt
+# by none of them but trusted by the reader served an empty relation as truth.
+DERIVED_MODULES = (rollup, presence, billing_rollup)
 
 ARM = "https://management.azure.com"
 DETAILS_API = "2023-11-01"
@@ -432,11 +438,16 @@ class Reader:
     """
 
     def __init__(self, con: Any, aggregate: str = "costs", counted: str = "costs",
-                 named: str = "costs") -> None:
+                 named: str = "costs", billing: str = "costs") -> None:
         self._con = con
         self.agg = aggregate
         self.res = counted
         self.named = named
+        # What `billing.build` should read. Unlike the three above it is not always a
+        # bare relation name: on an unshadowed connection whose rollup is behind the
+        # detail table there is no temp view to fall back to, so this carries the
+        # equivalent computation over `costs` as a parenthesised subquery instead.
+        self.bill = billing
 
     @property
     def aggregated(self) -> bool:
@@ -570,14 +581,16 @@ class Warehouse:
             window = None
         try:
             from . import derived, jobs
-            with jobs.coherent_rollup(self) as con:
-                # Both tables in one call, so their contents describe the same
+            with jobs.coherent_rollup(
+                    self, [module.TABLE for module in DERIVED_MODULES]) as con:
+                # Every table in one call, so their contents describe the same
                 # generation of `costs` and the generation stamp `coherent_rollup`
-                # writes covers both or neither -- and so the exclusive locks their
+                # writes covers all of them or none -- and so the exclusive locks their
                 # swaps need are taken together at the end, rather than one being
                 # held for the duration of the other's build.
                 counts = derived.rebuild(jobs.RollupTransaction(con), self._rollup_schema,
-                                         (rollup, presence), self._pg_table, window)
+                                         DERIVED_MODULES,
+                                         self._pg_table, window)
             self._rollup_full_required = False
             return counts[rollup.TABLE]
         except Exception as exc:  # noqa: BLE001
@@ -859,7 +872,39 @@ class Warehouse:
         con.execute(f"CREATE TEMP VIEW costs AS SELECT {select} FROM {self._pg_table} {where}")
         self._shadow_rollup(con, where, rate, filters)
         self._shadow_presence(con, where, rate, target, filters)
+        self._shadow_billing_rollup(con, where, rate, filters)
         return con
+
+    def _shadow_billing_rollup(self, con: Any, where: str, rate: float | None,
+                               filters: dict[str, list[str]] | None) -> None:
+        """Give this connection a `billing_rollup` carrying the same scope as `costs`.
+
+        The same argument as `_shadow_rollup` and `_shadow_presence`: the table holds
+        every subscription, so a scoped connection reading it unshadowed would report
+        an estate-wide statement to somebody entitled to see one subscription.
+
+        Money is refused outright under a converted currency rather than nulled. The
+        rollup's fifty measures are all money or counts of money, so nulling them
+        would leave nothing worth reading -- and unlike the presence table there is no
+        counting half that survives conversion. In practice this never fires: Billing
+        does its own FX in `_fx` from native per-currency totals and asks the
+        warehouse for `currency=None`, which is why the grain carries `currency`
+        rather than a converted figure.
+
+        Falling back means naming the detail-table computation under the same name, so
+        `billing.build` can read `billing_rollup` unconditionally and get either the
+        precomputed rows or the 451-second truth, without knowing which.
+        """
+        if (billing_rollup.serves_filters(filters) and rate is None
+                and self._rollup_fresh(con, billing_rollup.TABLE)):
+            con.execute(f'CREATE TEMP VIEW {billing_rollup.TABLE} AS SELECT * '
+                        f'FROM "{self._rollup_schema}".{billing_rollup.TABLE} {where}')
+            return
+        # A filter on `env`, a converted currency, or a rollup that has not caught up
+        # with the detail table. Compute the same grain from `costs`, which is scoped
+        # and filtered already -- correct, and as slow as it was before this existed.
+        con.execute(f"CREATE TEMP VIEW {billing_rollup.TABLE} AS "
+                    f"{billing_rollup.select_sql('costs')}")
 
     def _shadow_presence(self, con: Any, where: str, rate: float | None, target: str,
                          filters: dict[str, list[str]] | None) -> None:
@@ -883,7 +928,7 @@ class Warehouse:
         these columns -- and if something does, it reads NULL rather than a number
         that is silently in the wrong currency.
         """
-        if presence.serves_filters(filters) and self._rollup_fresh(con):
+        if presence.serves_filters(filters) and self._rollup_fresh(con, presence.TABLE):
             money_ok = presence.serves_money(rate)
             columns = ", ".join(
                 [f"'{target}' AS \"BillingCurrency\""
@@ -899,13 +944,18 @@ class Warehouse:
         con.execute(f"CREATE TEMP VIEW {presence.TABLE} AS "
                     f"{presence.select_sql('costs')}")
 
-    def _rollup_fresh(self, con: Any) -> bool:
-        """Whether the rollup was rebuilt from the generation `costs` is now at.
+    def _rollup_fresh(self, con: Any, table: str | None = None) -> bool:
+        """Whether `table` was rebuilt from the generation `costs` is now at.
 
         `jobs` advances the source generation inside the writing transaction and
         stamps the rollup's own generation inside the rebuilding one, so the two
         agreeing is a durable statement that the rollup is not stale -- unlike the
         in-process `_rollup_full_required` flag, which says nothing after a restart.
+
+        The stamp also records *which* derived tables that rebuild produced, and
+        `table` is checked against it. Without that check a table added to the code
+        after the last rebuild would read as fresh on the strength of a stamp it was
+        never part of, and serve its empty self instead of falling back.
 
         Guarded, and answers False on any failure. The cost of being wrong here is
         a wrong total on a page someone sends to a finance team, so the unknown
@@ -914,7 +964,7 @@ class Warehouse:
         try:
             from . import jobs
 
-            return jobs.rollup_current(con)
+            return jobs.rollup_current(con, table)
         except Exception as exc:  # noqa: BLE001
             log.debug("warehouse: could not establish rollup freshness (%s)", str(exc)[:200])
             return False
@@ -940,7 +990,8 @@ class Warehouse:
         rollup's grain. `serves_filters` is what guarantees that, and it is derived
         from the grain rather than written out, so the two cannot drift.
         """
-        if rate is None and rollup.serves_filters(filters) and self._rollup_fresh(con):
+        if (rate is None and rollup.serves_filters(filters)
+                and self._rollup_fresh(con, rollup.TABLE)):
             con.execute(f'CREATE TEMP VIEW {rollup.TABLE} AS SELECT * '
                         f'FROM "{self._rollup_schema}".{rollup.TABLE} {where}')
             return
@@ -986,14 +1037,15 @@ class Warehouse:
                     "NULLIF(current_setting('statement_timeout'), '0')::interval, "
                     "make_interval(secs => ? / 1000.0))) * 1000)::bigint::text, false)",
                     [budget_ms])
-            aggregate, counted, named = self._derived_sources(con, scope, currency, filters)
-            yield Reader(con, aggregate, counted, named)
+            aggregate, counted, named, billing = self._derived_sources(
+                con, scope, currency, filters)
+            yield Reader(con, aggregate, counted, named, billing)
         finally:
             con.close()
 
     def relations(self, con: Any, scope: list[str] | None = None,
                   currency: str | None = None,
-                  filters: dict[str, list[str]] | None = None) -> tuple[str, str, str]:
+                  filters: dict[str, list[str]] | None = None) -> tuple[str, str, str, str]:
         """The same routing decision `reader()` makes, for a caller holding a connection.
 
         Not every module can use `reader()`. `anomalies` opens its connection itself
@@ -1011,8 +1063,9 @@ class Warehouse:
 
     def _derived_sources(self, con: Any, scope: list[str] | None,
                          currency: str | None,
-                         filters: dict[str, list[str]] | None) -> tuple[str, str, str]:
-        """Which relations `Reader.agg`, `Reader.res` and `Reader.named` should name.
+                         filters: dict[str, list[str]] | None) -> tuple[str, str, str, str]:
+        """Which relations `Reader.agg`, `Reader.res`, `Reader.named` and `Reader.bill`
+        should name.
 
         A connection that `_prepare_connection` shadowed has both views, and both are
         correct by construction -- either the derived table, chosen only where it can
@@ -1028,16 +1081,43 @@ class Warehouse:
         presence table able to count but not to price, because the conversion factor
         needs columns outside its grain. Counting keeps the fast path; the money for
         that connection goes to the detail table, which is the only place it is right.
+
+        `bill` splits off from all three because Billing cannot simply be pointed at
+        `costs`: its statement is written against the rollup's column names, and the
+        detail table has neither `resource_id` nor the fifty measures. So a stale
+        unshadowed connection gets the grain *computed inline* from `costs` rather than
+        a relation name -- the same SQL the shadow view would have held, inlined
+        because on that path there is no view to hold it.
+
+        Freshness is asked per table rather than of the set. They are rebuilt together
+        and so normally answer alike, but a table added since the last rebuild is fresh
+        in neither its own right nor the set's, and gating it on the set would let it
+        serve an empty relation on the strength of its neighbours being current.
         """
-        from . import reporting
+        from . import jobs, reporting
 
         shadowed = bool(scope or currency or filters or reporting.view_predicate())
-        if not (shadowed or self._rollup_fresh(con)):
-            log.debug("warehouse: derived tables are behind the detail table; reading costs")
-            return "costs", "costs", "costs"
+        # One round trip for all three; `_rollup_fresh` would repeat it per table.
+        try:
+            fresh = jobs.fresh_derived_tables(con)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("warehouse: could not establish rollup freshness (%s)", str(exc)[:200])
+            fresh = frozenset()
+        # Correct on the shadowed path too: the view there is either the derived table
+        # or the same computation over the scoped `costs`, and both answer exactly.
+        bill = (billing_rollup.TABLE if shadowed or billing_rollup.TABLE in fresh
+                else f"({billing_rollup.select_sql('costs')}) AS {billing_rollup.TABLE}")
+        if shadowed:
+            aggregate, counted = rollup.TABLE, presence.TABLE
+        else:
+            if not fresh:
+                log.debug("warehouse: derived tables are behind the detail table; reading costs")
+            aggregate = rollup.TABLE if rollup.TABLE in fresh else "costs"
+            counted = presence.TABLE if presence.TABLE in fresh else "costs"
 
         money_ok = presence.serves_money(self._display_rate(currency))
-        return rollup.TABLE, presence.TABLE, presence.TABLE if money_ok else "costs"
+        named = counted if money_ok else "costs"
+        return aggregate, counted, named, bill
 
     @staticmethod
     def _display_rate(currency: str | None) -> float | None:
@@ -1066,6 +1146,7 @@ class Warehouse:
             "costs": tuple(COLUMNS),
             rollup.TABLE: (*rollup.DIMENSIONS, *rollup.MEASURES, "charges"),
             presence.TABLE: (*presence.DIMENSIONS, *presence.MEASURES),
+            billing_rollup.TABLE: (*billing_rollup.DIMENSIONS, *billing_rollup.MEASURES),
             "ingest_log": ("subscription_id", "subscription_name", "period", "rows",
                            "ingested_at", "status", "detail"),
             "meta": ("key", "value", "updated_at"),
@@ -1161,8 +1242,8 @@ class Warehouse:
             # or upgrades that arrangement. See `derived` for why the indirection
             # exists -- in short, it is what lets a rebuild swap the contents while
             # a dashboard is holding a scoped view of them.
-            derived.ensure(con, schema, rollup)
-            derived.ensure(con, schema, presence)
+            for module in DERIVED_MODULES:
+                derived.ensure(con, schema, module)
             self._rollup_schema = schema
             self._ensure_query_role(con)
 
@@ -1187,7 +1268,7 @@ class Warehouse:
         """
         from . import derived
 
-        for module in (rollup, presence):
+        for module in DERIVED_MODULES:
             expected = set(module.DIMENSIONS) | set(getattr(module, "MEASURES", []))
             if module is rollup:
                 expected.add("charges")

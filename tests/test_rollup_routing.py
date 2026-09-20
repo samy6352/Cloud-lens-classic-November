@@ -192,6 +192,90 @@ def test_catching_the_rollup_up_puts_it_back_in_service(loaded):
         assert r.agg == TABLE
 
 
+def test_a_table_the_last_rebuild_did_not_produce_is_not_read(loaded):
+    """A derived table added since the last rebuild must not inherit its stamp.
+
+    The generation stamp is one integer covering whichever tables that rebuild
+    produced. Before the roster was recorded beside it, adding a third derived
+    table to the code was enough to make the existing stamp vouch for it: the
+    generations matched, so the empty newcomer was read as current and Billing
+    served nulls and no rows, instantly and wrongly. Simulated here by stamping a
+    roster that predates the table, which is exactly the state an upgrade lands in.
+    """
+    from app import billing_rollup
+    from app.jobs import ROLLUP_TABLES_KEY
+    from app.presence import TABLE as PRESENCE
+    from app.rollup import TABLE as ROLLUP
+
+    with loaded.reader() as r:
+        assert r.bill == billing_rollup.TABLE
+
+    with loaded.connect() as con:
+        con.execute("UPDATE meta SET value = ? WHERE key = ?",
+                    [f"{ROLLUP},{PRESENCE}", ROLLUP_TABLES_KEY])
+
+    with loaded.reader() as r:
+        # Its neighbours are genuinely current and keep their fast path ...
+        assert r.agg == ROLLUP
+        assert r.res == PRESENCE
+        # ... while the table no rebuild produced is computed from `costs` instead
+        # of being read empty.
+        assert r.bill != billing_rollup.TABLE
+        assert "FROM costs" in r.bill
+
+    loaded.refresh_rollup()
+    with loaded.reader() as r:
+        assert r.bill == billing_rollup.TABLE
+
+
+def test_a_rebuild_records_which_tables_its_stamp_covers(loaded):
+    from app.jobs import ROLLUP_TABLES_KEY
+    from app.warehouse import DERIVED_MODULES
+
+    loaded.refresh_rollup()
+    with loaded.connect() as con:
+        roster = con.execute("SELECT value FROM meta WHERE key = ?",
+                             [ROLLUP_TABLES_KEY]).fetchone()[0]
+    assert set(roster.split(",")) == {module.TABLE for module in DERIVED_MODULES}
+
+
+def test_a_full_rebuild_builds_the_declared_column_types(loaded):
+    """The staged side must have the types the DDL declares, however it was built.
+
+    A full rebuild uses `CREATE TABLE AS`, because PostgreSQL will not parallelise a
+    query that writes data and `INSERT INTO ... SELECT` therefore aggregates the whole
+    detail table on one core. `CREATE TABLE AS` takes its column types from the query
+    rather than from the DDL, so this is the property that makes that swap safe: every
+    measure stays `double precision` even where the expression behind it is a `count`,
+    which is what lets the remeasure SQL sum counts and money the same way.
+
+    `strict=True` is load-bearing. `refresh_rollup` logs and swallows a failed rebuild
+    by default, leaving the previously published side in place -- so without it this
+    test would read the *old* table and pass while the rebuild it is meant to be
+    checking had failed. That is exactly how the missing cast first went unnoticed.
+    """
+    import os
+
+    from app.warehouse import DERIVED_MODULES
+
+    schema = os.environ["PGSCHEMA"]
+    loaded.refresh_rollup(strict=True)
+    with loaded.connect() as con:
+        for module in DERIVED_MODULES:
+            built = dict(con.execute(
+                "SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute "
+                "WHERE attrelid = ?::regclass AND attnum > 0 AND NOT attisdropped",
+                [f'"{schema}".{module.TABLE}']).fetchall())
+            declared = {name: "date" if name == module.PERIOD else "text"
+                        for name in module.DIMENSIONS}
+            declared.update(dict.fromkeys(getattr(module, "MEASURES", []),
+                                          "double precision"))
+            for column, want in declared.items():
+                assert built.get(column) == want, (
+                    f"{module.TABLE}.{column}: built {built.get(column)!r}, "
+                    f"declared {want!r}")
+
+
 # ------------------------------------------------------------------- payloads
 
 def _dashboard(warehouse):
@@ -356,9 +440,9 @@ def _anomalies(warehouse, monkeypatch, **kwargs):
 
 
 def _on_the_detail_table(monkeypatch, warehouse):
-    """Make `relations` name `costs` for all three routes, as it does when stale."""
+    """Make `relations` name `costs` for every route, as it does when stale."""
     monkeypatch.setattr(type(warehouse), "relations",
-                        lambda self, *a, **k: ("costs", "costs", "costs"))
+                        lambda self, *a, **k: ("costs", "costs", "costs", "costs"))
 
 
 def test_the_anomaly_tab_is_the_same_either_way(loaded, monkeypatch):

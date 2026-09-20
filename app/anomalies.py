@@ -400,7 +400,7 @@ def analyse(scope: list[str] | None = None, days: int = 60,
         # and a row count -- all of which the rollup holds, the count as the sum of
         # the `charges` each group stands for. Measured at 44s of this endpoint's
         # 45.7s before routing: the whole tab was waiting on three numbers.
-        agg, _, named = warehouse.relations(con, scope, display_currency, filters)
+        agg, _, named, _bill = warehouse.relations(con, scope, display_currency, filters)
         span = con.execute(
             f'SELECT min("ChargePeriodStart"), max("ChargePeriodStart"), '
             f'{rollup.charges_sql(agg)} FROM {agg}'

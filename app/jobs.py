@@ -6,6 +6,7 @@ import contextvars
 import hashlib
 import json
 import logging
+from collections.abc import Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any
@@ -18,6 +19,12 @@ ACTIVE = frozenset({"queued", "waiting-for-Azure", "downloading", "validating",
 LEASE_SECONDS = 300
 GENERATION_KEY = "data_generation"
 ROLLUP_GENERATION_KEY = "data_rollup_generation"
+ROLLUP_TABLES_KEY = "data_rollup_tables"
+# What a generation stamp written before `ROLLUP_TABLES_KEY` existed covered. A
+# stamp carries no roster of its own, and the two tables below are the only ones
+# that could have been rebuilt under it, so naming them here reads an old stamp
+# exactly rather than distrusting it and forcing a needless rebuild on upgrade.
+LEGACY_ROLLUP_TABLES = ("costs_rollup", "resource_presence")
 _LOCK = 741209031
 current_progress: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "ingest_progress", default=None)
@@ -81,18 +88,49 @@ def snapshot_generation(con: Any, scope: list[str] | None = None) -> str:
     return f"data:{source}" if source >= 0 and source == ready else f"pending:{source}:{ready}"
 
 
-def rollup_current(con: Any) -> bool:
+def rollup_current(con: Any, table: str | None = None) -> bool:
     """Whether the rollup holds the generation the detail table is now at.
 
     The read-side counterpart to `coherent_rollup`, which stamps the rollup's
-    generation inside the same transaction that rebuilt it. Two rows from `meta`,
+    generation inside the same transaction that rebuilt it. Three rows from `meta`,
     so it is cheap enough to ask on every connection that might read the rollup.
 
     A rollup that was never built reads as generation -1 and is therefore never
     current, which is the answer that keeps an empty rollup from serving zeroes.
+
+    `table` asks the question of one derived table rather than of the set. It is
+    not a refinement but a correctness requirement: the generation stamp is a
+    single integer covering whichever tables that rebuild actually produced, so a
+    table added to the code *after* the last rebuild would otherwise inherit a
+    stamp it was never part of and serve an empty relation as though it were
+    current. Asking without a table keeps the older, coarser meaning for callers
+    that only want to know whether derived data as a whole has caught up.
     """
     source, ready = _generation_pair(con)
-    return source == ready
+    if source != ready:
+        return False
+    return table is None or table in _stamped_tables(con)
+
+
+def _stamped_tables(con: Any) -> frozenset[str]:
+    """The derived tables the current generation stamp was written for."""
+    row = con.execute("SELECT value FROM meta WHERE key=?", [ROLLUP_TABLES_KEY]).fetchone()
+    if not row or not row[0]:
+        return frozenset(LEGACY_ROLLUP_TABLES)
+    return frozenset(name for name in (part.strip() for part in row[0].split(",")) if name)
+
+
+def fresh_derived_tables(con: Any) -> frozenset[str]:
+    """Which derived tables may be read as current, in one round trip.
+
+    `_derived_sources` needs the answer for three tables at once and is on the path
+    of every connection, so it asks here rather than calling `rollup_current` per
+    table and paying for the same two `meta` reads three times over.
+    """
+    source, ready = _generation_pair(con)
+    if source != ready:
+        return frozenset()
+    return _stamped_tables(con)
 
 
 def generation_ready(expected: int) -> bool:
@@ -119,19 +157,32 @@ class RollupTransaction:
 
 
 @contextmanager
-def coherent_rollup(warehouse: Any):
-    """Freeze source writes until the rebuilt rollup and its ready version are published."""
+def coherent_rollup(warehouse: Any, tables: Sequence[str] | None = None):
+    """Freeze source writes until the rebuilt rollup and its ready version are published.
+
+    `tables` names the derived tables the body actually rebuilt, and is stamped
+    beside the generation so a reader can tell which tables that generation covers.
+    Omitting it stamps every derived table the warehouse knows about, which is the
+    right default for callers that rebuild the lot.
+    """
+    if tables is None:
+        from .warehouse import DERIVED_MODULES
+
+        tables = [module.TABLE for module in DERIVED_MODULES]
+    roster = ",".join(sorted(tables))
     with warehouse.connect() as con:
         con.execute("BEGIN")
         try:
             lock_generation(con)
             version = con.execute("SELECT value FROM meta WHERE key=?", [GENERATION_KEY]).fetchone()[0]
             yield con
-            con.execute(
-                "INSERT INTO meta (key,value,updated_at) VALUES (?,?,now()) "
-                "ON CONFLICT (key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
-                [ROLLUP_GENERATION_KEY, str(version)],
-            )
+            for key, value in ((ROLLUP_GENERATION_KEY, str(version)),
+                               (ROLLUP_TABLES_KEY, roster)):
+                con.execute(
+                    "INSERT INTO meta (key,value,updated_at) VALUES (?,?,now()) "
+                    "ON CONFLICT (key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                    [key, value],
+                )
             con.execute("COMMIT")
         except BaseException:
             con.execute("ROLLBACK")
