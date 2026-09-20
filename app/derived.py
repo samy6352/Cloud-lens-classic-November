@@ -252,6 +252,21 @@ def stage(con: Any, schema: str, module: Any, source: str,
     auto-updatable, so writing through it would silently succeed while leaving
     which copy was modified up to PostgreSQL -- correct today and quietly wrong
     the moment the definition grows past a bare `SELECT *`.
+
+    The full rebuild is a `CREATE TABLE AS` rather than a create-then-insert, and
+    that is a performance decision with a correctness cost to manage. PostgreSQL
+    will not produce a parallel plan for a query that writes data, so
+    `INSERT INTO ... SELECT` aggregates the entire detail table on a single core:
+    measured on a 5.8M-row estate the planner put the insert form at 37.9M cost
+    units against 11.2M for the same select, the difference being four workers it
+    was not allowed to use. `CREATE TABLE AS` is not subject to that restriction.
+
+    The cost is that `CREATE TABLE AS` takes its column types from the query rather
+    than from `table_sql`, so the select has to produce the declared types itself --
+    a `count` is `bigint` until something casts it, while the DDL declares every
+    measure `double precision`. That is a property of the modules' SQL rather than
+    of this function, and `test_a_full_rebuild_builds_the_declared_column_types`
+    is what holds them to it.
     """
     ensure(con, schema, module)
     if window is not None:
@@ -266,8 +281,7 @@ def stage(con: Any, schema: str, module: Any, source: str,
     # after building this side but before naming it, and its indexes would then be
     # maintained row by row through the load for nothing.
     con.execute(f'DROP TABLE IF EXISTS "{schema}".{target}')
-    con.execute(module.table_sql(schema, target))
-    con.execute(f'INSERT INTO "{schema}".{target} {module.select_sql(source, None)}')
+    con.execute(f'CREATE TABLE "{schema}".{target} AS {module.select_sql(source, None)}')
     return target
 
 
