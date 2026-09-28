@@ -53,10 +53,9 @@ rather than on every page load.
 
 What it deliberately does not hold
 ----------------------------------
-`env`. It is not a column -- it is read out of the `Tags` document with four
-possible spellings -- so no grain can carry it, and `derived.FILTER_COLUMNS` says
-so in the one place both this table and the filter bar read. A statement filtered
-by environment falls back to the detail table, correctly and slowly.
+With CLOUDLENS_ENV_ROLLUP enabled the normalized environment joins the grain.
+Its source remains the legacy four-spelling Tags expression, evaluated during
+preprocessing rather than reclassifying raw charges for every filtered statement.
 
 The classification is absent from the grain for a happier reason: it is already
 *inside* the measures. `reservation_savings_total` was filtered to
@@ -70,11 +69,18 @@ import datetime as dt
 import logging
 from typing import Any
 
-from . import billing, derived
+from . import billing, derived, environment
 
 log = logging.getLogger("cloudlens.billing_rollup")
 
 TABLE = "billing_rollup"
+
+# Applied transaction-locally only while rebuilding this module, then restored.
+# With 192 MB work_mem, the real 5.8M-row month chose a multi-GB text sort and
+# exceeded 240 s even after factoring classification. Spill-capable hash
+# aggregation completed all 2.8M groups/all 50 measures in 146 s at the same
+# memory budget. Do not impose this on interactive queries or other modules.
+BUILD_SETTINGS = {"enable_sort": "off", "enable_incremental_sort": "off"}
 
 # The stored column names, and the expression in `billing`'s `valued` CTE each is
 # computed from. Written as one map rather than two lists because the table's DDL,
@@ -111,6 +117,8 @@ GRAIN: dict[str, str] = {
     "PricingModel": '"PricingModel"',
 }
 
+if environment.ENABLED:
+    GRAIN[environment.COLUMN] = f'"{environment.COLUMN}"'
 DIMENSIONS = list(GRAIN)
 PERIOD = DIMENSIONS[0]
 
@@ -130,6 +138,8 @@ SOURCE_COLUMNS = [
     "CommitmentDiscountStatus", "CommitmentDiscountType",
     "BilledCost", "InvoiceCost", "ListCost", "ContractedCost", "EffectiveCost",
 ]
+if environment.ENABLED:
+    SOURCE_COLUMNS.append("Tags")
 
 # Worked out from this table's own grain, the same way `presence` does it, so that
 # adding a filter column here is what widens what it claims to serve.
@@ -137,13 +147,7 @@ FILTERABLE = derived.filterable(DIMENSIONS)
 
 
 def serves_filters(filters: dict[str, list[str]] | None) -> bool:
-    """Whether every dimension the caller narrowed is one this grain holds.
-
-    False for `env`, always: it is read from the `Tags` document rather than a
-    column, so there is nothing here to narrow. That statement goes to the detail
-    table and takes the 451s, which is the correct answer slowly rather than a
-    fast one that silently ignored the filter.
-    """
+    """Whether every dimension the caller narrowed is one this grain holds."""
     return derived.serves_filters(filters, FILTERABLE)
 
 
@@ -173,8 +177,10 @@ def table_sql(schema: str, table: str = TABLE) -> str:
     """
     _validate()
     cols = ",\n  ".join(
-        [f'"{name}" {"date" if name == PERIOD else "text"}' for name in DIMENSIONS]
+        [f'"{name}" {"date" if name == PERIOD else "text"}'
+         for name in DIMENSIONS if name != environment.COLUMN]
         + [f'"{m}" double precision' for m in MEASURES]
+        + ([f'"{environment.COLUMN}" text'] if environment.ENABLED else [])
     )
     return f'CREATE TABLE IF NOT EXISTS "{schema}".{table} (\n  {cols}\n)'
 
@@ -185,6 +191,8 @@ def index_sql(schema: str, table: str = TABLE) -> list[str]:
     Named after `table` so a staging rebuild, which creates them before the swap
     gives the table its real name, produces the names a first-time create would.
     """
+    from . import read_indexes
+
     return [
         # Every statement is bounded to a calendar month and the one before it.
         f'CREATE INDEX IF NOT EXISTS {table}_period_idx '
@@ -192,10 +200,22 @@ def index_sql(schema: str, table: str = TABLE) -> list[str]:
         # And then narrowed to the subscriptions the viewer is allowed to see.
         f'CREATE INDEX IF NOT EXISTS {table}_sub_idx '
         f'ON "{schema}".{table} (lower("SubAccountId"), "{PERIOD}")',
+        *read_indexes.index_sql(schema, table, TABLE),
     ]
 
 
 def select_sql(source: str, window: tuple[dt.date, dt.date] | None = None) -> str:
+    """Computed fallback remains inline so caller date predicates reach the source."""
+    return _select_sql(source, window, precompute=False)
+
+
+def build_select_sql(source: str, window: tuple[dt.date, dt.date] | None = None) -> str:
+    """Rebuild-only projection boundary; not suitable for a persistent fallback view."""
+    return _select_sql(source, window, precompute=True)
+
+
+def _select_sql(source: str, window: tuple[dt.date, dt.date] | None, *,
+                precompute: bool) -> str:
     """The grain computed from `source`, using billing's own classification.
 
     The date predicate goes *inside* the CTE rather than around it, so a windowed
@@ -218,6 +238,13 @@ def select_sql(source: str, window: tuple[dt.date, dt.date] | None = None) -> st
 
     The projection is over the aggregated rows, not the detail table, so it costs
     a pass over the grain rather than over the estate.
+
+    Materialize only the grain and financial inputs, not the wide raw ``valued``
+    rows. Otherwise PostgreSQL inlines classification into every measure FILTER,
+    repeatedly normalizing the same tokens. On a complete real 151,410-row day,
+    this narrow boundary reduced all-measure aggregation from 29.23 s to 1.65 s;
+    materializing all valued columns took 2.79 s. The shared billing expressions
+    remain the single source of financial semantics.
     """
     where = ""
     if window is not None:
@@ -225,13 +252,26 @@ def select_sql(source: str, window: tuple[dt.date, dt.date] | None = None) -> st
         where = (f"WHERE \"{PERIOD}\" >= DATE '{lo.isoformat()}'"
                  f" AND \"{PERIOD}\" < DATE '{hi.isoformat()}'")
     dims = ", ".join(f'{expr} AS "{name}"' for name, expr in GRAIN.items())
-    grain = (f"{billing._sql_cte(None, source=source, where=where)}"
-             f" SELECT {dims}, {billing._sql_measures()} FROM valued"
+    extra = ()
+    if environment.ENABLED:
+        source = environment.project(source, [c for c in SOURCE_COLUMNS if c != "Tags"])
+        extra = (environment.COLUMN,)
+    cte = billing._sql_cte(None, source=source, where=where,
+                           **({"extra_columns": extra} if extra else {}))
+    relation = "valued"
+    if precompute:
+        cte += (f", billing_prepared AS MATERIALIZED ("
+                f"SELECT {dims}, comparable, unused, kind, list_value, contract_value, "
+                f"effective_value, invoice_value, recorded_value FROM valued)")
+        dims = ", ".join(f'"{name}"' for name in DIMENSIONS)
+        relation = "billing_prepared"
+    grain = (f"{cte} SELECT {dims}, {billing._sql_measures()} FROM {relation}"
              f" GROUP BY {', '.join(str(i + 1) for i in range(len(DIMENSIONS)))}")
     projected = ", ".join(
-        [f'"{name}"' for name in DIMENSIONS]
+        [f'"{name}"' for name in DIMENSIONS if name != environment.COLUMN]
         + [f'CAST("{measure}" AS double precision) AS "{measure}"'
-           for measure in MEASURES])
+           for measure in MEASURES]
+        + ([f'"{environment.COLUMN}"'] if environment.ENABLED else []))
     return f"SELECT {projected} FROM ({grain}) AS grain"
 
 

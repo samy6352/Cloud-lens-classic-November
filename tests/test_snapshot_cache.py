@@ -1341,6 +1341,7 @@ def test_stranded_committed_outbox_cannot_block_coherent_integer_revision(postgr
 @pytest.mark.postgres
 @pytest.mark.usefixtures("ready_cache_warehouse")
 def test_global_counter_readiness_is_deliberately_shared_across_selected_scopes(postgres_warehouse):
+    from app import jobs
     from app.snapshot_cache import read_generation
 
     with postgres_warehouse.connect() as con:
@@ -1348,7 +1349,32 @@ def test_global_counter_readiness_is_deliberately_shared_across_selected_scopes(
         con.execute("UPDATE meta SET value=? WHERE key=?", ["1", "data_generation"])
         assert read_generation(con, ("a",)) == read_generation(con, ("b",)) == "pending:1:0"
         con.execute("UPDATE meta SET value=? WHERE key=?", ["1", "data_rollup_generation"])
+        jobs._write_dirty(con, 1, 1, [])
         assert read_generation(con, ("a",)) == read_generation(con, ("b",)) == "1"
+
+
+@pytest.mark.postgres
+@pytest.mark.usefixtures("ready_cache_warehouse")
+def test_default_cache_revision_fences_pending_maintenance_without_a_source_write(postgres_warehouse):
+    from app import jobs
+    from app.snapshot_cache import Snapshot, read_generation
+
+    wh = postgres_warehouse
+    store = SnapshotStore(wh.connect)
+    store.initialize()
+    snapshot = Snapshot("maintenance", "partition", "0", b'{"total":12}',
+                        100, 110, 200, '"etag"')
+    assert store.put(snapshot)
+    jobs.request_rollup(wh, None)
+    with wh.connect() as con:
+        assert jobs._generation_pair(con) == (0, 0)
+        assert not jobs.rollup_current(con)
+        assert read_generation(con) == "pending:0:0"
+    assert not store.put(snapshot)
+    wh.refresh_rollup(strict=True)
+    with wh.connect() as con:
+        assert read_generation(con) == "0"
+    assert store.put(snapshot)
 
 
 @pytest.mark.postgres
@@ -1409,6 +1435,7 @@ def test_focus_transaction_counter_fences_writes_independently_of_outbox_promoti
 @pytest.mark.postgres
 @pytest.mark.usefixtures("ready_cache_warehouse")
 def test_generation_does_not_treat_uuid_or_transaction_timestamp_as_commit_order(postgres_warehouse):
+    from app import jobs
     from app.snapshot_cache import read_generation
 
     with postgres_warehouse.connect() as con:
@@ -1423,7 +1450,9 @@ def test_generation_does_not_treat_uuid_or_transaction_timestamp_as_commit_order
         assert read_generation(con, ("a",)) == first
         con.execute("UPDATE meta SET value=? WHERE key IN (?,?)",
                     ["1", "data_generation", "data_rollup_generation"])
+        jobs._write_dirty(con, 1, 1, [])
         second = read_generation(con, ("a",))
+        assert second == "1"
         assert second != first
         con.execute("UPDATE meta SET updated_at=now() WHERE key=?", ["data-publication:a"])
         assert read_generation(con, ("a",)) == second

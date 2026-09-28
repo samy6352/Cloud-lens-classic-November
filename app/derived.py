@@ -101,9 +101,16 @@ import datetime as dt
 import logging
 import time
 from collections.abc import Sequence
+from contextlib import contextmanager
 from typing import Any, Protocol
 
+from psycopg.errors import LockNotAvailable
+
+from . import derived_partitions
+from .derived_partitions import RebuildRequired
+
 log = logging.getLogger("cloudlens.derived")
+RETIRE_LOCK_TIMEOUT_MS = 5000
 
 # The two names the rows actually live under. The published name is a view naming
 # one of them; a full rebuild fills the other and repoints the view. Fixed names
@@ -116,14 +123,14 @@ SIDES = ("_a", "_b")
 # working that out per module from the same map means adding a column to one grain
 # cannot silently widen what another claims to serve.
 #
-# `env` is deliberately absent. It is not a column -- it is read out of the `Tags`
-# document -- so no grain can carry it and every filter on it needs the detail table.
+# Computed dimensions are usable only in grains that explicitly carry them.
 FILTER_COLUMNS = {
     "rg": "ResourceGroup",
     "service": "ServiceName",
     "region": "RegionName",
     "charge": "ChargeCategory",
     "pricing": "PricingModel",
+    "env": "Environment",
 }
 
 
@@ -178,14 +185,14 @@ def active_table(con: Any, schema: str, module: Any) -> str | None:
         "JOIN pg_namespace n ON n.oid = v.relnamespace "
         "JOIN pg_rewrite r ON r.ev_class = v.oid "
         "JOIN pg_depend d ON d.objid = r.oid AND d.classid = 'pg_rewrite'::regclass "
-        "JOIN pg_class t ON t.oid = d.refobjid AND t.relkind = 'r' "
+        "JOIN pg_class t ON t.oid = d.refobjid AND t.relkind IN ('r', 'p') "
         "WHERE n.nspname = ? AND v.relname = ? AND v.relkind = 'v' AND t.oid <> v.oid "
         "LIMIT 1",
         [schema, module.TABLE]).fetchone()
     return row[0] if row else None
 
 
-def ensure(con: Any, schema: str, module: Any) -> None:
+def ensure(con: Any, schema: str, module: Any) -> bool:
     """Make the published name a view over one of the two sides, whatever it is now.
 
     Idempotent, and safe to run on every boot. Three states to land from:
@@ -197,19 +204,21 @@ def ensure(con: Any, schema: str, module: Any) -> None:
       rebuild on the first boot after an upgrade.
     * The view is already there -- confirm the side it names still exists, and do
       nothing.
+    Returns True when existing published contents could not be preserved.
     """
+    derived_partitions.enabled()  # Validate configuration without migrating on boot.
     existing = active_table(con, schema, module)
     if existing:
         con.execute(module.table_sql(schema, existing))
         for statement in module.index_sql(schema, existing):
             con.execute(statement)
-        return
+        return False
 
     kind = con.execute(
         "SELECT relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
         "WHERE n.nspname = ? AND c.relname = ?", [schema, module.TABLE]).fetchone()
     side = f"{module.TABLE}{SIDES[0]}"
-    if kind and kind[0] == "r":
+    if kind and kind[0] in ("r", "p"):
         # Upgrade in place. The indexes come with the table and keep their old
         # names; `index_sql` is IF NOT EXISTS against the new name, so the next
         # rebuild creates the correctly-named ones on the other side and this
@@ -224,6 +233,19 @@ def ensure(con: Any, schema: str, module: Any) -> None:
         con.execute(statement)
     con.execute(f'CREATE OR REPLACE VIEW "{schema}".{module.TABLE} AS '
                 f'SELECT * FROM "{schema}".{side}')
+    return not (kind and kind[0] in ("r", "p"))
+
+
+def validate_storage(con: Any, schema: str, module: Any) -> None:
+    """Cheap readiness validation under generation/rebuild locks, without row scans.
+
+    After ensure(), callers should catch RebuildRequired and invalidate the
+    rollup generation so the next refresh repairs all data, not just dirty dates.
+    """
+    active = active_table(con, schema, module)
+    if active is None:
+        raise RebuildRequired(f"{module.TABLE} has no published side; a full rebuild is required")
+    derived_partitions.validate(con, schema, active)
 
 
 def _inactive(con: Any, schema: str, module: Any) -> str:
@@ -268,49 +290,82 @@ def stage(con: Any, schema: str, module: Any, source: str,
     of this function, and `test_a_full_rebuild_builds_the_declared_column_types`
     is what holds them to it.
     """
-    ensure(con, schema, module)
+    recreated = ensure(con, schema, module)
+    select = getattr(module, "build_select_sql", module.select_sql)
     if window is not None:
+        if recreated:
+            raise RuntimeError(f"{module.TABLE} was recreated; a full rebuild is required")
         active = active_table(con, schema, module)
+        if derived_partitions.partitioned(con, schema, active):
+            derived_partitions.repair(con, schema, module, active, source, window)
+            return active
         con.execute(f'DELETE FROM "{schema}".{active}{_scope(module, window)}')
         con.execute(f'INSERT INTO "{schema}".{active} '
-                    f'{module.select_sql(source, window)}')
+                    f'{select(source, window)}')
         return active
 
     target = _inactive(con, schema, module)
     # Dropped rather than truncated: a previous rebuild may have been interrupted
     # after building this side but before naming it, and its indexes would then be
     # maintained row by row through the load for nothing.
+    derived_partitions.drop_detached(con, schema, target)
     con.execute(f'DROP TABLE IF EXISTS "{schema}".{target}')
-    con.execute(f'CREATE TABLE "{schema}".{target} AS {module.select_sql(source, None)}')
+    active = active_table(con, schema, module)
+    if (derived_partitions.enabled()
+            or (active and derived_partitions.partitioned(con, schema, active))):
+        derived_partitions.build(con, schema, module, target, source)
+        return target
+    derived_partitions.forget(con, schema, target)
+    con.execute(f'CREATE TABLE "{schema}".{target} AS {select(source, None)}')
     return target
 
 
-def publish(con: Any, schema: str, module: Any, staged: str) -> int:
-    """Name the staged side from the published view, so readers start seeing it.
-
-    The swap is `CREATE OR REPLACE VIEW`, which redefines the view without
-    dropping it. That distinction is the whole point: the temp views carrying each
-    connection's subscription scope depend on this view, and dropping it would be
-    refused while any dashboard was being read.
-
-    Indexes are created before the swap, not after. The staged side is not
-    published yet, so nothing can read it and the build blocks nobody -- and an
-    index built on a populated table is cheaper than one maintained row by row
-    during the load. They are named after the side they belong to, so the two
-    copies never collide.
-
-    `ANALYZE` is not optional. Without current statistics the planner may still
-    choose a sequential scan of the detail table for a query the derived table
-    could have answered, which is the entire cost this table exists to avoid --
-    and a freshly built side has no statistics at all.
-    """
+def prepare(con: Any, schema: str, module: Any, staged: str) -> int:
+    """Finish every expensive step before taking any published-view locks."""
     for statement in module.index_sql(schema, staged):
         con.execute(statement)
+    if derived_partitions.partitioned(con, schema, staged):
+        rows = derived_partitions.prepare(con, schema, module, staged)
+        if active_table(con, schema, module) != staged:
+            con.execute(f'ANALYZE "{schema}".{staged}')
+        return rows
     rows = con.execute(f'SELECT count(*) FROM "{schema}".{staged}').fetchone()[0]
     con.execute(f'ANALYZE "{schema}".{staged}')
+    return int(rows or 0)
+
+
+def publish(con: Any, schema: str, module: Any, staged: str) -> None:
+    """Repoint the stable view without dropping dependent scoped views."""
     con.execute(f'CREATE OR REPLACE VIEW "{schema}".{module.TABLE} AS '
                 f'SELECT * FROM "{schema}".{staged}')
-    return int(rows or 0)
+
+
+def lock_rebuild(con: Any, schema: str) -> None:
+    # Cleanup must not drop the inactive side while another rebuild is filling it.
+    con.execute("SELECT pg_advisory_xact_lock(hashtext(?))",
+                [f"cloudlens:derived:{schema}"])
+
+
+@contextmanager
+def build_options(con: Any, module: Any):
+    """Scope measured module-specific planner choices to its rebuild statements.
+
+    SET LOCAL cannot leak through the connection pool after rollback. Restore on
+    success too, so subsequent modules and the caller's outer transaction retain
+    their own settings. On an SQL error, the rebuild must roll back before issuing
+    more SQL; trying to restore inside the aborted transaction masks the failure.
+    """
+    previous = {}
+    for key, value in getattr(module, "BUILD_SETTINGS", {}).items():
+        previous[key] = con.execute("SELECT current_setting(?)", [key]).fetchone()[0]
+        con.execute("SELECT set_config(?, ?, true)", [key, value])
+    try:
+        yield
+    except BaseException:
+        raise
+    else:
+        for key, value in previous.items():
+            con.execute("SELECT set_config(?, ?, true)", [key, value])
 
 
 def retire(con: Any, schema: str, module: Any) -> None:
@@ -325,23 +380,32 @@ def retire(con: Any, schema: str, module: Any) -> None:
     copy that could not be dropped is wasted space and nothing worse. It cannot
     accumulate -- the next full rebuild drops whichever side it builds into.
     """
-    stale = _inactive(con, schema, module)
+    con.execute("BEGIN")
     try:
-        con.execute("SET lock_timeout = '5s'")
+        con.execute("SELECT set_config('lock_timeout', ?, true)",
+                    [f"{RETIRE_LOCK_TIMEOUT_MS}ms"])
+        lock_rebuild(con, schema)
+        if active_table(con, schema, module) is None:
+            raise RuntimeError(f"Cannot retire {module.TABLE}: no published side exists")
+        stale = _inactive(con, schema, module)
+        derived_partitions.drop_detached(con, schema, stale)
         con.execute(f'DROP TABLE IF EXISTS "{schema}".{stale}')
-    except Exception as exc:  # noqa: BLE001 - space, not correctness
-        log.info("derived: %s is still being read and was left in place (%s); "
-                 "the next full rebuild will reclaim it", stale, str(exc)[:120])
-    finally:
-        try:
-            con.execute("RESET lock_timeout")
-        except Exception:  # noqa: BLE001
-            log.debug("derived: could not reset lock_timeout", exc_info=True)
+        derived_partitions.forget(con, schema, stale)
+        con.execute("COMMIT")
+    except LockNotAvailable:
+        con.execute("ROLLBACK")
+        log.info("derived: cleanup of %s deferred because a reader or rebuild holds "
+                 "a lock; the next full rebuild will reclaim it", module.TABLE)
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
 
 
 
 def rebuild(con: Any, schema: str, modules: Sequence[Any], source: str,
-            window: tuple[dt.date, dt.date] | None = None) -> dict[str, int]:
+            window: tuple[dt.date, dt.date] | None = None, *,
+            cleanup: bool = True,
+            windows: Sequence[tuple[dt.date, dt.date]] | None = None) -> dict[str, int]:
     """Rebuild every derived table in `modules` from `source`, in one transaction.
 
     A rebuild rather than an incremental merge. These tables are derived data whose
@@ -363,31 +427,74 @@ def rebuild(con: Any, schema: str, modules: Sequence[Any], source: str,
     and because the window is snapped to month boundaries it prunes to the matching
     `costs_fact` partitions instead of reading the rest of the year to discard it.
 
-    Every table is staged before any is published, so that the exclusive locks the
-    swaps need are taken together at the end rather than one being held across
-    another table's build. One transaction, so the tables can never describe
-    different generations of the source, and readers see all the old contents or
-    all the new.
+    Every table is staged, indexed and analysed before any is published. Callers
+    mapping COMMIT to a savepoint must pass cleanup=False and retire the old sides
+    only after their outer transaction actually commits.
+
+    `windows` replaces several disjoint periods atomically, without touching the
+    intervening history. It is mutually exclusive with `window`.
+
+    A module may name SOURCE_TABLE from an earlier module and expand repair
+    periods through build_windows. Dependencies are prepared before use, but no
+    view is published until every module is complete.
     """
+    from .jobs import merge_windows
+
+    if windows is not None and (window is not None or not windows):
+        raise ValueError("Supply either one window or a non-empty list of windows")
+    ranges = list(windows) if windows is not None else [window]
+    full = ranges == [None]
+    if not full:
+        ranges = merge_windows(ranges)
+    plans = []
+    seen = set()
+    effective_ranges = {}
+    for module in modules:
+        if module.TABLE in seen:
+            raise ValueError(f"Duplicate derived table: {module.TABLE}")
+        dependency = getattr(module, "SOURCE_TABLE", None)
+        if dependency is not None and dependency not in seen:
+            raise ValueError(f"{module.TABLE} requires {dependency} to be built first")
+        source_ranges = effective_ranges[dependency] if dependency else ranges
+        periods = source_ranges
+        if not full and (expand := getattr(module, "build_windows", None)) is not None:
+            periods = merge_windows(expand(tuple(source_ranges)))
+            if any(not any(start <= lo and stop >= hi for start, stop in periods)
+                   for lo, hi in source_ranges):
+                raise ValueError(f"{module.TABLE} rebuild periods do not cover the source changes")
+        plans.append((module, dependency, periods))
+        seen.add(module.TABLE)
+        effective_ranges[module.TABLE] = periods
     t0 = time.monotonic()
     con.execute("BEGIN")
     try:
-        staged = [(module, stage(con, schema, module, source, window))
-                  for module in modules]
-        counts = {module.TABLE: publish(con, schema, module, name)
-                  for module, name in staged}
+        lock_rebuild(con, schema)
+        staged = []
+        built = {}
+        counts = {}
+        for module, dependency, periods in plans:
+            module_source = f'"{schema}".{built[dependency]}' if dependency else source
+            with build_options(con, module):
+                for period in periods:
+                    name = stage(con, schema, module, module_source, period)
+            counts[module.TABLE] = prepare(con, schema, module, name)
+            staged.append((module, name))
+            built[module.TABLE] = name
+        if full:
+            for module, name in staged:
+                publish(con, schema, module, name)
         con.execute("COMMIT")
-    except Exception:
+    except BaseException:
         con.execute("ROLLBACK")
         raise
 
     # After the commit, never inside it: dropping the retired copy waits for
     # readers that are still on it, and the swap's locks must not be held for that.
-    if window is None:
+    if cleanup and full:
         for module in modules:
             retire(con, schema, module)
 
-    scope = "full" if window is None else f"{window[0]}..{window[1]}"
+    scope = "full" if full else ", ".join(f"{lo}..{hi}" for lo, hi in ranges)
     for table, rows in counts.items():
         log.info("%s: %s rows (%s)", table, f"{rows:,}", scope)
     log.info("derived: %s rebuilt in %.1fs (%s)",

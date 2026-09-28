@@ -111,31 +111,42 @@ function toLogin() {
 }
 
 /** fetch with a timeout, so a stalled request can't wedge the UI. */
-export async function get(url, { timeout = 20000, signal, ...opts } = {}) {
+let cacheWarmer = null;
+
+export async function get(url, { timeout = 20000, signal, cacheWarming = false, ...opts } = {}) {
+  const warmingKey = cacheWarming ? null : cacheWarmer?.begin(url, opts);
   const ac = new AbortController();
   const abort = () => ac.abort(signal?.reason);
   if (signal?.aborted) abort();
   else signal?.addEventListener("abort", abort, { once: true });
-  const timer = setTimeout(() => ac.abort(), timeout);
+  const timer = setTimeout(() => ac.abort(new DOMException(
+    "The request timed out. Please retry.", "TimeoutError")), timeout);
   try {
     const r = await fetch(url, { ...opts, signal: ac.signal });
     // An expired session shouldn't look like a broken app: bounce to the login page instead
     // of painting every tile with an error.
     if (r.status === 401) {
-      toLogin();
-      throw new Error("Signed out");
+      cacheWarmer?.stop();
+      if (!cacheWarming) toLogin();
+      throw Object.assign(new Error("Signed out"), { status: 401 });
     }
     if (r.status === 403) {
       const body = await r.json().catch(() => ({}));
       const err = new Error(body.detail || "You don't have access to that.");
       err.forbidden = true;
+      err.status = 403;
+      cacheWarmer?.stop();
       throw err;
     }
     if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-    return recordSnapshot(await r.json(), url, r.headers, opts.method || "GET");
+    const data = await r.json();
+    if (cacheWarming) return r;
+    cacheWarmer?.observe(warmingKey, r);
+    return recordSnapshot(data, url, r.headers, opts.method || "GET");
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener("abort", abort);
+    cacheWarmer?.end(warmingKey);
   }
 }
 
@@ -483,7 +494,24 @@ function describeScope(all, label) {
  */
 let identityPromise = null;
 export function whoAmI() {
-  identityPromise = identityPromise || get("/api/auth/me", { timeout: 30000 });
+  identityPromise = identityPromise || get("/api/auth/me", { timeout: 30000 }).then(async me => {
+    if (me.required && me.authenticated && me.features?.snapshot_warming === true) {
+      try {
+        const { createCacheWarmer } = await import("./cache-warming.js");
+        cacheWarmer = createCacheWarmer({
+          origin: location.origin,
+          request: (url, options) => get(url, { ...options, cacheWarming: true }),
+        });
+        cacheWarmer.configure(true);
+      } catch {
+        console.warn("CloudLens cache warming could not be enabled.");
+      }
+    } else cacheWarmer?.stop();
+    return me;
+  }).catch(error => {
+    identityPromise = null;
+    throw error;
+  });
   return identityPromise;
 }
 
@@ -1276,6 +1304,7 @@ function wire() {
 
   wireAccount();
   $("signout").onclick = async () => {
+    cacheWarmer?.stop();
     // Clear the remembered scope too: the next person at this browser shouldn't inherit
     // a filter they never chose.
     try {

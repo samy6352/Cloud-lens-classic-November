@@ -7,6 +7,8 @@ async (page, { stylesheetUrl, assetOrigin } = {}) => {
   });
   const test = await context.newPage();
   const errors = [];
+  let releaseOpportunities;
+  const opportunitiesGate = new Promise(resolve => { releaseOpportunities = resolve; });
   test.on("pageerror", error => errors.push(error.message));
   const statement = {
     period: { month: "2026-08", label: "August 2026 — UI test fixture", previous_month: "2026-07", days: 31 },
@@ -25,14 +27,14 @@ async (page, { stylesheetUrl, assetOrigin } = {}) => {
     definitions: [], warnings: ["Synthetic UI fixture, not customer billing data."], per_currency: [], fx: { complete: true },
   };
   try {
-    if (assetOrigin) {
-      await context.route("**/assets/**", async route => {
-        const path = route.request().url().split("/assets/")[1];
-        const response = await page.request.get(`${assetOrigin}/assets/${path}`);
-        if (!response.ok()) throw new Error(`Missing local billing asset: ${path}`);
-        await route.fulfill({ response });
-      });
-    }
+    // A running preview freezes its versioned bundle. Exercise current disk assets without
+    // restarting that server or modifying its immutable URLs for other browser contexts.
+    await context.route("**/assets/**", async route => {
+      const path = route.request().url().split("/assets/")[1].replace(/^v\/[a-f0-9]{64}\//, "");
+      const response = await page.request.get(`${assetOrigin || origin}/assets/${path}`);
+      if (!response.ok()) throw new Error(`Missing local billing asset: ${path}`);
+      await route.fulfill({ response });
+    });
     if (stylesheetUrl) {
       const response = await page.request.get(stylesheetUrl);
       if (!response.ok()) throw new Error("Requested billing stylesheet is unavailable.");
@@ -41,14 +43,25 @@ async (page, { stylesheetUrl, assetOrigin } = {}) => {
     }
     await context.route("**/api/dashboard/billing?**", route => route.fulfill({ json: statement }));
     await context.route("**/api/dashboard/billing", route => route.fulfill({ json: statement }));
-    await context.route("**/api/dashboard/billing/opportunities**", route => route.fulfill({
-      json: { status: "ok", opportunities: [], potential: { monthly: 15, annual: 180, currency: "USD" },
-        commitments: { items: [], unavailable: [] }, warnings: [] },
+    await context.route("**/api/dashboard/sections**", route => route.fulfill({
+      json: { total: 100, currency: "USD", sections: [] },
     }));
+    await context.route("**/api/dashboard/executive**", route => route.fulfill({
+      json: { empty: true },
+    }));
+    await context.route("**/api/filters**", route => route.fulfill({ json: { dimensions: {} } }));
+    await context.route("**/api/dashboard/billing/opportunities**", async route => {
+      await opportunitiesGate;
+      await route.fulfill({
+        json: { status: "ok", opportunities: [], potential: { monthly: 15, annual: 180, currency: "USD" },
+          commitments: { items: [], unavailable: [] }, warnings: [] },
+      });
+    });
     await test.goto(origin);
     await test.waitForFunction(() => document.documentElement.dataset.dashboardReady === "true");
     await test.evaluate(() => window.dispatchEvent(new CustomEvent("cl:goto-tab", { detail: "billing" })));
-    await test.waitForFunction(() => !document.querySelector("#billRefresh")?.disabled
+    await test.waitForFunction(() => document.documentElement.dataset.dashboardReady === "true"
+      && !document.querySelector("#billRefresh")?.disabled
       && document.querySelector("#billPeriod")?.textContent.includes("UI test fixture"));
     for (const id of ["billSavingsChart", "billMomChart"]) {
       await test.locator(`#${id}`).scrollIntoViewIfNeeded();
@@ -63,6 +76,11 @@ async (page, { stylesheetUrl, assetOrigin } = {}) => {
       return { id, type: chart.config.type, values: chart.data.datasets[0].data,
         unclipped: canvas.getBoundingClientRect().bottom <= canvas.closest(".card").getBoundingClientRect().bottom + 1 };
     }));
+    if (!(await test.locator("#billOpportunities").textContent()).includes("sources load")
+      || !await test.locator('[data-bill-breakdown="services"]').isEnabled()) {
+      throw new Error("The statement must be interactive while optional savings sources are unresolved.");
+    }
+    releaseOpportunities();
     const chartSizes = async () => {
       await test.waitForFunction(() => [...document.querySelectorAll(".bill-chart-grid > .card")]
         .every(card => card.querySelector("canvas").getBoundingClientRect().bottom <= card.getBoundingClientRect().bottom + 1),
@@ -135,8 +153,12 @@ async (page, { stylesheetUrl, assetOrigin } = {}) => {
       || row.columns !== (row.width > 1400 ? 6 : row.width > 900 ? 3 : row.width > 360 ? 2 : 1)) || errors.length) {
       throw new Error(JSON.stringify({ charts, narrow, errors }));
     }
-    return { charts, collapsed, expanded, closed, narrow, searchTotals: true, currencyIsolation: true, errors };
+    return { charts, collapsed, expanded, closed, narrow, searchTotals: true, currencyIsolation: true,
+      statementReadyBeforeOpportunities: true, errors };
+  } catch (error) {
+    throw new Error(`${error.stack}\nBrowser errors: ${errors.join("; ")}\nReadiness: ${await test.evaluate(() => document.documentElement.dataset.dashboardReady)}\nBody: ${(await test.locator("#tabBody").innerText()).slice(0, 1000)}`);
   } finally {
+    releaseOpportunities();
     await context.close();
   }
 }

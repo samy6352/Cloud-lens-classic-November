@@ -135,6 +135,9 @@ class PostgresConnection:
         self._conn = conn
         self._owner = owner
         self._closed = False
+        self.bill_stored = False
+        self.bill_serving: str | None = None
+        self.presence_stored = False
 
     def execute(self, sql: str, params: Any = None) -> _Cursor:
         return _Cursor(self._conn.cursor()).execute(sql, params)

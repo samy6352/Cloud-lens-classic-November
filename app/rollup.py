@@ -44,7 +44,7 @@ import logging
 from collections.abc import Iterable
 from typing import Any
 
-from . import derived
+from . import derived, environment
 
 log = logging.getLogger("cloudlens.rollup")
 
@@ -80,6 +80,8 @@ DIMENSIONS = [
     "ChargeCategory",
     "PricingModel",
 ]
+if environment.ENABLED:
+    DIMENSIONS.append(environment.COLUMN)
 
 # The date column the rollup is windowed and retained by. Named off DIMENSIONS
 # rather than repeated as a literal so the two cannot drift apart.
@@ -109,7 +111,7 @@ def _validate() -> None:
     """
     from .warehouse import COLUMNS, NUMERIC
 
-    unknown = [c for c in DIMENSIONS + MEASURES if c not in COLUMNS]
+    unknown = [c for c in environment.source_columns(DIMENSIONS + MEASURES) if c not in COLUMNS]
     if unknown:
         raise RuntimeError(
             f"rollup names columns the warehouse does not have: {', '.join(unknown)}")
@@ -136,9 +138,8 @@ def covers(group_by: list[str], measures: list[str]) -> bool:
 
 
 # The filter-bar dimensions the rollup can narrow itself by, worked out from the grain
-# rather than listed again -- so adding a column above cannot leave this behind. `env`
-# names the `Tags` document, which no grain carries, so a connection filtering on it
-# still has to answer from the detail table.
+# rather than listed again -- so adding a column above cannot leave this behind.
+# Environment is a computed dimension carried only when its opt-in gate is enabled.
 FILTERABLE = derived.filterable(DIMENSIONS)
 
 
@@ -188,9 +189,11 @@ def table_sql(schema: str, table: str = TABLE) -> str:
     """
     _validate()
     cols = ",\n  ".join(
-        [f'"{d}" {"date" if d == "ChargePeriodStart" else "text"}' for d in DIMENSIONS]
+        [f'"{d}" {"date" if d == "ChargePeriodStart" else "text"}'
+         for d in DIMENSIONS if d != environment.COLUMN]
         + [f'"{m}" double precision' for m in MEASURES]
         + ["charges bigint"]
+        + ([f'"{environment.COLUMN}" text'] if environment.ENABLED else [])
     )
     return f'CREATE TABLE IF NOT EXISTS "{schema}".{table} (\n  {cols}\n)'
 
@@ -218,16 +221,20 @@ def select_sql(source: str, window: tuple[dt.date, dt.date] | None = None) -> st
     Public, and named to match `presence.select_sql`, because `derived` drives both
     modules through the same three functions.
     """
-    dims = ", ".join(f'"{d}"' for d in DIMENSIONS)
+    if environment.ENABLED:
+        source = environment.project(source, DIMENSIONS + MEASURES)
+    dims = ", ".join(f'"{d}"' for d in DIMENSIONS if d != environment.COLUMN)
     sums = ", ".join(f'sum("{m}") AS "{m}"' for m in MEASURES)
     where = ""
     if window is not None:
         lo, hi = window
         where = (f" WHERE \"{PERIOD}\" >= DATE '{lo.isoformat()}'"
                  f" AND \"{PERIOD}\" < DATE '{hi.isoformat()}'")
-    return (f"SELECT {dims}, {sums}, count(*) AS charges "
+    env = f', "{environment.COLUMN}"' if environment.ENABLED else ""
+    groups = ", ".join(f'"{d}"' for d in DIMENSIONS)
+    return (f"SELECT {dims}, {sums}, count(*) AS charges{env} "
             f"FROM {source}{where} "
-            f"GROUP BY {', '.join(str(i + 1) for i in range(len(DIMENSIONS)))}")
+            f"GROUP BY {groups}")
 
 
 def month_start(day: dt.date) -> dt.date:

@@ -33,7 +33,17 @@ from typing import Any, ClassVar
 
 import httpx
 
-from . import billing_rollup, derived, presence, rollup, schema_v2, store
+from . import (
+    billing_rollup,
+    billing_serving,
+    derived,
+    environment,
+    fx_rollup,
+    presence,
+    rollup,
+    schema_v2,
+    store,
+)
 from .sqldialect import SHIM_SCHEMA, strip_literals
 
 log = logging.getLogger("cloudlens.warehouse")
@@ -42,7 +52,9 @@ log = logging.getLogger("cloudlens.warehouse")
 # rebuild, the boot-time `ensure`, the column check, and the generation stamp's
 # roster together -- the four had drifted apart once, and a table that was rebuilt
 # by none of them but trusted by the reader served an empty relation as truth.
-DERIVED_MODULES = (rollup, presence, billing_rollup)
+DERIVED_MODULES = (rollup, presence, billing_rollup, billing_serving)
+if fx_rollup.ENABLED:
+    DERIVED_MODULES += (fx_rollup,)
 
 ARM = "https://management.azure.com"
 DETAILS_API = "2023-11-01"
@@ -438,7 +450,9 @@ class Reader:
     """
 
     def __init__(self, con: Any, aggregate: str = "costs", counted: str = "costs",
-                 named: str = "costs", billing: str = "costs") -> None:
+                 named: str = "costs", billing: str = "costs", *,
+                 bill_stored: bool = False, bill_serving: str | None = None,
+                 bill_indexed: bool = False, res_ordered: bool = False) -> None:
         self._con = con
         self.agg = aggregate
         self.res = counted
@@ -448,6 +462,10 @@ class Reader:
         # detail table there is no temp view to fall back to, so this carries the
         # equivalent computation over `costs` as a parenthesised subquery instead.
         self.bill = billing
+        self.bill_stored = bill_stored
+        self.bill_serving = bill_serving
+        self.bill_indexed = bill_indexed
+        self.res_ordered = res_ordered
 
     @property
     def aggregated(self) -> bool:
@@ -551,7 +569,8 @@ class Warehouse:
 
     # ------------------------------------------------------------------ rollup
     def refresh_rollup(self, *, strict: bool = False,
-                       window: tuple[Any, Any] | None = None) -> int:
+                       window: tuple[date, date] | None = None,
+                       incremental: bool = False) -> int:
         """Rebuild the pre-aggregated table the dashboard reads.
 
         Called after every write. It is derived from the rows that were just written, so
@@ -565,45 +584,56 @@ class Warehouse:
         for certain, because days outside it keep whatever the previous rebuild produced.
         Callers that cannot state that omit it and rebuild the lot, which is always correct.
 
-        A window is *ignored* if the last rebuild did not succeed. That is the one way a
-        narrow rebuild can go permanently wrong: a failed rebuild leaves days stale, and
-        every later windowed rebuild would step over them rather than correct them, so the
-        staleness would never age out. After a failure the next rebuild is full, whatever
-        the caller asks for, and the flag is only cleared once one has succeeded.
+        Pending windows are durable and accumulate with source writes. A restart or a
+        failed rebuild retains every affected period; a later request cannot hide an
+        earlier correction. Unknown coverage or a changed layout requires a full rebuild.
+        Explicit synchronous maintenance records its request before starting; asynchronous
+        ingestion uses incremental=True to recover the persisted work even without a window.
 
         Source writes are frozen while derived data is rebuilt. Failed rebuilds retain the
         previous ready generation; ingest callers raise so recovery cannot publish stale
         aggregates as current. Synchronous maintenance retains its non-raising default.
         """
-        if window is not None and getattr(self, "_rollup_full_required", True):
-            log.info("warehouse: rebuilding the whole rollup rather than %s..%s, "
-                     "because the last rebuild did not complete", window[0], window[1])
-            window = None
         try:
             from . import derived, jobs
-            with jobs.coherent_rollup(
-                    self, [module.TABLE for module in DERIVED_MODULES]) as con:
+            if not incremental:
+                jobs.request_rollup(self, window)
+            tables = [module.TABLE for module in DERIVED_MODULES]
+            with jobs.coherent_rollup(self, tables) as con:
+                derived.lock_rebuild(con, self._rollup_schema)
+                self._ensure_derived(con, self._rollup_schema)
                 # Every table in one call, so their contents describe the same
                 # generation of `costs` and the generation stamp `coherent_rollup`
                 # writes covers all of them or none -- and so the exclusive locks their
                 # swaps need are taken together at the end, rather than one being
                 # held for the duration of the other's build.
-                counts = derived.rebuild(jobs.RollupTransaction(con), self._rollup_schema,
-                                         DERIVED_MODULES,
-                                         self._pg_table, window)
-            self._rollup_full_required = False
-            return counts[rollup.TABLE]
+                pending = jobs.rebuild_windows(con, tables, window)
+                transaction = jobs.RollupTransaction(con)
+                if pending is None:
+                    counts = derived.rebuild(transaction, self._rollup_schema,
+                                            DERIVED_MODULES, self._pg_table, cleanup=False)
+                elif pending:
+                    counts = derived.rebuild(
+                        transaction, self._rollup_schema, DERIVED_MODULES, self._pg_table,
+                        pending[0] if len(pending) == 1 else None, cleanup=False,
+                        **({"windows": pending} if len(pending) > 1 else {}))
+                else:
+                    counts = {rollup.TABLE: 0}
         except Exception as exc:  # noqa: BLE001
-            self._rollup_full_required = True
             log.warning("warehouse: could not rebuild the rollup (%s); "
                         "the previous ready generation is retained", exc)
             if strict:
                 raise
             return 0
+        if pending is None:
+            with self.connect() as con:
+                for module in DERIVED_MODULES:
+                    derived.retire(con, self._rollup_schema, module)
+        return counts[rollup.TABLE]
 
     async def refresh_rollup_async(self, window: tuple[Any, Any] | None = None) -> None:
         """`refresh_rollup` off the event loop — it aggregates the whole detail table."""
-        await asyncio.to_thread(self.refresh_rollup, strict=True, window=window)
+        await asyncio.to_thread(self.refresh_rollup, strict=True, window=window, incremental=True)
 
     # ------------------------------------------------------------------ schema
     def _columns_sql(self, rate: float | None, target: str) -> str:
@@ -637,7 +667,8 @@ class Warehouse:
         return ", ".join(parts)
 
     @staticmethod
-    def _currency_sql(rate: float, target: str) -> tuple[str, str]:
+    def _currency_sql(rate: float, target: str, *,
+                      legacy_ratio: str | None = None) -> tuple[str, str]:
         """Row-aware factors shared by selected cost and the independent billing money.
 
         Provider exchange rates take priority over current display FX. CostInUsd can be
@@ -666,15 +697,13 @@ class Warehouse:
         exchange = '"ExchangeRatePricingToBilling"'
         billed_fallback = current_factor("BillingCurrency")
         priced_fallback = current_factor("PricingCurrency")
+        legacy_ratio = legacy_ratio or f"({fx_rollup.LEGACY_RATIO})"
         billing_factor = (
             f"CASE WHEN {billing} = '{target}' THEN 1.0 "
             f"WHEN {billing} = 'USD' THEN {rate} "
             f"WHEN {exchange} > 0 AND {pricing} = '{target}' THEN 1.0 / {exchange} "
             f"WHEN {exchange} > 0 AND {pricing} = 'USD' THEN {rate} / {exchange} "
-            'WHEN ("BillingCostBasis" IN (\'ActualCost\', \'AmortizedCost\') '
-            'OR "BillingCostBasis" IS NULL) '
-            'AND "BilledCost" <> 0 AND "CostInUsd" / NULLIF("BilledCost", 0) > 0 '
-            f'THEN "CostInUsd" / NULLIF("BilledCost", 0) * {rate} '
+            f"WHEN {legacy_ratio} > 0 THEN {legacy_ratio} * {rate} "
             f"WHEN {exchange} > 0 AND ({priced_fallback}) IS NOT NULL "
             f"THEN ({priced_fallback}) / {exchange} "
             f"ELSE {billed_fallback} END"
@@ -735,11 +764,7 @@ class Warehouse:
                 # make one malformed document break every filtered query.
                 rows += [("env", v.lower()) for v in picked]
                 clauses.append(
-                    "lower(COALESCE("
-                    "TRY_CAST(\"Tags\" AS JSON) #>> '{env}', "
-                    "TRY_CAST(\"Tags\" AS JSON) #>> '{Env}', "
-                    "TRY_CAST(\"Tags\" AS JSON) #>> '{environment}', "
-                    "TRY_CAST(\"Tags\" AS JSON) #>> '{Environment}', '')) "
+                    f"{environment.RAW_SQL} "
                     "IN (SELECT val FROM _filter WHERE dim = 'env')"
                 )
                 continue
@@ -856,12 +881,24 @@ class Warehouse:
         if period_filter:
             where = f"{where} AND {period_filter}" if where else f"WHERE {period_filter}"
 
+        fx_source = None
         if rate is not None:
-            billing_factor, _ = self._currency_sql(rate, target)
-            missing = f'({billing_factor}) IS NULL AND "BilledCost" <> 0'
-            check_where = f"{where} AND ({missing})" if where else f"WHERE {missing}"
+            if (fx_rollup.ENABLED and fx_rollup.serves_filters(filters)
+                    and self._rollup_fresh(con, fx_rollup.TABLE)):
+                fx_source = (
+                    f'(SELECT * FROM "{self._rollup_schema}".{fx_rollup.TABLE} '
+                    f'{environment.stored_where(where)}) AS native_fx')
+            billing_factor, _ = self._currency_sql(
+                rate, target, legacy_ratio=f'"{fx_rollup.RATIO}"' if fx_source else None)
+            # Nonzero row count, not the net sum: cancelling unknown charges must
+            # still fail rather than disguise missing exchange-rate authority.
+            nonzero = (f'"{fx_rollup.NONZERO}" > 0' if fx_source else '"BilledCost" <> 0')
+            missing = f'({billing_factor}) IS NULL AND {nonzero}'
+            check_where = (f"WHERE {missing}" if fx_source else
+                           f"{where} AND ({missing})" if where else f"WHERE {missing}")
             unknown = con.execute(
-                f'SELECT DISTINCT "BillingCurrency" FROM {self._pg_table} {check_where} LIMIT 1'
+                f'SELECT DISTINCT "BillingCurrency" FROM '
+                f'{fx_source or self._pg_table} {check_where} LIMIT 1'
             ).fetchone()
             if unknown:
                 raise ValueError(
@@ -870,13 +907,14 @@ class Warehouse:
                     "or configure FX rates; no partial total will be reported."
                 )
         con.execute(f"CREATE TEMP VIEW costs AS SELECT {select} FROM {self._pg_table} {where}")
-        self._shadow_rollup(con, where, rate, filters)
-        self._shadow_presence(con, where, rate, target, filters)
-        self._shadow_billing_rollup(con, where, rate, filters)
+        self._shadow_rollup(con, where, rate, filters, target=target, fx_source=fx_source)
+        con.presence_stored = self._shadow_presence(con, where, rate, target, filters)
+        con.bill_stored = self._shadow_billing_rollup(con, where, rate, filters)
+        con.bill_serving = self._shadow_billing_serving(con, where, rate, filters)
         return con
 
     def _shadow_billing_rollup(self, con: Any, where: str, rate: float | None,
-                               filters: dict[str, list[str]] | None) -> None:
+                               filters: dict[str, list[str]] | None) -> bool:
         """Give this connection a `billing_rollup` carrying the same scope as `costs`.
 
         The same argument as `_shadow_rollup` and `_shadow_presence`: the table holds
@@ -897,17 +935,28 @@ class Warehouse:
         """
         if (billing_rollup.serves_filters(filters) and rate is None
                 and self._rollup_fresh(con, billing_rollup.TABLE)):
+            where = environment.stored_where(where)
             con.execute(f'CREATE TEMP VIEW {billing_rollup.TABLE} AS SELECT * '
                         f'FROM "{self._rollup_schema}".{billing_rollup.TABLE} {where}')
-            return
+            return True
         # A filter on `env`, a converted currency, or a rollup that has not caught up
         # with the detail table. Compute the same grain from `costs`, which is scoped
         # and filtered already -- correct, and as slow as it was before this existed.
         con.execute(f"CREATE TEMP VIEW {billing_rollup.TABLE} AS "
                     f"{billing_rollup.select_sql('costs')}")
+        return False
+
+    def _shadow_billing_serving(self, con: Any, where: str, rate: float | None,
+                                filters: dict[str, list[str]] | None) -> str | None:
+        if (rate is None and billing_serving.serves_filters(filters)
+                and self._rollup_fresh(con, billing_serving.TABLE)):
+            con.execute(f'CREATE TEMP VIEW {billing_serving.TABLE} AS SELECT * '
+                        f'FROM "{self._rollup_schema}".{billing_serving.TABLE} {where}')
+            return billing_serving.TABLE
+        return None
 
     def _shadow_presence(self, con: Any, where: str, rate: float | None, target: str,
-                         filters: dict[str, list[str]] | None) -> None:
+                         filters: dict[str, list[str]] | None) -> bool:
         """Give this connection a `resource_presence` carrying the same scope as `costs`.
 
         The same argument as `_shadow_rollup`: the table is not scope-filtered, so a
@@ -929,20 +978,23 @@ class Warehouse:
         that is silently in the wrong currency.
         """
         if presence.serves_filters(filters) and self._rollup_fresh(con, presence.TABLE):
+            where = environment.stored_where(where)
             money_ok = presence.serves_money(rate)
             columns = ", ".join(
                 [f"'{target}' AS \"BillingCurrency\""
                  if name == "BillingCurrency" and rate is not None else f'"{name}"'
-                 for name in presence.DIMENSIONS]
+                 for name in presence.DIMENSIONS if name != environment.COLUMN]
                 + [f'"{m}"' if money_ok else f'CAST(NULL AS double precision) AS "{m}"'
-                   for m in presence.MEASURES])
+                  for m in presence.MEASURES]
+                + ([f'"{environment.COLUMN}"'] if environment.ENABLED else []))
             con.execute(f'CREATE TEMP VIEW {presence.TABLE} AS SELECT {columns} '
                         f'FROM "{self._rollup_schema}".{presence.TABLE} {where}')
-            return
+            return True
         # A filter on `charge`, `pricing` or `env` names something outside the grain,
         # so the counts have to come from the detail table the filter can be applied to.
         con.execute(f"CREATE TEMP VIEW {presence.TABLE} AS "
                     f"{presence.select_sql('costs')}")
+        return False
 
     def _rollup_fresh(self, con: Any, table: str | None = None) -> bool:
         """Whether `table` was rebuilt from the generation `costs` is now at.
@@ -970,7 +1022,8 @@ class Warehouse:
             return False
 
     def _shadow_rollup(self, con: Any, where: str, rate: float | None,
-                       filters: dict[str, list[str]] | None) -> None:
+                       filters: dict[str, list[str]] | None, *,
+                       target: str = "", fx_source: str | None = None) -> None:
         """Give this connection a `costs_rollup` carrying the same scope as `costs`.
 
         The rollup table is not scope-filtered -- an unqualified `SELECT * FROM
@@ -990,8 +1043,14 @@ class Warehouse:
         rollup's grain. `serves_filters` is what guarantees that, and it is derived
         from the grain rather than written out, so the two cannot drift.
         """
+        if fx_source is not None and rate is not None:
+            factor, _ = self._currency_sql(rate, target, legacy_ratio=f'"{fx_rollup.RATIO}"')
+            con.execute(f"CREATE TEMP VIEW {rollup.TABLE} AS "
+                        f"{fx_rollup.converted_sql(fx_source, factor, target)}")
+            return
         if (rate is None and rollup.serves_filters(filters)
                 and self._rollup_fresh(con, rollup.TABLE)):
+            where = environment.stored_where(where)
             con.execute(f'CREATE TEMP VIEW {rollup.TABLE} AS SELECT * '
                         f'FROM "{self._rollup_schema}".{rollup.TABLE} {where}')
             return
@@ -1039,7 +1098,21 @@ class Warehouse:
                     [budget_ms])
             aggregate, counted, named, billing = self._derived_sources(
                 con, scope, currency, filters)
-            yield Reader(con, aggregate, counted, named, billing)
+            from . import read_indexes
+
+            indexable = {billing_rollup.TABLE} if con.bill_stored else set()
+            # The identity index covers date/currency/region, not scoped filter
+            # dimensions. Keep the existing plans for those narrower workloads.
+            if con.presence_stored and not scope and not filters:
+                indexable.add(presence.TABLE)
+            with read_indexes.certified(
+                    con, self._rollup_schema, indexable,
+                    [module.TABLE for module in DERIVED_MODULES]) as indexed:
+                yield Reader(
+                    con, aggregate, counted, named, billing,
+                    bill_stored=con.bill_stored, bill_serving=con.bill_serving,
+                    bill_indexed=billing_rollup.TABLE in indexed,
+                    res_ordered=presence.TABLE in indexed)
         finally:
             con.close()
 
@@ -1110,6 +1183,9 @@ class Warehouse:
         if shadowed:
             aggregate, counted = rollup.TABLE, presence.TABLE
         else:
+            con.bill_stored = billing_rollup.TABLE in fresh
+            con.presence_stored = presence.TABLE in fresh
+            con.bill_serving = billing_serving.TABLE if billing_serving.TABLE in fresh else None
             if not fresh:
                 log.debug("warehouse: derived tables are behind the detail table; reading costs")
             aggregate = rollup.TABLE if rollup.TABLE in fresh else "costs"
@@ -1147,6 +1223,9 @@ class Warehouse:
             rollup.TABLE: (*rollup.DIMENSIONS, *rollup.MEASURES, "charges"),
             presence.TABLE: (*presence.DIMENSIONS, *presence.MEASURES),
             billing_rollup.TABLE: (*billing_rollup.DIMENSIONS, *billing_rollup.MEASURES),
+            billing_serving.TABLE: (*billing_serving.DIMENSIONS, *billing_serving.MEASURES),
+            **({fx_rollup.TABLE: (*fx_rollup.DIMENSIONS, *fx_rollup.MEASURES)}
+               if fx_rollup.ENABLED else {}),
             "ingest_log": ("subscription_id", "subscription_name", "period", "rows",
                            "ingested_at", "status", "detail"),
             "meta": ("key", "value", "updated_at"),
@@ -1237,15 +1316,37 @@ class Warehouse:
 
             self._merge_subscription_spellings(con)
             self._create_indexes(con)
-            self._drop_outdated_derived(con, schema)
             # The published names are views over one of two sides; `ensure` creates
             # or upgrades that arrangement. See `derived` for why the indirection
             # exists -- in short, it is what lets a rebuild swap the contents while
             # a dashboard is holding a scoped view of them.
-            for module in DERIVED_MODULES:
-                derived.ensure(con, schema, module)
+            from . import jobs
+
+            con.execute("BEGIN")
+            try:
+                jobs.lock_generation(con)
+                derived.lock_rebuild(con, schema)
+                self._ensure_derived(con, schema)
+                con.execute("COMMIT")
+            except BaseException:
+                con.execute("ROLLBACK")
+                raise
             self._rollup_schema = schema
             self._ensure_query_role(con)
+
+    def _ensure_derived(self, con: Any, schema: str) -> None:
+        """Called under generation/rebuild locks, with invalidation atomic with DDL."""
+        from . import jobs
+
+        self._drop_outdated_derived(con, schema)
+        for module in DERIVED_MODULES:
+            if derived.ensure(con, schema, module):
+                jobs.invalidate_rollup(con)
+            try:
+                derived.validate_storage(con, schema, module)
+            except derived.RebuildRequired as exc:
+                log.warning("warehouse: invalidating derived readiness: %s", exc)
+                jobs.invalidate_rollup(con)
 
     def _drop_outdated_derived(self, con: Any, schema: str) -> None:
         """Drop a derived table whose columns no longer match the grain that defines it.
@@ -1266,7 +1367,7 @@ class Warehouse:
         name is a view over the side being dropped, and dropping it is the point here
         rather than something to be preserved.
         """
-        from . import derived
+        from . import derived, jobs
 
         for module in DERIVED_MODULES:
             expected = set(module.DIMENSIONS) | set(getattr(module, "MEASURES", []))
@@ -1277,7 +1378,25 @@ class Warehouse:
                 "SELECT column_name FROM information_schema.columns "
                 "WHERE table_schema = ? AND table_name = ?",
                 [schema, active]).fetchall()}
+            if environment.COLUMN in found and not environment.ENABLED:
+                raise RuntimeError(
+                    "Environment summaries are already migrated. Set CLOUDLENS_ENV_ROLLUP=true; "
+                    "disabling this gate requires an explicit versioned schema rollback, "
+                    "not dropping active financial summaries."
+                )
+            if (environment.ENABLED and environment.COLUMN in expected
+                    and found == expected - {environment.COLUMN}):
+                # Append after every existing measure: CREATE OR REPLACE VIEW may
+                # append columns but must never reorder the published positions.
+                jobs.invalidate_rollup(con)
+                con.execute(f'ALTER TABLE "{schema}".{active} '
+                            f'ADD COLUMN "{environment.COLUMN}" text')
+                if active != module.TABLE:
+                    con.execute(f'CREATE OR REPLACE VIEW "{schema}".{module.TABLE} AS '
+                                f'SELECT * FROM "{schema}".{active}')
+                continue
             if found and found != expected:
+                jobs.invalidate_rollup(con)
                 log.info("warehouse: rebuilding %s; its columns no longer match the grain "
                          "(missing %s, extra %s)", module.TABLE,
                          sorted(expected - found) or "none", sorted(found - expected) or "none")
@@ -1920,7 +2039,8 @@ class Warehouse:
                     # neighbouring column. Naming them costs nothing and removes the coupling.
                     insert_rows(con, retained)
                     if retained or removed:
-                        jobs.advance_generation(con)
+                        jobs.advance_generation(
+                            con, (date.fromisoformat(start), date.fromisoformat(end) + timedelta(days=1)))
                     con.execute("COMMIT")
                     return len(retained), len(protected)
                 except Exception:

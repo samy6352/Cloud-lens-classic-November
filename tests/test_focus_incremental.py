@@ -506,34 +506,51 @@ def _mark_derived_current(memory):
     import looks like one retrying after an interrupted rebuild -- which is the
     case the skip must *not* apply to.
     """
-    memory.db.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES "
-        "('data_rollup_generation', (SELECT value FROM meta WHERE key='data_generation'))")
+    from app import jobs
+
+    with jobs.coherent_rollup(memory, ["costs_rollup", "resource_presence", "billing_rollup"]):
+        pass
 
 
-def test_the_rebuild_is_narrowed_to_the_months_a_change_landed_in(monkeypatch, memory):
-    """A windowed rebuild scans the months that changed, not all retained history.
+def _dirty_windows(memory):
+    from app import jobs
 
-    The cost of a full rebuild is one scan of every month ever ingested, so under a
-    daily FOCUS sync it grows with retention while the change stays one day wide.
-    """
+    return jobs.dirty_windows(memory.db, *jobs._generation_pair(memory.db))
+
+
+def test_the_rebuild_records_only_the_day_a_change_landed_in(monkeypatch, memory):
     ingest(monkeypatch, report([charge("2026-08-01"), charge("2026-08-02", 4)]))
-    assert memory.rollup_windows == [(date(2026, 8, 1), date(2026, 9, 1))]
+    assert memory.rollup_windows == [None]
+    assert _dirty_windows(memory) is None  # No published baseline yet.
+    _mark_derived_current(memory)
 
     memory.rollup_windows.clear()
     result, _ = ingest(monkeypatch, report(
         [charge("2026-08-01"), charge("2026-08-02", 99)], run="restated"))
-    # One day moved, so one month is rebuilt -- not the two days' worth of months.
     assert result["changed_days"] == 1
-    assert memory.rollup_windows == [(date(2026, 8, 1), date(2026, 9, 1))]
+    assert _dirty_windows(memory) == [(date(2026, 8, 2), date(2026, 8, 3))]
+    assert memory.rollup_windows == [None]  # Read the complete durable ledger.
 
 
-def test_a_change_spanning_two_months_rebuilds_both_of_them(monkeypatch, memory):
-    """The window is snapped outwards to whole months, so it can never exclude a changed day."""
+def test_disjoint_changes_preserve_gaps_in_the_dirty_ledger(monkeypatch, memory):
     blobs = report([charge("2026-07-30"), charge("2026-08-02", 4)],
                    start="2026-07-01", end="2026-08-31")
     ingest(monkeypatch, blobs)
-    assert memory.rollup_windows == [(date(2026, 7, 1), date(2026, 9, 1))]
+    _mark_derived_current(memory)
+    result, _ = ingest(monkeypatch, report(
+        [charge("2026-07-30", 9), charge("2026-07-31"), charge("2026-08-02", 99)],
+        run="restated", start="2026-07-01", end="2026-08-31"))
+    assert result["changed_days"] == 3
+    assert _dirty_windows(memory) == [
+        (date(2026, 7, 30), date(2026, 8, 1)), (date(2026, 8, 2), date(2026, 8, 3))]
+
+
+def test_deletion_to_zero_records_the_deleted_day(monkeypatch, memory):
+    ingest(monkeypatch, report([charge(), charge("2026-08-02", 4)]))
+    _mark_derived_current(memory)
+    result, _ = ingest(monkeypatch, report([charge()], run="deleted"))
+    assert result["deleted_rows"] == 1 and result["changed_days"] == 1
+    assert _dirty_windows(memory) == [(date(2026, 8, 2), date(2026, 8, 3))]
 
 
 def test_an_import_that_changed_nothing_leaves_current_derived_tables_alone(monkeypatch, memory):

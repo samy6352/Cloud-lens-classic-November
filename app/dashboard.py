@@ -384,15 +384,18 @@ class Dashboard:
                 + f" FROM {agg} WHERE {window} GROUP BY 1",
                 None)
 
-            # Resources counted by hashing a distinct subquery rather than with
-            # `count(DISTINCT)`, which sorts: at two million identities the sort spills
-            # to disk and costs 9s where the hash costs 6.8s. The other three are taken
-            # from the rollup, which preserves every distinct dimension combination and
-            # is sixty thousand rows rather than three million -- 118ms against 9s.
+            # A certified covering identity index can stream exact distinct keys
+            # instead of spilling a multi-million-entry hash. Keep NULL identities
+            # (SELECT DISTINCT counts them), native currency separation, and the
+            # existing unordered plan for scoped/computed/unindexed sources.
+            identity_order = (' ORDER BY "ResourceId", "BillingCurrency"'
+                              if getattr(r, "res_ordered", False) else "")
+            region_order = (' ORDER BY "ResourceId", "RegionName", "BillingCurrency"'
+                            if getattr(r, "res_ordered", False) else "")
             counts = r.rows(
                 'WITH seen AS (SELECT "BillingCurrency" AS currency, count(*) AS resources '
                 'FROM (SELECT DISTINCT "BillingCurrency", "ResourceId" '
-                f'FROM {res} WHERE {period}) x GROUP BY 1), '
+                f'FROM {res} WHERE {period}{identity_order}) x GROUP BY 1), '
                 'dims AS (SELECT "BillingCurrency" AS currency, '
                 'count(DISTINCT "ServiceName") AS services, '
                 'count(DISTINCT "SubAccountId") AS subscriptions, '
@@ -458,7 +461,7 @@ class Dashboard:
                 'seen AS (SELECT coalesce("RegionName", \'—\') AS name, '
                 '"BillingCurrency" AS currency, count(*) AS resources '
                 'FROM (SELECT DISTINCT "RegionName", "BillingCurrency", "ResourceId" '
-                f'FROM {res} WHERE {period}) x GROUP BY 1, 2) '
+                f'FROM {res} WHERE {period}{region_order}) x GROUP BY 1, 2) '
                 'SELECT money.name, money.currency, money.cost, money.prior, '
                 'coalesce(seen.resources, 0) AS resources FROM money LEFT JOIN seen '
                 'ON seen.name = money.name '

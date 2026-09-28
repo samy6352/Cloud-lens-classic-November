@@ -627,12 +627,20 @@ async def _prepare_snapshot_generation(warehouse: Any, state: Any) -> None:
                 await asyncio.sleep(5 * (attempt + 1))
 
 
+def snapshot_warming_enabled() -> bool:
+    value = os.getenv("SNAPSHOT_WARMING_ENABLED", "false").strip().lower()
+    if value not in {"true", "false", "1", "0"}:
+        raise ValueError("SNAPSHOT_WARMING_ENABLED must be true, false, 1, or 0.")
+    return value in {"true", "1"}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     global _agent, _ingest_task, _overview, _snapshot_cache
     app.state.readiness = None
     app.state.snapshot_bootstrap_ready = False
     app.state.snapshot_bootstrap_error = None
+    snapshot_warming_enabled()
     if not os.getenv("PROJECT_ENDPOINT"):
         raise RuntimeError("PROJECT_ENDPOINT is not set. See README.md.")
     from . import azure_updates, backfill, currency, onboarding, service_health
@@ -1080,9 +1088,7 @@ async def authorize_snapshot(request: Request) -> CacheContext:
         credential = request.cookies.get(COOKIE) or request.headers.get("authorization", "")
         policy["session_partition"] = hashlib.sha256(credential.encode()).hexdigest()
     target = request.query_params.get("currency", "").strip().upper()
-    conversion: dict[str, Any] = {"pinned": os.getenv("FX_RATES", ""), "target": target}
-    if target not in {"", "BILLED"}:
-        conversion["rates"] = {code: currency.describe(code) for code in currency.OFFERED}
+    conversion = currency.cache_identity(target)
     data_day = ""
     period_version = request.query_params.get("period_month") or datetime.now(UTC).date().isoformat()
     if request.url.path == "/api/dashboard/ai-billing":
@@ -1124,13 +1130,9 @@ FILTER_KEYS = ("rg", "service", "region", "charge", "pricing", "env")
 # holding something that is not JSON. `try_cast_json` is the warehouse's own shim for exactly
 # that: it returns NULL where a cast would fail, so one malformed tag document cannot take the
 # whole filter bar down with it.
-ENV_TAG = (
-    "COALESCE("
-    "TRY_CAST(\"Tags\" AS JSON) #>> '{env}', "
-    "TRY_CAST(\"Tags\" AS JSON) #>> '{Env}', "
-    "TRY_CAST(\"Tags\" AS JSON) #>> '{environment}', "
-    "TRY_CAST(\"Tags\" AS JSON) #>> '{Environment}')"
-)
+from . import environment  # noqa: E402
+
+ENV_TAG = environment.tag_sql()
 
 # How long the filter bar may hold a database connection before giving up.
 #
@@ -1425,6 +1427,8 @@ async def me(request: Request) -> JSONResponse:
         "mode": auth.mode,
         "local": auth.mode == "local" or auth.allow_local,
         "user": user.public() if user else None,
+        "features": {"snapshot_warming": bool(
+            auth.enabled and user is not None and snapshot_warming_enabled())},
     }
     # A personal Microsoft account cannot use the multi-tenant endpoints for an ARM scope, so
     # the page has to offer them a tenant sign-in instead of letting them bounce off a message
@@ -1549,11 +1553,20 @@ async def subscriptions(request: Request) -> JSONResponse:
     # be the one doing the work.
     awaiting_setup = onboarding.settled() is None and not await offload(warehouse.has_rows)
 
+    # Read once, off the event loop, and hand the same answer to both callers below. It used to
+    # be read inside each of them, synchronously, which put two full warehouse scans on the loop
+    # for every picker request — the picker never got faster on a second load because nothing
+    # about it was cached, and while it ran no other request could be served at all.
+    have: set[str] | None = None
+    if not awaiting_setup and not read_only_mode():
+        have = await offload(backfill.present)
+
     if os.getenv("USER_BACKFILL", "true").lower() != "false" and not awaiting_setup:
         try:
             async with as_user(user):
                 if not read_only_mode():
-                    backfill.schedule(mine, months=int(os.getenv("INGEST_MONTHS", "3")))
+                    backfill.schedule(mine, months=int(os.getenv("INGEST_MONTHS", "3")),
+                                      have=have)
         except HTTPException:
             # An expired Azure session must not fail the picker; the page still renders from
             # what the warehouse already holds.
@@ -1565,7 +1578,8 @@ async def subscriptions(request: Request) -> JSONResponse:
                          # already, and a second banner repeating it under different words
                          # reads as two different problems.
                          "backfill": ({"pending": [], "failed": [], "loading": False}
-                                      if awaiting_setup else backfill.status_for(mine))})
+                                      if awaiting_setup
+                                      else backfill.status_for(mine, have=have))})
 
 
 @app.get("/api/health")
@@ -2233,7 +2247,11 @@ async def onboarding_state(request: Request) -> JSONResponse:
         # not a reason for it to fail to load.
         allowed = []
 
-    rows = await offload(warehouse.row_count)
+    # Only ever compared against zero, so ask whether *a* row exists rather than counting
+    # 5.8M of them. `row_count` measured 1.6-1.8s here against ~1ms for EXISTS, and this
+    # endpoint is polled while a scan runs — it was the whole of its ~2.6s, on every call,
+    # and it never cached because there is nothing here to cache.
+    rows = None if await offload(warehouse.has_rows) else 0
 
     # How many subscriptions they can actually see, asked of Azure rather than of the
     # warehouse. On a first run the warehouse is empty *by definition*, so counting its
@@ -4871,17 +4889,18 @@ async def filter_values(request: Request, days: int = 30, scope: str = "",
                 log.info("filter values: %s not available in time (%s)",
                          ", ".join(key for key, _ in rollup_dims), str(exc)[:120])
 
-        # `env` is not a column. It is read out of the `Tags` document per row, which on the
-        # real estate costs about 161s of the 171s the combined query used to need -- so the
-        # one dimension nobody was waiting for was making the other five unavailable too.
-        # Asked last, on its own connection and its own tighter bound, so that its failure
-        # costs only itself.
+        # Fresh environment-aware summaries avoid raw JSON entirely. Keep the raw
+        # fallback independently bounded for deployments not yet migrated and FX.
         try:
             with warehouse.reader(picked or None, currency=currency or None,
                                   budget_ms=FILTER_ENV_BUDGET_MS) as r:
+                stored = (environment.ENABLED and not currency and r.agg == "costs_rollup"
+                          and warehouse._rollup_fresh(r._con, "costs_rollup"))
+                env_sql = '"Environment"' if stored else environment.RAW_SQL
+                source = r.agg if stored else "costs"
                 absorb(r.rows(ranked(
-                    f'SELECT lower({ENV_TAG}) AS env, "BilledCost" AS cost, '
-                    f'"BillingCurrency" AS currency FROM costs '
+                    f'SELECT {env_sql} AS env, "BilledCost" AS cost, '
+                    f'"BillingCurrency" AS currency FROM {source} '
                     f'WHERE "ChargePeriodStart" > {since}',
                     "SELECT 'env' AS d, min(env) AS v, currency, sum(cost) AS c FROM recent "
                     "WHERE env IS NOT NULL AND env <> '' GROUP BY env, currency",

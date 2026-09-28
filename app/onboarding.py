@@ -99,12 +99,18 @@ def progress() -> dict[str, Any]:
     }
 
 
-def state(rows: int, is_admin: bool, subscriptions: int,
+def state(rows: int | None, is_admin: bool, subscriptions: int,
           ingesting: bool = False) -> dict[str, Any]:
     """Whether to offer first-run setup, and if not, why not.
 
     Takes the row count rather than reading it, because every caller has already asked the
     warehouse something and this should not cost a second connection.
+
+    `rows` may be `None`, meaning "the warehouse is not empty, and nobody counted how much".
+    The only question asked of this number is whether it is zero, and `warehouse.has_rows`
+    settles that from a single row where `row_count` scans all 5.8M of them. `None` is used
+    rather than a placeholder integer so the published figure is never a wrong number --
+    it is either the true count or an explicit absence.
 
     `ingesting` matters more than it looks. A fresh deployment starts its own ingest on boot
     (AUTO_INGEST), which takes minutes and holds zero rows for most of them — so testing rows

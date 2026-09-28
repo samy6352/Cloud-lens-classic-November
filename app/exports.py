@@ -713,10 +713,8 @@ def _reconcile_staged(con: Any, staged: Any,
     return {
         "incremental": True,
         "changed_days": len(changed),
-        # The days themselves, not merely how many there were. The derived tables are
-        # rebuilt only for the months an import actually touched, and a count cannot
-        # say which months those are. Deduplicated across subscriptions because the
-        # rebuild window is a span of charge dates, not a per-subscription thing.
+        # Include deleted-to-zero days; derived repair covers charge dates across
+        # subscriptions, not merely the dates still present in the incoming rows.
         "changed_dates": sorted({day for _, day in changed}),
         "unchanged_days": len(unchanged),
         "inserted_rows": inserted,
@@ -742,36 +740,18 @@ def _derived_is_current() -> bool:
         return jobs.rollup_current(con)
 
 
-def _rebuild_window(changes: dict[str, Any]) -> tuple[date, date] | None:
-    """The whole-month span to rebuild the derived tables over, or None for all of it.
+def _rebuild_windows(changes: dict[str, Any]) -> list[tuple[date, date]] | None:
+    """Exact changed days, preserving gaps; uncertain coverage requires a full rebuild."""
+    from .jobs import merge_windows
 
-    A full rebuild costs one scan of every retained month. That was acceptable when
-    the data was loaded once; under the customer's daily FOCUS sync it is the same
-    scan of a year of history repeated every day to correct one day's rows, so the
-    cost of staying fresh grows with retention while the change stays constant.
-
-    `_reconcile_focus` already knows exactly which days it replaced, so the rebuild
-    can be narrowed to the months those fall in -- and because `month_window` snaps
-    outwards to month boundaries, that prunes to the matching `costs` partitions.
-
-    None means "rebuild everything", and is returned for anything this cannot state
-    with certainty: a non-incremental import, which deletes and reloads whole
-    windows rather than reconciling days, and an unparseable date. Returning a
-    narrow window on uncertain input is the one way this can leave a quietly stale
-    dashboard, so it declines the optimisation instead of guessing. `refresh_rollup`
-    independently ignores any window when the previous rebuild did not complete.
-    """
-    from .rollup import month_window
-
-    if not changes.get("incremental"):
+    values = changes.get("changed_dates")
+    if not changes.get("incremental") or not isinstance(values, (list, tuple, set)) or not values:
         return None
-    days = []
-    for value in changes.get("changed_dates") or []:
-        try:
-            days.append(date.fromisoformat(str(value)[:10]))
-        except (TypeError, ValueError):
-            return None
-    return month_window(days)
+    try:
+        days = [value if type(value) is date else date.fromisoformat(value) for value in values]
+        return merge_windows([(day, day + timedelta(days=1)) for day in days])
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 async def describe_export(account: str | None = None, container: str | None = None,
@@ -1344,7 +1324,7 @@ async def ingest_export(
                     if not incremental:
                         staged.publish()
                     if changes.get("changed_days") or (not incremental and total_rows):
-                        jobs.advance_generation(con)
+                        jobs.advance_generation(con, windows=_rebuild_windows(changes))
                         changes["generation"] = int(con.execute(
                             "SELECT value FROM meta WHERE key=?", [jobs.GENERATION_KEY]).fetchone()[0])
                     con.execute(
@@ -1407,7 +1387,7 @@ async def ingest_export(
         # found the tables current does no work here at all.
         await jobs.phase("warming-cache")
         if not await asyncio.to_thread(_derived_is_current):
-            await warehouse.refresh_rollup_async(_rebuild_window(changes))
+            await warehouse.refresh_rollup_async()
         if changes.get("changed_days"):
             from . import jobs
             await jobs.publish_generation(sorted(subs), windows, generation=changes["generation"],

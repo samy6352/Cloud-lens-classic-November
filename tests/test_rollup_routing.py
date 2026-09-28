@@ -80,6 +80,81 @@ def test_a_plain_reader_is_pointed_at_the_rollup(loaded):
         assert r.aggregated
 
 
+@pytest.mark.parametrize("options", [
+    {}, {"scope": [str(uuid.UUID(int=2))]}, {"filters": {"service": ["Storage"]}},
+])
+def test_reader_certifies_actual_stored_billing_source(loaded, options):
+    with loaded.reader(**options) as reader:
+        assert reader.bill_stored is True
+
+
+def test_named_billing_view_does_not_imply_stored_measures(loaded):
+    from app import billing_rollup, jobs
+
+    with loaded.reader(filters={"env": ["prod"]}) as reader:
+        assert reader.bill == billing_rollup.TABLE
+        assert reader.bill_stored is False
+    with loaded.connect() as con:
+        con.execute("UPDATE meta SET value='99' WHERE key=?", [jobs.GENERATION_KEY])
+    for scope in (None, [str(uuid.UUID(int=2))]):
+        with loaded.reader(scope=scope) as reader:
+            assert reader.bill_stored is False
+
+
+def test_stored_capability_keeps_the_branch_chosen_when_the_shadow_was_created(loaded, monkeypatch):
+    monkeypatch.setattr(loaded, "_rollup_fresh", lambda con, table=None: False)
+    with loaded.reader(scope=[str(uuid.UUID(int=2))]) as reader:
+        assert reader.bill == "billing_rollup"
+        assert reader.bill_stored is False
+
+
+def test_manually_constructed_reader_does_not_claim_stored_billing(loaded):
+    from app.warehouse import Reader
+
+    with loaded.connect() as con:
+        assert Reader(con, billing="billing_rollup").bill_stored is False
+
+
+def test_compact_billing_is_fresh_and_scoped_by_the_actual_reader(loaded):
+    sub = str(uuid.UUID(int=2))
+    with loaded.reader(scope=[sub]) as reader:
+        assert reader.bill_serving == "billing_serving"
+        rows = reader.rows(f'SELECT DISTINCT "SubAccountId" FROM {reader.bill_serving}')
+        assert rows == [{"SubAccountId": sub}]
+    with loaded.reader() as reader:
+        assert reader.bill_serving == "billing_serving"
+        assert len(reader.rows(
+            f'SELECT DISTINCT "SubAccountId" FROM {reader.bill_serving}')) > 1
+
+
+@pytest.mark.parametrize("options", [
+    {"filters": {"service": ["Storage"]}},
+    {"filters": {"env": ["prod"]}},
+    {"currency": "USD"},
+])
+def test_compact_billing_declines_unsupported_reader_transformations(loaded, options):
+    with loaded.reader(**options) as reader:
+        assert reader.bill_serving is None
+
+
+def test_compact_billing_cannot_inherit_a_stamp_that_did_not_build_it(loaded):
+    from app import jobs
+
+    with loaded.connect() as con:
+        con.execute("UPDATE meta SET value=? WHERE key=?",
+                    ["costs_rollup,resource_presence,billing_rollup", jobs.ROLLUP_TABLES_KEY])
+    for scope in (None, [str(uuid.UUID(int=2))]):
+        with loaded.reader(scope=scope) as reader:
+            assert reader.bill_serving is None
+            assert reader.bill_stored
+
+
+def test_compact_billing_keeps_the_actual_shadow_branch(loaded, monkeypatch):
+    monkeypatch.setattr(loaded, "_rollup_fresh", lambda con, table=None: False)
+    with loaded.reader(scope=[str(uuid.UUID(int=2))]) as reader:
+        assert reader.bill_serving is None
+
+
 def test_a_converted_currency_is_not_answered_from_the_rollup_table(loaded):
     """The grain has no PricingCurrency or exchange rate, so conversion must derive.
 
@@ -266,14 +341,13 @@ def test_a_full_rebuild_builds_the_declared_column_types(loaded):
                 "SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute "
                 "WHERE attrelid = ?::regclass AND attnum > 0 AND NOT attisdropped",
                 [f'"{schema}".{module.TABLE}']).fetchall())
-            declared = {name: "date" if name == module.PERIOD else "text"
-                        for name in module.DIMENSIONS}
-            declared.update(dict.fromkeys(getattr(module, "MEASURES", []),
-                                          "double precision"))
-            for column, want in declared.items():
-                assert built.get(column) == want, (
-                    f"{module.TABLE}.{column}: built {built.get(column)!r}, "
-                    f"declared {want!r}")
+            con.execute(module.table_sql(schema, "_declared_derived_types"))
+            declared = dict(con.execute(
+                "SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute "
+                "WHERE attrelid = ?::regclass AND attnum > 0 AND NOT attisdropped",
+                [f'"{schema}"._declared_derived_types']).fetchall())
+            assert built == declared, f"{module.TABLE}: built types differ from declared DDL"
+            con.execute(f'DROP TABLE "{schema}"._declared_derived_types')
 
 
 # ------------------------------------------------------------------- payloads

@@ -195,6 +195,8 @@ def cache_key(request: Request, context: CacheContext, version: str,
 
 def read_generation(con, scope: tuple[str, ...] | None = None) -> str:
     """Global committed-cost revision; scope still partitions each private cache key."""
+    from . import jobs
+
     versions = dict(con.execute("SELECT key,value FROM meta WHERE key IN (?,?)",
                                 [SOURCE_REVISION_KEY, ROLLUP_REVISION_KEY]).fetchall())
     source_value, ready_value = versions.get(SOURCE_REVISION_KEY), versions.get(ROLLUP_REVISION_KEY)
@@ -203,7 +205,9 @@ def read_generation(con, scope: tuple[str, ...] | None = None) -> str:
     # Outbox IDs/status/timestamps are notifications, not source revisions.
     # A crash after a coherent rebuild but before outbox promotion must not
     # strand the cache, nor may an older event finishing later roll it back.
-    return str(source) if source >= 0 and source == ready else f"pending:{source}:{ready}"
+    # Maintenance can be pending without changing raw costs. Use the same readiness
+    # gate as query routing, while retaining the numeric ready-header contract.
+    return str(source) if jobs._ready(con, source, ready) else f"pending:{source}:{ready}"
 
 
 def _source_pending(generation: str) -> bool:

@@ -343,6 +343,73 @@ def test_a_full_rebuild_retires_the_side_it_replaced(loaded):
                 f"{module.TABLE} should have exactly the published side, found {found & sides}")
 
 
+def test_every_table_is_prepared_before_any_view_is_published(loaded, monkeypatch):
+    from app import derived
+    from app.warehouse import DERIVED_MODULES
+
+    events = []
+    real_prepare, real_publish = derived.prepare, derived.publish
+
+    def prepare(con, schema, module, staged):
+        events.append(("prepare", module.TABLE))
+        return real_prepare(con, schema, module, staged)
+
+    def publish(con, schema, module, staged):
+        events.append(("publish", module.TABLE))
+        return real_publish(con, schema, module, staged)
+
+    monkeypatch.setattr(derived, "prepare", prepare)
+    monkeypatch.setattr(derived, "publish", publish)
+    loaded.refresh_rollup(strict=True)
+    assert events == ([("prepare", m.TABLE) for m in DERIVED_MODULES]
+                      + [("publish", m.TABLE) for m in DERIVED_MODULES])
+
+
+def test_retirement_runs_after_the_outer_publication_commit(loaded, monkeypatch):
+    from psycopg.pq import TransactionStatus
+
+    from app import derived, jobs
+    from app.warehouse import DERIVED_MODULES
+
+    calls = []
+    real_retire = derived.retire
+
+    def retire(con, schema, module):
+        assert con.raw.info.transaction_status == TransactionStatus.IDLE
+        with loaded.connect(read_only=True) as observer:
+            assert jobs.rollup_current(observer, module.TABLE)
+        calls.append(module.TABLE)
+        return real_retire(con, schema, module)
+
+    monkeypatch.setattr(derived, "retire", retire)
+    loaded.refresh_rollup(strict=True)
+    assert calls == [m.TABLE for m in DERIVED_MODULES]
+
+
+def test_a_locked_retired_heap_cannot_rollback_publication(loaded, monkeypatch):
+    from app import derived, jobs, rollup
+
+    monkeypatch.setattr(derived, "RETIRE_LOCK_TIMEOUT_MS", 50)
+    schema = loaded._rollup_schema
+    with loaded.connect() as reader:
+        old = derived.active_table(reader, schema, rollup)
+        reader.execute("BEGIN")
+        try:
+            reader.execute(f'SELECT * FROM "{schema}".{old} LIMIT 1')
+            loaded.refresh_rollup(strict=True)
+            with loaded.connect(read_only=True) as observer:
+                assert jobs.rollup_current(observer, rollup.TABLE)
+                assert derived.active_table(observer, schema, rollup) != old
+                assert observer.execute(
+                    "SELECT to_regclass(?)", [f"{schema}.{old}"]).fetchone()[0]
+        finally:
+            reader.execute("ROLLBACK")
+    with loaded.connect() as con:
+        derived.retire(con, schema, rollup)
+        assert con.execute(
+            "SELECT to_regclass(?)", [f"{schema}.{old}"]).fetchone()[0] is None
+
+
 def test_a_rebuild_succeeds_while_a_reader_holds_a_shadow_view(loaded):
     """The defect this indirection exists for.
 
@@ -593,9 +660,9 @@ def test_a_windowed_rebuild_is_ignored_after_a_failed_rebuild(loaded, monkeypatc
     calls: list[object] = []
     real = derived_module.rebuild
 
-    def spy(con, schema, modules, source, window=None):
+    def spy(con, schema, modules, source, window=None, **kwargs):
         calls.append(window)
-        return real(con, schema, modules, source, window)
+        return real(con, schema, modules, source, window, **kwargs)
 
     def boom(*_args, **_kwargs):
         raise RuntimeError("rebuild failed on purpose")

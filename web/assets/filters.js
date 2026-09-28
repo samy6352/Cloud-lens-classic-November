@@ -30,6 +30,7 @@ const DIMS = [
 ];
 
 let available = {};                                   // dimension -> [{value, cost}]
+let unavailableDimensions = [];
 let chosen = readStore("costFilters", {}) || {};      // dimension -> [value]
 let onChange = () => {};
 let currency = "";
@@ -109,14 +110,24 @@ export function wireFilters(handler, days, month = "") {
     if (!ready) return;
     // Scope changes also redraw the dashboard. Let that critical read finish before asking the
     // same database for secondary menu values.
-    window.addEventListener("cl:dashboard-ready", () => loadFilters(queuedDays), { once: true });
+    afterDashboard(() => loadFilters(queuedDays));
   });
   const start = () => {
     ready = true;
     loadFilters(queuedDays);
   };
-  if (document.documentElement.dataset.dashboardReady === "true") start();
-  else window.addEventListener("cl:dashboard-ready", start, { once: true });
+  if (["true", "error"].includes(document.documentElement.dataset.dashboardReady)) start();
+  else afterDashboard(start);
+}
+
+function afterDashboard(callback) {
+  const done = () => {
+    window.removeEventListener("cl:dashboard-ready", done);
+    window.removeEventListener("cl:dashboard-error", done);
+    callback();
+  };
+  window.addEventListener("cl:dashboard-ready", done, { once: true });
+  window.addEventListener("cl:dashboard-error", done, { once: true });
 }
 
 export async function loadFilters(days, month = queuedMonth) {
@@ -126,7 +137,8 @@ export async function loadFilters(days, month = queuedMonth) {
   const scope = scopeIds();
   const requestedCurrency = currency;
   const requestKey = `${queuedDays || ""}|${queuedMonth}|${scope.join(",")}|${requestedCurrency}`;
-  if (pendingRequest && pendingKey === requestKey) return pendingRequest;
+  // The owning call renders failures; duplicate callers must not leak the raw rejection.
+  if (pendingRequest && pendingKey === requestKey) return pendingRequest.catch(() => {});
   requestController?.abort();
   requestController = new AbortController();
   const controller = requestController;
@@ -145,12 +157,14 @@ export async function loadFilters(days, month = queuedMonth) {
     if (controller !== requestController) return;
     if (r.unavailable) throw new Error("Filter choices are unavailable.");
     available = r.dimensions || {};
+    unavailableDimensions = (r.unavailable_dimensions || []).filter(key => DIMS.some(dim => dim.key === key));
     availableCurrency = r.currency || "";
     filterError = "";
     const previous = filterQuery().join("&");
     // Anything selected that the estate no longer contains is dropped rather than kept.
     // A filter that cannot match is indistinguishable from a broken dashboard.
     for (const { key } of DIMS) {
+      if (unavailableDimensions.includes(key)) continue;
       const have = new Set((available[key] || []).map((o) => String(o.value).toLowerCase()));
       if (chosen[key]) {
         chosen[key] = chosen[key].filter((v) => have.has(String(v).toLowerCase()));
@@ -161,7 +175,7 @@ export async function loadFilters(days, month = queuedMonth) {
     render();
     if (previous !== filterQuery().join("&")) notifyChange(true);
   } catch (err) {
-    if (controller !== requestController || err?.name === "AbortError") return;
+    if (controller !== requestController || controller.signal.aborted) return;
     filterError = "Filter choices could not refresh. Existing selections still apply.";
     render();
   } finally {
@@ -181,7 +195,7 @@ function notifyChange(immediate = false) {
 function render() {
   const bar = $("filterBar");
   const usable = DIMS.filter(({ key }) => (available[key] || []).length > 1 || chosen[key]?.length);
-  if (!usable.length && !filterError) {
+  if (!usable.length && !filterError && !unavailableDimensions.length) {
     bar.hidden = true;
     return;
   }
@@ -190,8 +204,11 @@ function render() {
   $("fbClear").hidden = activeFilterCount() === 0;
   const status = $("fbStatus");
   if (status) {
-    status.innerHTML = filterError
-      ? `${esc(filterError)} <button type="button" class="linkish" id="fbRetry">Retry filters</button>` : "";
+    const unavailable = unavailableDimensions.map(key => DIMS.find(dim => dim.key === key).label);
+    const notice = filterError || (unavailable.length
+      ? `${unavailable.join(", ")} filter choices are temporarily unavailable, not necessarily empty. Other filters remain usable.${unavailableDimensions.some(key => chosen[key]?.length) ? " Existing selections still apply." : ""}` : "");
+    status.innerHTML = notice
+      ? `${esc(notice)} <button type="button" class="linkish" id="fbRetry">Retry filters</button>` : "";
     if ($("fbRetry")) $("fbRetry").onclick = () => loadFilters(queuedDays, queuedMonth);
   }
   wireSlots();

@@ -8,7 +8,7 @@ import json
 import logging
 from collections.abc import Sequence
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 from uuid import uuid4
 
@@ -20,6 +20,9 @@ LEASE_SECONDS = 300
 GENERATION_KEY = "data_generation"
 ROLLUP_GENERATION_KEY = "data_rollup_generation"
 ROLLUP_TABLES_KEY = "data_rollup_tables"
+ROLLUP_DIRTY_KEY = "data_rollup_dirty"
+ROLLUP_LAYOUT_KEY = "data_rollup_layout"
+ROLLUP_LAYOUT_VERSION = "1"
 # What a generation stamp written before `ROLLUP_TABLES_KEY` existed covered. A
 # stamp carries no roster of its own, and the two tables below are the only ones
 # that could have been rebuilt under it, so naming them here reads an old stamp
@@ -60,12 +63,36 @@ def lock_generation(con: Any) -> None:
     )
 
 
-def advance_generation(con: Any) -> None:
-    """Advance only with an actual cost write; transaction rollback also rolls this back."""
+def advance_generation(con: Any, window: tuple[date, date] | None = None, *,
+                       windows: Sequence[tuple[date, date]] | None = None) -> None:
+    """Record source-write coverage; omitted/unknown bounds require a full rebuild.
+
+    The caller holds the generation lock in its write transaction. Explicit windows
+    must cover a real change, so an empty collection cannot certify a new generation.
+    """
+    if window is not None and windows is not None:
+        raise ValueError("Specify window or windows, not both")
+    affected = windows if windows is not None else ([window] if window is not None else None)
+    if affected is not None:
+        try:
+            affected = list(affected)
+            if not affected or any(type(lo) is not date or type(hi) is not date
+                                   for lo, hi in affected):
+                raise ValueError("Rebuild windows require nonempty half-open date bounds")
+            affected = merge_windows(affected)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Rebuild windows require nonempty half-open date bounds") from exc
+    source, ready = _generation_pair(con)
+    pending = dirty_windows(con, source, ready)
+    if affected is None or pending is None:
+        pending = None
+    else:
+        pending = merge_windows([*pending, *affected])
     con.execute(
         "UPDATE meta SET value=CAST(CAST(value AS BIGINT)+1 AS TEXT),updated_at=now() WHERE key=?",
         [GENERATION_KEY],
     )
+    _write_dirty(con, source + 1, ready, pending)
 
 
 def read_generation() -> int:
@@ -82,10 +109,93 @@ def _generation_pair(con: Any) -> tuple[int, int]:
     return int(values.get(GENERATION_KEY, 0)), int(values.get(ROLLUP_GENERATION_KEY, -1))
 
 
+def merge_windows(windows: Sequence[tuple[date, date]]) -> list[tuple[date, date]]:
+    """Coalesce overlapping/adjacent ranges without filling gaps in unchanged history."""
+    merged: list[tuple[date, date]] = []
+    for lo, hi in sorted(windows):
+        if not isinstance(lo, date) or not isinstance(hi, date) or lo >= hi:
+            raise ValueError("Rebuild windows must have ordered, half-open date bounds")
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(hi, merged[-1][1]))
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
+def _write_dirty(con: Any, source: int, ready: int,
+                 windows: list[tuple[date, date]] | None) -> None:
+    _put(con, ROLLUP_DIRTY_KEY, {
+        "generation": source, "base_generation": ready,
+        "windows": None if windows is None else [
+            [lo.isoformat(), hi.isoformat()] for lo, hi in windows],
+    })
+
+
+def dirty_windows(con: Any, source: int, ready: int) -> list[tuple[date, date]] | None:
+    """None means unknown coverage; never infer a narrow repair from a stale ledger."""
+    state = _read(con, ROLLUP_DIRTY_KEY)
+    if state is None:
+        return [] if source == ready else None
+    if state.get("generation") != source or state.get("base_generation") != ready:
+        log.warning("derived: dirty-period ledger does not match source/ready generations; "
+                    "a full rebuild is required")
+        return None
+    windows = state.get("windows")
+    if windows is None:
+        return None
+    return merge_windows([(date.fromisoformat(lo), date.fromisoformat(hi))
+                          for lo, hi in windows])
+
+
+def request_rollup(warehouse: Any, window: tuple[date, date] | None) -> None:
+    """Persist an explicit maintenance request before its rebuild can fail."""
+    with warehouse.connect() as con:
+        con.execute("BEGIN")
+        try:
+            lock_generation(con)
+            source, ready = _generation_pair(con)
+            pending = dirty_windows(con, source, ready)
+            pending = (None if pending is None or window is None
+                       else merge_windows([*pending, window]))
+            _write_dirty(con, source, ready, pending)
+            con.execute("COMMIT")
+        except BaseException:
+            con.execute("ROLLBACK")
+            raise
+
+
+def rebuild_windows(con: Any, tables: Sequence[str],
+                    requested: tuple[date, date] | None = None) -> list[tuple[date, date]] | None:
+    """Resolve all pending periods while coherent_rollup holds the source lock."""
+    layout = con.execute("SELECT value FROM meta WHERE key=?", [ROLLUP_LAYOUT_KEY]).fetchone()
+    if not layout or layout[0] != ROLLUP_LAYOUT_VERSION or not set(tables) <= _stamped_tables(con):
+        return None
+    source, ready = _generation_pair(con)
+    pending = dirty_windows(con, source, ready)
+    if pending is None:
+        return None
+    return merge_windows([*pending, requested]) if requested is not None else pending
+
+
+def invalidate_rollup(con: Any) -> None:
+    """A recreated relation cannot inherit the previous relation's ready stamp."""
+    source, _ = _generation_pair(con)
+    con.execute(
+        "INSERT INTO meta(key,value,updated_at) VALUES (?, '-1', now()) "
+        "ON CONFLICT (key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+        [ROLLUP_GENERATION_KEY],
+    )
+    _write_dirty(con, source, -1, None)
+
+
+def _ready(con: Any, source: int, ready: int) -> bool:
+    return source >= 0 and source == ready and dirty_windows(con, source, ready) == []
+
+
 def snapshot_generation(con: Any, scope: list[str] | None = None) -> str:
     """Cache callback using its supplied connection; the revision is intentionally global."""
     source, ready = _generation_pair(con)
-    return f"data:{source}" if source >= 0 and source == ready else f"pending:{source}:{ready}"
+    return f"data:{source}" if _ready(con, source, ready) else f"pending:{source}:{ready}"
 
 
 def rollup_current(con: Any, table: str | None = None) -> bool:
@@ -107,7 +217,7 @@ def rollup_current(con: Any, table: str | None = None) -> bool:
     that only want to know whether derived data as a whole has caught up.
     """
     source, ready = _generation_pair(con)
-    if source != ready:
+    if not _ready(con, source, ready):
         return False
     return table is None or table in _stamped_tables(con)
 
@@ -128,7 +238,7 @@ def fresh_derived_tables(con: Any) -> frozenset[str]:
     table and paying for the same two `meta` reads three times over.
     """
     source, ready = _generation_pair(con)
-    if source != ready:
+    if not _ready(con, source, ready):
         return frozenset()
     return _stamped_tables(con)
 
@@ -138,7 +248,7 @@ def generation_ready(expected: int) -> bool:
 
     with warehouse.connect(read_only=True) as con:
         source, ready = _generation_pair(con)
-    return source == expected and ready == expected
+        return source == expected and _ready(con, source, ready)
 
 
 class RollupTransaction:
@@ -177,12 +287,14 @@ def coherent_rollup(warehouse: Any, tables: Sequence[str] | None = None):
             version = con.execute("SELECT value FROM meta WHERE key=?", [GENERATION_KEY]).fetchone()[0]
             yield con
             for key, value in ((ROLLUP_GENERATION_KEY, str(version)),
-                               (ROLLUP_TABLES_KEY, roster)):
+                               (ROLLUP_TABLES_KEY, roster),
+                               (ROLLUP_LAYOUT_KEY, ROLLUP_LAYOUT_VERSION)):
                 con.execute(
                     "INSERT INTO meta (key,value,updated_at) VALUES (?,?,now()) "
                     "ON CONFLICT (key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
                     [key, value],
                 )
+            _write_dirty(con, int(version), int(version), [])
             con.execute("COMMIT")
         except BaseException:
             con.execute("ROLLBACK")

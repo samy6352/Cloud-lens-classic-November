@@ -36,6 +36,11 @@ export function createTabs(ctx) {
   const list = value => Array.isArray(value) ? value : value ? [value] : [];
   const metric = name => statement?.kpis?.[name];
   const currency = () => statement?.currency || "";
+  const nativeSeparate = () => !new URLSearchParams(ctx.qs().slice(1)).get("currency")
+    && !statement?.currency && statement?.fx?.complete === false
+    && rowsOf(statement?.per_currency).length > 1
+    && rowsOf(statement?.per_currency).every(item => /^[A-Z]{3}$/.test(item.currency || ""));
+  const nativeNote = "As billed keeps native currencies separate. See per-currency totals below; no combined total or conversion is requested.";
   const basis = () => typeof statement?.spend_basis === "object" ? statement.spend_basis
     : { code: statement?.spend_basis };
   const spendMetric = () => ["billed_cost", "effective_cost", "recorded_cost"].includes(basis().metric)
@@ -50,6 +55,7 @@ export function createTabs(ctx) {
   };
   const priceNote = () => {
     const pricing = statement?.pricing;
+    if (nativeSeparate()) return nativeNote;
     if (statement?.fx?.complete === false) return "A complete display-currency conversion is unavailable. Review native-currency totals below; no mixed-currency total is inferred.";
     if (pricing?.status === "complete") return "Measured on comparable usage, after amortized commitment costs.";
     if (pricing?.status === "partial") return `${pricing.covered_rows ?? 0} of ${pricing.total_rows ?? "unknown"} usage rows have complete prices. Some savings metrics remain unavailable.`;
@@ -89,6 +95,7 @@ export function createTabs(ctx) {
       <strong class="bill-value${!finite(saved) ? " bill-unavailable" : saved < 0 ? " bill-negative" : ""}">${esc(!statement ? statementError ? "Unavailable" : "Loading..." : amount(saved, cur))}</strong>
       <p>Effective discount: <strong>${esc(percent(metric("effective_discount_pct")))}</strong></p>
       <span class="bill-answer-note">${esc(!statement ? statementError ? "Statement unavailable; see notice above." : "Awaiting price evidence."
+        : nativeSeparate() ? "As billed · native currencies shown separately."
         : statement.fx?.complete === false ? "FX incomplete; see native totals below."
         : statement.pricing?.status === "complete" ? "Net of amortized commitment costs"
         : statement.pricing?.status === "partial" ? "Partial pricing; see coverage above."
@@ -102,7 +109,7 @@ export function createTabs(ctx) {
       ${outlookLoading && outlook ? '<span class="bill-loading-note">Refreshing · previous estimates shown</span>' : ""}`);
     const button = $("billRefresh");
     if (button) {
-      button.disabled = statementLoading || outlookLoading;
+      button.disabled = statementLoading;
       button.textContent = button.disabled ? "Refreshing..." : "Refresh Billing";
     }
   }
@@ -112,11 +119,11 @@ export function createTabs(ctx) {
     const current = statement?.coverage?.current || {};
     setContent($("billPeriod"), `<div class="bill-period-meta"><strong>${esc(period.label || monthName(period.month) || "Last calendar month")}</strong>
       <span class="muted">${period.days ? `${esc(period.days)} calendar days` : "A complete calendar month"}${period.previous_month ? ` · compared with ${esc(monthName(period.previous_month))}` : ""}</span></div>
-      <button type="button" class="ghost" id="billRefresh"${statementLoading || outlookLoading ? " disabled" : ""}>Refresh Billing</button>`);
+      <button type="button" class="ghost" id="billRefresh"${statementLoading ? " disabled" : ""}>Refresh Billing</button>`);
     $("billRefresh").onclick = () => loadAll(ctx.loadToken, true);
     const warning = (statementError ? `${statementError}${statement ? " Last loaded statement shown." : ""}` : "") || (statement?.empty || current.rows === 0
       ? "No billing rows are loaded for this calendar month. This is not evidence of zero spend."
-      : statement?.pricing?.status !== "complete" && statement
+      : (statement?.pricing?.status !== "complete" || statement?.fx?.complete === false) && statement
         ? priceNote()
         : null);
     setContent($("billCoverage"), `${warning ? `<div class="bill-notice">${esc(warning)}
@@ -157,8 +164,8 @@ export function createTabs(ctx) {
         currency: cur || undefined, note: "Price benefits on comparable usage; unused commitment allocations reduce net savings." });
     } else {
       setContent($("billSavingsChart"), `<h3>Savings by source</h3><p class="bill-empty">
-        Pricing attribution unavailable. Refresh FOCUS data for list, contracted and effective costs.
-        Missing prices are not treated as savings.</p>`);
+        ${nativeSeparate() ? esc(nativeNote)
+          : "Pricing attribution unavailable. Refresh FOCUS data for list, contracted and effective costs. Missing prices are not treated as savings."}</p>`);
     }
     const labels = statement.trend?.labels || [statement.period?.previous_month, statement.period?.month];
     const values = statement.trend?.values || [mom.previous, mom.current];
@@ -286,7 +293,8 @@ export function createTabs(ctx) {
   }
 
   function paintNotes() {
-    const warnings = list(statement?.warnings);
+    const warnings = list(statement?.warnings).filter(warning => !nativeSeparate()
+      || warning !== "Native currencies could not all be converted. Aggregate money is unavailable; see per-currency totals.");
     const definitions = list(statement?.definitions);
     const coverage = statement?.coverage || {};
     const perCurrency = rowsOf(statement?.per_currency);
@@ -297,8 +305,9 @@ export function createTabs(ctx) {
       ${statement?.pricing?.status === "partial" && finite(statement.pricing.reconciled_totals?.actual_savings)
         ? `<p><strong>Fully priced subset:</strong> ${esc(amount(statement.pricing.reconciled_totals.actual_savings, currency()))} net savings on
           ${esc(statement.pricing.covered_rows)} of ${esc(statement.pricing.total_rows)} comparable usage rows. This is not a whole-month savings total.</p>` : ""}
-      ${statement?.fx?.note ? `<p class="bill-period-note">${esc(statement.fx.note)}</p>` : ""}
-      ${statement?.fx?.rates?.some(rate => rate.from !== rate.to) ? `<ul>${statement.fx.rates
+      ${nativeSeparate() ? `<p class="bill-period-note">${esc(nativeNote)}</p>`
+        : statement?.fx?.note ? `<p class="bill-period-note">${esc(statement.fx.note)}</p>` : ""}
+      ${!nativeSeparate() && statement?.fx?.rates?.some(rate => rate.from !== rate.to) ? `<ul>${statement.fx.rates
         .filter(rate => rate.from !== rate.to).map(rate => `<li>${esc(rate.from || "Unknown")} → ${esc(rate.to || "Unknown")}: ${finite(rate.rate) ? esc(rate.rate) : "rate unavailable"}
         ${rate.as_of ? ` · ${esc(dateLabel(rate.as_of))}` : ""}${rate.source ? ` · ${esc(rate.source)}` : ""}</li>`).join("")}</ul>` : ""}
       ${["current", "previous"].map(key => coverage[key] ? `<p class="bill-period-note"><strong>${key === "current" ? "Statement month" : "Previous month"}:</strong>
@@ -374,7 +383,15 @@ export function createTabs(ctx) {
     for (const controller of controllers) controller.abort();
     controllers = [];
     generation++;
-    return Promise.all([loadStatement(token), loadOutlook(token, refresh)]);
+    const required = loadStatement(token);
+    const version = generation;
+    void loadOutlook(token, refresh).catch(error => {
+      if (!active(token, version)) return;
+      outlookLoading = false;
+      outlookError = error?.message || "Could not load current savings opportunities.";
+      paintAnswers(); paintOutlook();
+    });
+    return required;
   }
 
   async function renderBilling(token) {

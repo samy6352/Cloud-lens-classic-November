@@ -177,8 +177,6 @@ const key = (name) => `${name}|${days}|${periodMonth}|${scopeIds().join(",")}|${
 
 const sectionsData = (signal) => watchSnapshot(cached(key("sections"), () =>
   snapshotViews.read(`/api/dashboard/sections${qs()}`, { timeout: 30000, signal })), key("sections"));
-const executiveData = (signal) => cached(key("executive"), () =>
-  get(`/api/dashboard/executive${qs()}`, { timeout: 30000, signal }));
 
 function setContent(root, html, options) {
   const started = performance.now();
@@ -279,6 +277,7 @@ async function loadTabs({ preserve = false } = {}) {
   const request = ++tabsRequest;
   tabsController?.abort();
   tabsController = new AbortController();
+  const controller = tabsController;
   const body = $("tabBody");
   if (renderedKey && renderedKey !== key(current)) {
     activeTabs?.stop?.();
@@ -296,37 +295,55 @@ async function loadTabs({ preserve = false } = {}) {
   periodControl?.refresh();
   let data, me;
   try {
-    // Start the opening view with the navigation request instead of after it. Both are local
-    // warehouse reads; removing the serial waterfall gets useful content on screen one round
-    // trip earlier without making any extra request.
-    if (current === "overview") void executiveData(tabsController.signal).catch(() => {});
-    // whoAmI() is memoised (one request shared by every caller), so asking here for the one
-    // thing this list needs from it -- is this an admin, so the Audit log entry below can
-    // decide whether it belongs on the rail at all -- costs nothing extra over what the header
-    // chip already asked for.
-    [data, me] = await Promise.all([
-      sectionsData(tabsController.signal),
-      whoAmI().catch(() => null),
-    ]);
+    me = await whoAmI();
+    if (request !== tabsRequest || controller.signal.aborted) return;
+    if (me?.required && !me.authenticated) return;
+    // The canonical destinations do not depend on cost data. Keep account-gated navigation
+    // usable while the optional cost-family picker and the selected view load independently.
+    updateSections(sectionSnapshot?.signature === key("") ? sectionSnapshot.data : {}, me,
+      { retainCurrent: true });
+    setSectionsNotice("");
+    const rendering = renderTab(preserve);
+    data = await sectionsData(controller.signal);
+    if (request !== tabsRequest || controller.signal.aborted) return;
+    sectionSnapshot = { signature: key(""), data };
+    const previous = current;
+    updateSections(data, me);
+    if (previous !== current) await renderTab();
+    else {
+      renderViewActions();
+      await rendering;
+    }
   } catch (err) {
-    if (err?.name === "AbortError" || request !== tabsRequest) return;
-    if (preserve && body.childElementCount) {
-      toast(err.forbidden ? err.message : "Could not refresh the cost breakdown.", "err");
-    } else {
-      $("tabs").innerHTML = "";
-      fail(err.forbidden ? err.message : "Could not load the cost breakdown.");
+    if (request !== tabsRequest || controller.signal.aborted) return;
+    if (!me) {
+      fail(err?.message || "Could not verify your account.");
+      reportReadiness(false, err?.message);
+      return;
     }
-    reportReadiness(false, err?.message);
-    return;
-  } finally {
-    if (request === tabsRequest && !data) {
-      body.classList.remove("refreshing");
-      body.removeAttribute("aria-busy");
-    }
+    setSectionsNotice(err.forbidden ? err.message
+      : `Cost breakdown navigation could not load. ${err?.message || "Please retry."}`);
   }
-  if (request !== tabsRequest) return;
-  sectionSnapshot = { signature: key(""), data };
+}
 
+function setSectionsNotice(message) {
+  let notice = $("sectionsNotice");
+  if (!notice) {
+    notice = document.createElement("div");
+    notice.id = "sectionsNotice";
+    $("tabBody").before(notice);
+  }
+  notice.hidden = !message;
+  notice.innerHTML = message ? `<div class="banner err" role="alert">${esc(message)}
+    <button type="button" class="ghost" id="sectionsRetry">Retry dashboard</button></div>` : "";
+  if ($("sectionsRetry")) $("sectionsRetry").onclick = () => {
+    clearCache();
+    void loadTabs({ preserve: true });
+  };
+}
+
+function updateSections(data, me, { retainCurrent = false } = {}) {
+  const previous = sections.find(section => section.id === current);
   sections = [
     { id: "overview", label: "Overview", cost: data.total, currency: data.currency,
       cost_by_currency: data.total_by_currency },
@@ -343,10 +360,6 @@ async function loadTabs({ preserve = false } = {}) {
       : []),
     { id: "uptime", label: "Hourly Billing", analysis: true },
     { id: "tags", label: "Cost by Application / Tags", analysis: true },
-    // The same billing data as every tab above, but at the grain a bill actually names: one
-    // row per resource rather than per tag or per hour. Warehouse-only like its neighbours in
-    // this group — no Resource Graph call — so "what is this VM, and what has it cost" is an
-    // instant answer rather than a live scan.
     { id: "resources", label: "All resources", analysis: true },
     { id: "anomalies", label: "Anomalies", analysis: true },
     { id: "history", label: "History", analysis: true },
@@ -354,17 +367,8 @@ async function loadTabs({ preserve = false } = {}) {
     { id: "azure-updates", label: "Azure Updates", live: true },
     { id: "changes", label: "Change Analysis", live: true },
     { id: "performance", label: "Performance vs Spend", live: true },
-    // One entry where there were six. Orphaned resources, Rightsizing, Shutdown savings, Rate
-    // optimization, Advisor and Commitments all answered "where can we spend less", and their
-    // totals shared resources — so the rail offered six doors into one room and no way to tell
-    // how much of what was behind them had been counted twice.
     { id: "savings", label: "Savings", live: true },
-    // Back out of that merge, deliberately and on its own. Everything under Savings is a
-    // cleanup: delete the disk, resize the VM, turn it off at night — decisions someone can
-    // take this afternoon and reverse tomorrow. A reservation is the opposite: nothing is
-    // removed, the same workload is re-priced, and the signature runs for three years. Folding
-    // it in made the same Advisor recommendation appear as a card, a table row and a share of
-    // the headline, and left a "recoverable" total a third of which needed a purchase order.
+    // Purchase commitments stay separate from reversible operational savings.
     { id: "commitments", label: "Reservation & Savings", live: true },
     { id: "governance", label: "Governance", live: true },
     { id: "esu", label: "End of support", live: true },
@@ -376,6 +380,8 @@ async function loadTabs({ preserve = false } = {}) {
     { id: "report", label: "Export data", build: true },
     { id: "settings", label: "Cost data", build: true },
   ];
+  // A cost family already open can finish its own request before its new menu values arrive.
+  if (retainCurrent && previous && !sections.some(section => section.id === current)) sections.push(previous);
 
   tabSearch?.update(sections, me?.user);
 
@@ -393,7 +399,6 @@ async function loadTabs({ preserve = false } = {}) {
   renderRail();
   wireRail();
 
-  await renderTab(preserve);
 }
 
 // --------------------------------------------------------------- the rail
@@ -866,7 +871,12 @@ function fail(message) {
     toast(message, "err");
     return;
   }
-  $("tabBody").innerHTML = `<div class="banner err">${esc(message)}</div>`;
+  $("tabBody").innerHTML = `<div class="banner err" role="alert">${esc(message)}
+    <button type="button" class="ghost" id="viewRetry">Retry view</button></div>`;
+  $("viewRetry").onclick = () => {
+    clearCache();
+    void loadTabs();
+  };
 }
 
 /**

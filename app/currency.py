@@ -170,6 +170,16 @@ def rate_to(target: str) -> float | None:
     return float(rate) if rate else None
 
 
+def cache_identity(target: str) -> dict[str, Any]:
+    """Every rate SQL conversion may consult, including non-picker currencies."""
+    target = (target or "").strip().upper()
+    identity: dict[str, Any] = {"pinned": os.getenv("FX_RATES", ""), "target": target}
+    if target not in {"", "BILLED"}:
+        codes = set(OFFERED) | set(_cache["rates"]) | set(_pinned()) | {target}
+        identity["rates"] = {code: describe(code) for code in sorted(codes)}
+    return identity
+
+
 async def available() -> dict[str, Any]:
     """Which currencies this deployment can actually display, and on what authority.
 

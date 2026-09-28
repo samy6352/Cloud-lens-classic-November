@@ -73,7 +73,7 @@ import datetime as dt
 import logging
 from typing import Any
 
-from . import derived
+from . import derived, environment
 
 log = logging.getLogger("cloudlens.presence")
 
@@ -96,6 +96,8 @@ DIMENSIONS = [
     "ResourceGroup",
     "PublisherName",
 ]
+if environment.ENABLED:
+    DIMENSIONS.append(environment.COLUMN)
 
 PERIOD = DIMENSIONS[0]
 
@@ -139,7 +141,7 @@ def _validate() -> None:
     """Fail at import if the grain names a column the warehouse does not have."""
     from .warehouse import COLUMNS, NUMERIC
 
-    unknown = [c for c in DIMENSIONS + MEASURES if c not in COLUMNS]
+    unknown = [c for c in environment.source_columns(DIMENSIONS + MEASURES) if c not in COLUMNS]
     if unknown:
         raise RuntimeError(
             f"presence names columns the warehouse does not have: {', '.join(unknown)}")
@@ -187,8 +189,10 @@ def table_sql(schema: str, table: str = TABLE) -> str:
     """
     _validate()
     cols = ",\n  ".join(
-        [f'"{d}" {"date" if d == PERIOD else "text"}' for d in DIMENSIONS]
+        [f'"{d}" {"date" if d == PERIOD else "text"}'
+         for d in DIMENSIONS if d != environment.COLUMN]
         + [f'"{m}" double precision' for m in MEASURES]
+        + ([f'"{environment.COLUMN}" text'] if environment.ENABLED else [])
     )
     return f'CREATE TABLE IF NOT EXISTS "{schema}".{table} (\n  {cols}\n)'
 
@@ -200,6 +204,8 @@ def index_sql(schema: str, table: str = TABLE) -> list[str]:
     the swap has given the table its real name, produces the same names a
     first-time create would.
     """
+    from . import read_indexes
+
     return [
         # Every query against it is bounded by a date window, as with the rollup.
         f'CREATE INDEX IF NOT EXISTS {table}_period_idx '
@@ -207,6 +213,7 @@ def index_sql(schema: str, table: str = TABLE) -> list[str]:
         # And then usually narrowed to a set of subscriptions.
         f'CREATE INDEX IF NOT EXISTS {table}_sub_idx '
         f'ON "{schema}".{table} (lower("SubAccountId"), "{PERIOD}")',
+        *read_indexes.index_sql(schema, table, TABLE),
     ]
 
 
@@ -218,15 +225,19 @@ def select_sql(source: str, window: tuple[dt.date, dt.date] | None = None) -> st
     of a projection is what distinct means -- so the set of identities this table
     holds, and therefore every count taken from it, is unchanged.
     """
-    dims = ", ".join(f'"{d}"' for d in DIMENSIONS)
+    if environment.ENABLED:
+        source = environment.project(source, DIMENSIONS + MEASURES)
+    dims = ", ".join(f'"{d}"' for d in DIMENSIONS if d != environment.COLUMN)
     sums = ", ".join(f'sum("{m}") AS "{m}"' for m in MEASURES)
     where = ""
     if window is not None:
         lo, hi = window
         where = (f" WHERE \"{PERIOD}\" >= DATE '{lo.isoformat()}'"
                  f" AND \"{PERIOD}\" < DATE '{hi.isoformat()}'")
-    return (f"SELECT {dims}, {sums} FROM {source}{where} "
-            f"GROUP BY {', '.join(str(i + 1) for i in range(len(DIMENSIONS)))}")
+    env = f', "{environment.COLUMN}"' if environment.ENABLED else ""
+    groups = ", ".join(f'"{d}"' for d in DIMENSIONS)
+    return (f"SELECT {dims}, {sums}{env} FROM {source}{where} "
+            f"GROUP BY {groups}")
 
 
 def rebuild(con: Any, schema: str, source: str,
