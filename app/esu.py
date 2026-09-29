@@ -245,15 +245,21 @@ async def esu_report(subscription_ids: list[str] | None = None,
             "monthly_esu_cost": 0.0,
         })
 
-    # What ESU is actually being billed today, as opposed to what it might cost.
+    # What ESU is actually being billed today, as opposed to what it might cost. Read from
+    # `usage_signals`, which keeps exactly these charges: over `costs` this scanned every
+    # retained charge on every load, with no date bound.
     billed, currency = 0.0, None
+
+    def _billed_esu() -> list[dict]:
+        with warehouse.reader(scope=subscription_ids, usage=("signals",)) as r:
+            source = getattr(r, "signals", None) or "costs"
+            return r.rows(
+                f'SELECT "BillingCurrency" AS currency, sum("BilledCost") AS billed FROM {source} '
+                "WHERE lower(\"MeterName\") LIKE '%esu%' "
+                "OR lower(\"ProductName\") LIKE '%extended security%' GROUP BY 1", limit=None)
+
     try:
-        rows = (await asyncio.to_thread(
-            warehouse.query,
-            'SELECT "BillingCurrency" AS currency, sum("BilledCost") AS billed FROM costs '
-            "WHERE lower(\"MeterName\") LIKE '%esu%' "
-            "OR lower(\"ProductName\") LIKE '%extended security%' GROUP BY 1",
-            scope=subscription_ids))["rows"]
+        rows = await asyncio.to_thread(_billed_esu)
         for row in rows:
             billed += float(row["billed"] or 0.0)
             currency = currency or row["currency"]

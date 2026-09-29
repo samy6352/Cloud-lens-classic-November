@@ -227,7 +227,7 @@ def source(monkeypatch):
             return copy.deepcopy(state.rows[:limit])
 
     @contextmanager
-    def reader(*, scope, currency, filters):
+    def reader(*, scope, currency, filters, **options):
         state.readers.append((scope, currency, filters, reporting.selected_month()))
         yield Reader()
 

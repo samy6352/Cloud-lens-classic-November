@@ -41,6 +41,7 @@ async (page) => {
       if (!r.ok) throw new Error('Test refresh failure');
       return r.json();
     };
+    export const freshReads = async fn => fn();
     export const post = async () => ({currency:'USD',days:30,billed:{annual:100},current_retail:{annual:100},target:{annual:40},annual_saving:60,target_size:'Standard_B2s',note:'Fixture comparison'});
     export const allSubscriptions = () => [{id:'11111111-1111-4111-8111-111111111111',name:'Demo'},
       {id:'22222222-2222-4222-8222-222222222222',name:'Second subscription'}];

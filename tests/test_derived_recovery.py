@@ -83,13 +83,13 @@ def assert_current(wh):
 def assert_windows(calls, windows):
     from datetime import timedelta
 
-    from app import billing_serving, jobs, schema_v2
+    from app import billing_serving, jobs, resource_tags, schema_v2
     from app.warehouse import DERIVED_MODULES
 
     expected = []
     for module in DERIVED_MODULES:
         periods = windows
-        if module is billing_serving and windows != [None]:
+        if module in (billing_serving, resource_tags) and windows != [None]:
             periods = jobs.merge_windows([
                 (lo.replace(day=1), schema_v2.next_month(hi - timedelta(days=1)))
                 for lo, hi in windows])
@@ -260,7 +260,7 @@ def test_explicit_failed_maintenance_survives_restart(loaded, monkeypatch):
 @pytest.mark.parametrize("damage", ["missing-relation", "changed-layout"])
 def test_recreated_relation_cannot_inherit_readiness(loaded, monkeypatch, damage):
     from app import derived, jobs, rollup
-    from app.warehouse import Warehouse
+    from app.warehouse import DERIVED_MODULES, Warehouse
 
     correct(loaded, MAR)
     with loaded.connect() as con:
@@ -275,8 +275,12 @@ def test_recreated_relation_cannot_inherit_readiness(loaded, monkeypatch, damage
     try:
         with restarted.connect(read_only=True) as con:
             assert not jobs.rollup_current(con, rollup.TABLE)
+            assert not jobs.rollup_complete(con)
         asyncio.run(restarted.refresh_rollup_async(MAR))
-        assert_windows(calls, [None])
+        # The damaged table in full; the others, whose contents survived, only the period
+        # written since -- not a rebuild of every table's whole history.
+        assert calls == [(rollup.TABLE, None)] + [
+            (m.TABLE, MAR) for m in DERIVED_MODULES if m is not rollup]
         assert_current(restarted)
         with restarted.connect(read_only=True) as con:
             assert con.execute('SELECT count(DISTINCT "ChargePeriodStart") '
@@ -307,11 +311,17 @@ def test_partition_damage_triggers_full_automatic_recovery(loaded, monkeypatch, 
     calls = record_stages(monkeypatch)
     try:
         with restarted.connect(read_only=True) as con:
-            assert not jobs.rollup_current(con)
+            assert not jobs.rollup_current(con, rollup.TABLE)
+            assert not jobs.rollup_complete(con)
         state = SimpleNamespace()
         asyncio.run(_prepare_snapshot_generation(restarted, state))
         assert state.snapshot_bootstrap_ready
-        assert_windows(calls, [None])
+        if damage == "missing-ledger":
+            # The ledger is shared, so every partitioned table is withdrawn at once.
+            assert_windows(calls, [None])
+        else:
+            # One damaged table is rebuilt in full; the undamaged ones are left alone.
+            assert calls == [(rollup.TABLE, None)]
         assert_current(restarted)
     finally:
         restarted._store.close()

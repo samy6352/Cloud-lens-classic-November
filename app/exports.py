@@ -737,7 +737,7 @@ def _derived_is_current() -> bool:
     from . import jobs
 
     with warehouse.connect(read_only=True) as con:
-        return jobs.rollup_current(con)
+        return jobs.rollup_complete(con)
 
 
 def _rebuild_windows(changes: dict[str, Any]) -> list[tuple[date, date]] | None:

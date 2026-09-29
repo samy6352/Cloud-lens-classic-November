@@ -610,7 +610,8 @@ async def _prepare_snapshot_generation(warehouse: Any, state: Any) -> None:
     for attempt in range(3):
         try:
             generation = await offload(jobs.read_generation)
-            if not await offload(jobs.generation_ready, generation):
+            if (not await offload(jobs.generation_ready, generation)
+                    or not await offload(jobs.derived_complete)):
                 await warehouse.refresh_rollup_async()
                 generation = await offload(jobs.read_generation)
                 if not await offload(jobs.generation_ready, generation):
@@ -679,6 +680,28 @@ def snapshot_warming_enabled() -> bool:
     return value in {"true", "1"}
 
 
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer.") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer.")
+    return value
+
+
+def snapshot_cache_settings() -> dict[str, int]:
+    return {
+        "max_bytes": _positive_int_env("SNAPSHOT_MAX_BYTES", 256 * 1024 * 1024),
+        "max_entries": _positive_int_env("SNAPSHOT_MAX_ENTRIES", 4096),
+        "max_payload": _positive_int_env("SNAPSHOT_MAX_PAYLOAD", 8 * 1024 * 1024),
+        "origin_timeout": _positive_int_env("SNAPSHOT_ORIGIN_TIMEOUT", 300),
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     global _agent, _ingest_task, _overview, _snapshot_cache
@@ -710,9 +733,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _agent = CostAgent()
         _overview = {"status": "loading"}
         if os.getenv("SNAPSHOT_CACHE_ENABLED", "true").lower() != "false":
+            snapshot_settings = snapshot_cache_settings()
             _snapshot_cache = SnapshotCache(
-                SnapshotStore(warehouse.connect),
+                SnapshotStore(
+                    warehouse.connect,
+                    max_bytes=snapshot_settings["max_bytes"],
+                    max_entries=snapshot_settings["max_entries"],
+                    max_payload=snapshot_settings["max_payload"],
+                ),
                 version=application_version(build_id=os.getenv("CLOUDLENS_BUILD_ID", "")),
+                origin_timeout=snapshot_settings["origin_timeout"],
             )
             try:
                 await _snapshot_cache.start()
@@ -1164,6 +1194,37 @@ def narrow(picked: list[str], allowed: list[str] | None) -> list[str]:
     return selected_scope(picked, allowed) or []
 
 
+# Views whose cached answer must not survive a budget CloudLens itself created. Budgets
+# are read live from Azure and cached for speed; without this, a cached "no budgets" could
+# outlast the create that disproves it and invite a second, duplicate budget.
+BUDGET_VIEWS = frozenset({"/api/budgets", "/api/insights"})
+BUDGET_REVISION_KEY = "budget_revision"
+
+
+def _budget_revision() -> str:
+    from .warehouse import warehouse
+
+    try:
+        with warehouse.connect(read_only=True) as con:
+            row = con.execute("SELECT value FROM meta WHERE key = ?",
+                              [BUDGET_REVISION_KEY]).fetchone()
+    except Exception as exc:  # noqa: BLE001 - an unknown revision must not reuse a known one
+        log.warning("budget revision unavailable (%s)", type(exc).__name__)
+        return f"unavailable:{time.time()}"
+    return row[0] if row else "0"
+
+
+def _bump_budget_revision() -> None:
+    from .warehouse import warehouse
+
+    with warehouse.connect() as con:
+        con.execute(
+            "INSERT INTO meta (key, value, updated_at) VALUES (?, '1', now()) "
+            "ON CONFLICT (key) DO UPDATE SET "
+            "value = CAST(CAST(meta.value AS bigint) + 1 AS text), updated_at = now()",
+            [BUDGET_REVISION_KEY])
+
+
 def selected_scope(picked: list[str], allowed: list[str] | None) -> list[str] | None:
     """An explicit selection never silently expands when it is no longer authorized."""
     selected = list(dict.fromkeys(s.strip().lower() for s in picked if s.strip()))
@@ -1187,6 +1248,8 @@ async def authorize_snapshot(request: Request) -> CacheContext:
         "admin": user.admin, "delegated": auth.sso.delegated,
         "read_only": read_only_mode(), "workload_client": os.getenv("AZURE_CLIENT_ID", ""),
     }
+    if request.url.path in BUDGET_VIEWS:
+        policy["budget_revision"] = await offload(_budget_revision)
     if user.source == "entra":
         session = auth.sso.get(user.sid)
         if session is None or session.reauth_required:
@@ -1201,9 +1264,12 @@ async def authorize_snapshot(request: Request) -> CacheContext:
             for sub in session.subscriptions or [])
     else:
         tenant, principal = "local", f"{user.source}:{user.name.casefold()}"
-        # Local display names can be customized; do not merge distinct sessions
-        # merely because their displayed account names happen to match.
-        credential = request.cookies.get(COOKIE) or request.headers.get("authorization", "")
+        if user.source in {"file", "env"}:
+            account = user.name.casefold()
+            credential = json.dumps([account, auth.users.secret_for(user.name)],
+                                    separators=(",", ":"))
+        else:
+            credential = request.cookies.get(COOKIE) or request.headers.get("authorization", "")
         policy["session_partition"] = hashlib.sha256(credential.encode()).hexdigest()
     target = request.query_params.get("currency", "").strip().upper()
     conversion = currency.cache_identity(target)
@@ -4701,6 +4767,11 @@ async def create_budget(body: BudgetRequest, request: Request) -> JSONResponse:
         raise HTTPException(502, f"Azure refused the budget: {str(exc)[:300]}") from exc
 
     log.info("budget %s created on %s by %s", created["name"], body.subscription, user.name)
+    try:
+        await offload(_bump_budget_revision)
+    except Exception as exc:  # noqa: BLE001 - the budget exists; say so rather than fail
+        log.warning("budget created but cached budget views were not invalidated (%s)",
+                    type(exc).__name__)
     return JSONResponse(created, status_code=201)
 
 

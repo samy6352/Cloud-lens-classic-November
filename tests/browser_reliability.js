@@ -24,6 +24,7 @@ async (page) => {
     ${getSource.replace("export async function get(", "async function realGet(")}
     export const get = (url, options = {}) => realGet(url, { ...options,
       timeout: /\\/dashboard\\/(sections|executive)|\\/filters|\\/auth\\/me/.test(url) ? 1000 : options.timeout });
+    export const freshReads = async fn => fn();
     export const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     export const money = (v,c='USD') => c + ' ' + Number(v || 0).toFixed(2);
     export const moneyHtml = money;

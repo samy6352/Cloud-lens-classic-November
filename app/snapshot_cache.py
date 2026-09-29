@@ -24,6 +24,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 import time
 from collections import OrderedDict
@@ -40,6 +41,12 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from .store import PoolBusy
+
+try:
+    from psycopg.errors import LockNotAvailable
+except ImportError:  # pragma: no cover - psycopg is present in deployed/test warehouses
+    class LockNotAvailable(Exception):
+        pass
 
 calculation_context: ContextVar[tuple[str, str] | None] = ContextVar(
     "cloudlens_snapshot_calculation", default=None)
@@ -122,14 +129,34 @@ class Policy:
             raise ValueError("Cache retention must be at least its positive TTL.")
 
 
-WAREHOUSE = Policy("warehouse", 300)
-MONITOR = Policy("monitor", 900)
-ADVISOR = Policy("advisor", 1800)
-AI = Policy("ai", 900)
-AI_BILLING = Policy("ai", 86400, daily=True)
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer.") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer.")
+    return value
+
+
+_DEFAULT_TTL = _positive_int_env("SNAPSHOT_TTL_SECONDS", 24 * 60 * 60)
+_DEFAULT_RETENTION = _positive_int_env("SNAPSHOT_RETENTION_SECONDS", 7 * 24 * 60 * 60)
+# How long a report with partial evidence is served before a view refreshes it behind
+# the scenes. Short because the gap is often transient (a throttled subscription); long
+# enough that nobody waits for the full origin on every load while it persists.
+PARTIAL_TTL = _positive_int_env("SNAPSHOT_PARTIAL_TTL_SECONDS", 60 * 60)
+
+WAREHOUSE = Policy("warehouse", _DEFAULT_TTL, _DEFAULT_RETENTION)
+MONITOR = Policy("monitor", _DEFAULT_TTL, _DEFAULT_RETENTION)
+ADVISOR = Policy("advisor", _DEFAULT_TTL, _DEFAULT_RETENTION)
+AI = Policy("ai", _DEFAULT_TTL, _DEFAULT_RETENTION)
+AI_BILLING = Policy("ai", _DEFAULT_TTL, _DEFAULT_RETENTION, daily=True)
 # Exact paths only. Job/progress/auth/chat/download/write routes are not eligible.
 DEFAULT_POLICIES = {
-    "/api/overview": Policy("overview", 300),
+    "/api/overview": Policy("overview", _DEFAULT_TTL, _DEFAULT_RETENTION),
     **dict.fromkeys((
         "/api/dashboard/sections", "/api/dashboard/executive",
         "/api/dashboard/billing",
@@ -152,6 +179,12 @@ DEFAULT_POLICIES = {
     "/api/dashboard/billing/opportunities": ADVISOR,
     "/api/dashboard/ai-billing": AI_BILLING,
     "/api/dashboard/recommendations": AI,
+    # Both read live Azure per subscription and were never cached: measured on the live
+    # deployment, Budgets hit the 240s gateway limit and Insights took 220s on every view.
+    # A created budget changes the Budgets key (see `authorize_snapshot`), so a cached
+    # "no budgets" can never outlive the create that disproves it.
+    "/api/budgets": MONITOR,
+    "/api/insights": MONITOR,
 }
 
 
@@ -177,8 +210,7 @@ def application_version(directory: Path | None = None, *, build_id: str = "") ->
     return digest.hexdigest()
 
 
-def cache_key(request: Request, context: CacheContext, version: str,
-              policy: Policy) -> str:
+def _normalised_query(request: Request) -> dict[str, list[str]]:
     # Sorting names is safe; sorting/deduplicating repeated VALUES is not (last
     # value wins for scalar parameters, and list parameters preserve order).
     query: dict[str, list[str]] = {}
@@ -188,9 +220,19 @@ def cache_key(request: Request, context: CacheContext, version: str,
         if name == "scope":
             value = ",".join(_scopes(value.split(",")))
         query.setdefault(name, []).append(value)
-    return _digest([context.partition(), request.url.path, query, context.fx_version,
-                    context.period_version,
-                    version, policy.source])
+    return query
+
+
+def cache_key(request: Request, context: CacheContext, version: str,
+              policy: Policy) -> str:
+    return _digest([context.partition(), request.url.path, _normalised_query(request),
+                    context.fx_version, context.period_version, version, policy.source])
+
+
+def cache_family_key(request: Request, context: CacheContext, version: str,
+                     policy: Policy) -> str:
+    return _digest([context.partition(), request.url.path, _normalised_query(request),
+                    context.fx_version, version, policy.source])
 
 
 def read_generation(con, scope: tuple[str, ...] | None = None) -> str:
@@ -228,6 +270,11 @@ class Snapshot:
     retry_at: float = 0
     error: str = ""
     scope: tuple[str, ...] | None = None
+    family_key: str = ""
+
+
+class SnapshotBusy(RuntimeError):
+    """The generation fence is locked by a publisher; serve the response uncached."""
 
 
 class SnapshotStore:
@@ -235,7 +282,8 @@ class SnapshotStore:
 
     def __init__(self, connect: Callable, *, generation: Callable = read_generation,
                  max_entries: int = 512, max_bytes: int = 64 * 1024 * 1024,
-                 max_payload: int = 8 * 1024 * 1024):
+                 max_payload: int = 8 * 1024 * 1024,
+                 lock_timeout_ms: int | None = None):
         """`max_payload` bounds one entry; `max_bytes` bounds the whole store.
 
         8MB rather than 2MB because the total is what actually protects memory --
@@ -246,11 +294,14 @@ class SnapshotStore:
         client-side filtering the tab is built on, so it was never cached and cost
         84 seconds on every single load, warm or cold.
         """
-        if min(max_entries, max_bytes, max_payload) < 1:
+        lock_timeout_ms = (_positive_int_env("SNAPSHOT_LOCK_TIMEOUT_MS", 2000)
+                           if lock_timeout_ms is None else lock_timeout_ms)
+        if min(max_entries, max_bytes, max_payload, lock_timeout_ms) < 1:
             raise ValueError("Snapshot bounds must be positive.")
         self.connect, self.generation = connect, generation
         self.max_entries, self.max_bytes = max_entries, max_bytes
         self.max_payload = min(max_payload, max_bytes)
+        self.lock_timeout = f"{lock_timeout_ms}ms"
 
     def initialize(self):
         with self.connect() as con:
@@ -259,6 +310,7 @@ class SnapshotStore:
                 con.execute("SELECT pg_advisory_xact_lock(?)", [_CACHE_LOCK])
                 con.execute("""CREATE TABLE IF NOT EXISTS private_snapshots (
                     cache_key TEXT PRIMARY KEY, partition_hash TEXT NOT NULL,
+                    family_key TEXT NOT NULL DEFAULT '',
                     source_generation TEXT NOT NULL, body TEXT NOT NULL,
                     created DOUBLE PRECISION NOT NULL, expires DOUBLE PRECISION NOT NULL,
                     retain_until DOUBLE PRECISION NOT NULL, etag TEXT NOT NULL,
@@ -266,6 +318,10 @@ class SnapshotStore:
                     retry_at DOUBLE PRECISION NOT NULL DEFAULT 0,
                     error_code TEXT NOT NULL DEFAULT ''
                 )""")
+                con.execute("ALTER TABLE private_snapshots ADD COLUMN IF NOT EXISTS family_key TEXT")
+                con.execute(
+                    "CREATE INDEX IF NOT EXISTS private_snapshots_family_idx "
+                    "ON private_snapshots (family_key,partition_hash,created DESC)")
                 con.execute("COMMIT")
             except BaseException:
                 con.execute("ROLLBACK")
@@ -292,19 +348,33 @@ class SnapshotStore:
                 con.execute("ROLLBACK")
                 raise
 
+    @staticmethod
+    def _snapshot(row, scope=None):
+        values = list(row)
+        values[3] = values[3].encode("utf-8")
+        return Snapshot(*values[:11], scope=scope, family_key=values[11] or "")
+
     def load(self, key: str, partition: str, now: float, scope=None):
         with self.connect() as con:
             generation = self.generation(con, scope)
             row = con.execute(
                 "SELECT cache_key,partition_hash,source_generation,body,created,expires,"
-                "retain_until,etag,failures,retry_at,error_code FROM private_snapshots "
+                "retain_until,etag,failures,retry_at,error_code,family_key FROM private_snapshots "
                 "WHERE cache_key=? AND partition_hash=? AND retain_until>?",
                 [key, partition, now]).fetchone()
         if row:
-            values = list(row)
-            values[3] = values[3].encode("utf-8")
-            return Snapshot(*values, scope=scope), generation
+            return self._snapshot(row, scope), generation
         return None, generation
+
+    def load_family(self, family_key: str, partition: str, now: float, scope=None):
+        with self.connect() as con:
+            row = con.execute(
+                "SELECT cache_key,partition_hash,source_generation,body,created,expires,"
+                "retain_until,etag,failures,retry_at,error_code,family_key FROM private_snapshots "
+                "WHERE family_key=? AND partition_hash=? AND retain_until>? "
+                "ORDER BY created DESC,cache_key LIMIT 1",
+                [family_key, partition, now]).fetchone()
+        return self._snapshot(row, scope) if row else None
 
     def put(self, item: Snapshot) -> bool:
         if len(item.body) > self.max_payload or _source_pending(item.generation):
@@ -318,27 +388,33 @@ class SnapshotStore:
                 con.execute("SELECT pg_advisory_xact_lock(?)", [_CACHE_LOCK])
                 # Generic cost writers and coherent_rollup use this row lock,
                 # not necessarily the FOCUS publication advisory lock.
+                con.execute("SELECT set_config('lock_timeout', ?, true)", [self.lock_timeout])
                 lock_generation(con)
                 if self.generation(con, item.scope) != item.generation:
                     con.execute("ROLLBACK")
                     return False
+                family = item.family_key or item.key
                 row = con.execute(
                     "INSERT INTO private_snapshots "
-                    "(cache_key,partition_hash,source_generation,body,created,expires,"
-                    "retain_until,etag,byte_size) VALUES (?,?,?,?,?,?,?,?,?) "
+                    "(cache_key,partition_hash,family_key,source_generation,body,created,expires,"
+                    "retain_until,etag,byte_size) VALUES (?,?,?,?,?,?,?,?,?,?) "
                     "ON CONFLICT(cache_key) DO UPDATE SET "
                     "partition_hash=excluded.partition_hash,"
+                    "family_key=excluded.family_key,"
                     "source_generation=excluded.source_generation,body=excluded.body,"
                     "created=excluded.created,expires=excluded.expires,"
                     "retain_until=excluded.retain_until,etag=excluded.etag,"
                     "byte_size=excluded.byte_size,failures=0,retry_at=0,error_code='' "
                     "WHERE private_snapshots.created<=excluded.created RETURNING cache_key",
-                    [item.key, item.partition, item.generation, item.body.decode("utf-8"),
+                    [item.key, item.partition, family, item.generation, item.body.decode("utf-8"),
                      item.created, item.expires, item.retain_until, item.etag,
                      len(item.body)]).fetchone()
                 self._prune(con, item.created)
                 con.execute("COMMIT")
                 return bool(row)
+            except LockNotAvailable as exc:
+                con.execute("ROLLBACK")
+                raise SnapshotBusy("Snapshot generation lock is busy.") from exc
             except BaseException:
                 con.execute("ROLLBACK")
                 raise
@@ -464,6 +540,18 @@ def oversize(response: Response, limit: int) -> int:
 
 
 def _body(response: Response, limit: int) -> bytes | None:
+    body = _json_body(response, limit)
+    if body is None:
+        return None
+    try:
+        value = json.loads(body)
+        return body if _cacheable_report(value) else None
+    except (ValueError, UnicodeError):
+        return None
+
+
+def _json_body(response: Response, limit: int) -> bytes | None:
+    """The body, if the response is a plain, private-safe JSON 200 within the size limit."""
     body = getattr(response, "body", None)
     if (response.status_code != 200 or not isinstance(body, bytes) or len(body) > limit
             or "set-cookie" in response.headers
@@ -471,11 +559,53 @@ def _body(response: Response, limit: int) -> bytes | None:
             or "content-disposition" in response.headers
             or response.headers.get("content-type", "").split(";")[0] != "application/json"):
         return None
+    return body
+
+
+def _partial_body(response: Response, limit: int) -> bytes | None:
+    """A report that is complete as an answer, though its evidence is not.
+
+    Everything `_body` refuses for secrets, unfinished jobs, size and headers is still
+    refused. What is admitted is a report carrying per-source errors or partial
+    coverage *and real money somewhere in it*. A failure-shaped report -- an error, a
+    zero total, a coverage block that says "unavailable" -- carries none, is usually
+    transient, and must not be served back for the next hour.
+    """
+    body = _json_body(response, limit)
+    if body is None:
+        return None
     try:
         value = json.loads(body)
-        return body if _cacheable_report(value) else None
     except (ValueError, UnicodeError):
         return None
+    if not isinstance(value, (dict, list)) or not _safe_content(value) or _unfinished(value):
+        return None
+    return body if _carries_money(value) else None
+
+
+def _carries_money(value: Any) -> bool:
+    """A non-zero money or measurement figure anywhere, including in sections that
+    `_has_evidence` deliberately skips: Commitments keeps its whole report in `coverage`.
+    """
+    if isinstance(value, dict):
+        for name, item in value.items():
+            if name in {"error", "errors", "problem"}:
+                continue
+            if (name in _EVIDENCE_FIELDS and isinstance(item, (int, float))
+                    and not isinstance(item, bool) and math.isfinite(item) and item != 0):
+                return True
+            if isinstance(item, (dict, list)) and _carries_money(item):
+                return True
+    elif isinstance(value, list):
+        return any(_carries_money(item) for item in value)
+    return False
+
+
+def _complete(body: bytes) -> bool:
+    try:
+        return _cacheable_report(json.loads(body))
+    except (ValueError, UnicodeError):
+        return False
 
 
 def _pending_body(response: Response, limit: int) -> bool:
@@ -599,7 +729,7 @@ class SnapshotCache:
         self._db_tasks.discard(task)
         if not task.cancelled():
             error = task.exception()
-            if error is not None:
+            if error is not None and not isinstance(error, SnapshotBusy):
                 self._log_failure("database", None, error)
 
     async def close(self):
@@ -636,6 +766,11 @@ class SnapshotCache:
         context = await self._authorize(request, authorize)
         partition = context.partition()
         key = cache_key(request, context, self.version, policy)
+        family = cache_family_key(request, context, self.version, policy)
+        force = any(request.query_params.get(name, "").lower() in {"1", "true", "yes"}
+                    for name in _FORCE_FLAGS)
+        family_fallback = False
+        load_family = getattr(self.store, "load_family", None)
         try:
             while True:
                 completion_serial = self._completion_serial
@@ -643,7 +778,18 @@ class SnapshotCache:
                 # while this DB read was in flight. Recheck before issuing work.
                 item, generation = await self._db(
                     self.store.load, key, partition, self.clock(), context.selected)
-                if item is not None or completion_serial == self._completion_serial:
+                # No exact entry: yesterday's calculation of the same view, same partition,
+                # is served stale while today's is computed, so the UTC day boundary is not
+                # a cold miss for every viewer. Never across partitions, never when forced.
+                family_fallback = False
+                if item is None and not force and load_family is not None:
+                    item = await self._db(
+                        load_family, family, partition, self.clock(), context.selected)
+                    family_fallback = item is not None
+                # Both reads are waits during which a producer can finish; only an exact
+                # hit is final, anything else is re-read if one did.
+                if ((item is not None and not family_fallback)
+                        or completion_serial == self._completion_serial):
                     break
         except PoolBusy as exc:
             # Not a cache outage, so the fallback below is not the answer. The origin
@@ -676,8 +822,6 @@ class SnapshotCache:
                                retry_at=max(item.retry_at, notice.retry_at), error=notice.code)
             else:
                 self._failures.pop(key, None)
-        force = any(request.query_params.get(name, "").lower() in {"1", "true", "yes"}
-                    for name in _FORCE_FLAGS)
         if _source_pending(generation):
             await self._authorize(request, authorize, partition, context)
             if force or item is None:
@@ -696,15 +840,16 @@ class SnapshotCache:
             source_changed = saved_day != context.data_day
             # The source revision still fences writes. A completed daily report,
             # however, survives same-day imports and midnight without new data.
-            stale = source_changed or bool(item.error)
+            stale = family_fallback or source_changed or bool(item.error)
         else:
             source_changed = bool(item and item.generation != generation)
-            stale = bool(item and (item.expires <= self.clock() or source_changed or item.error))
+            stale = bool(item and (
+                family_fallback or item.expires <= self.clock() or source_changed or item.error))
         task_key = (key, generation)
         task = self._tasks.get(task_key)
         owns_origin = False
         if ((not item or stale or force)
-                and (not item or force or (source_changed and not daily)
+                and (not item or force or family_fallback or (source_changed and not daily)
                      or item.retry_at <= self.clock())
                 and task is None and not self._closed and len(self._tasks) < self.max_inflight):
             task = asyncio.create_task(self._refresh(
@@ -736,6 +881,8 @@ class SnapshotCache:
             raise HTTPException(409, "Source data changed during refresh. Retry this view.",
                                 headers={"X-CloudLens-Cache": "superseded",
                                          "X-CloudLens-Refresh-Error": "source_changed"})
+        if result.headers.get("X-CloudLens-Cache") == "bypass":
+            return result
         if owns_origin:
             return result
         # Do not share a streaming iterator, Set-Cookie, or any other non-cacheable
@@ -766,12 +913,26 @@ class SnapshotCache:
                     await self._db(self.store.discard, key, partition)
                     return response
                 body = _body(response, self.store.max_payload)
+                ttl = policy.ttl
+                if body is None and not _pending_body(response, self.store.max_payload):
+                    # A complete answer about incomplete evidence -- one subscription
+                    # throttled, some days not yet verified -- is still the answer the
+                    # next viewer would get after waiting the full origin time, so it is
+                    # kept briefly rather than recomputed on every view. Measured on the
+                    # 16.9M-row estate: Commitments 98s and Waste 6s on *every* load, because
+                    # each always reported partial coverage somewhere. It never replaces a
+                    # complete snapshot: the last good answer is worth more than a new
+                    # partial one, and the failure path below keeps serving it.
+                    partial = _partial_body(response, self.store.max_payload)
+                    if partial is not None and not (old is not None and _complete(old.body)):
+                        body, ttl = partial, min(policy.ttl, PARTIAL_TTL)
                 if body is not None and policy.daily and context.data_day:
                     value = json.loads(body)
                     value["snapshot"] = {"cadence": "data-day", "data_day": context.data_day}
                     response.body = json.dumps(value, separators=(",", ":"), ensure_ascii=True).encode()
                     response.headers["Content-Length"] = str(len(response.body))
-                    body = _body(response, self.store.max_payload)
+                    body = (_body(response, self.store.max_payload) if ttl == policy.ttl
+                            else _partial_body(response, self.store.max_payload))
                 if body is None:
                     if _pending_body(response, self.store.max_payload):
                         return self._source_state(response, "source-pending", generation)
@@ -795,12 +956,17 @@ class SnapshotCache:
                 if _source_pending(generation):
                     return self._source_state(response, "source-pending", generation)
                 item = Snapshot(key, partition, generation, body, started,
-                                started + policy.ttl, started + policy.retention,
+                                started + ttl, started + policy.retention,
                                 '"' + _digest([generation, self.version,
                                                hashlib.sha256(body).hexdigest()]) + '"',
-                                scope=context.selected)
+                                scope=context.selected, family_key=cache_family_key(
+                                    request, context, self.version, policy))
                 try:
                     accepted = await self._db(self.store.put, item)
+                except SnapshotBusy:
+                    response.headers["Cache-Control"] = "private, no-store"
+                    response.headers["X-CloudLens-Cache"] = "bypass"
+                    return response
                 except Exception as exc:
                     self._log_failure("write", request, exc)
                     await self._record_failure(old, request, "cache_write_failed")

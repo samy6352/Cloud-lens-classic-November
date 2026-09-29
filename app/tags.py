@@ -155,28 +155,35 @@ def merge_live_keys(payload: dict[str, Any], live: list[dict[str, Any]]) -> dict
 def cost_by_tag(scope: list[str] | None = None, days: int = 30,
                 currency: str | None = None) -> dict[str, Any]:
     """Every tagged resource in the window, with its cost, its tag keys and its daily spend."""
-    from . import reporting
+    from . import reporting, resource_tags
 
     days = reporting.period_days(days)
     if scope is not None and not scope:
         return _empty(days)
     from .warehouse import warehouse
 
-    with warehouse.reader(scope=scope, currency=currency) as r:
+    with warehouse.reader(scope=scope, currency=currency, usage=("tags",)) as r:
+        # Money per resource from the per-resource summary when it can price this
+        # connection, tags looked up for just the resources returned. Scanning `costs`
+        # for both timed out on a 16.9M-row estate: `Tags` is most of every row's bytes.
+        agg = getattr(r, "agg", "costs")
+        tag_source = getattr(r, "tags", None)
+        named = getattr(r, "named", "costs") if tag_source else "costs"
         # Anchored to the newest data, not to today. Cost lands a day or two late, so a window
         # ending at CURRENT_DATE quietly drops the most recent complete day -- and on a
         # warehouse that has not been refreshed this week it returns almost nothing, which
         # reads as "you have no tagged resources" rather than "this data is stale".
-        edge = r.rows('SELECT max("ChargePeriodStart") AS hi FROM costs')
+        edge = r.rows(f'SELECT max("ChargePeriodStart") AS hi FROM {agg}')
         hi = edge[0]["hi"] if edge and edge[0]["hi"] else None
         if hi is None:
             return _empty(days)
 
-        window = f'"ChargePeriodStart" > {reporting.start_sql(hi, days)}'
+        start = reporting.start_sql(hi, days)
+        window = f'"ChargePeriodStart" > {start}'
         totals = r.rows(
             'SELECT COALESCE(NULLIF("BillingCurrency", \'\'), \'unknown\') AS currency, '
             'SUM(COALESCE("BilledCost", 0)) AS cost '
-            f'FROM costs WHERE {window} GROUP BY 1',
+            f'FROM {agg} WHERE {window} GROUP BY 1',
             limit=MAX_RESOURCES + 1,
         )
         currency, mixed = _dominant(totals)
@@ -186,30 +193,58 @@ def cost_by_tag(scope: list[str] | None = None, days: int = 30,
             code = currency.replace("'", "''")
             display_window += f' AND COALESCE(NULLIF("BillingCurrency", \'\'), \'unknown\') = \'{code}\''
 
-        rows = r.rows(
-            f"""
-            SELECT
+        identity = """
               COALESCE(NULLIF("ResourceId", ''), "ResourceName", '(unnamed)') AS id,
               MAX(COALESCE(NULLIF("ResourceName", ''), '(unnamed)'))          AS name,
-              MAX(COALESCE("ServiceName", ''))                                AS service,
-              MAX(COALESCE("SubAccountName", ''))                             AS subscription,
+              MAX(COALESCE("ServiceName", ''))                                AS service,"""
+        grouped = """
               MAX(COALESCE("ResourceGroup", ''))                              AS resource_group,
               COALESCE(NULLIF("BillingCurrency", ''), 'unknown')              AS currency,
               SUM(COALESCE("BilledCost", 0))                                  AS cost,
-              MAX(CASE WHEN TRIM(COALESCE("Tags", '')) NOT IN ('', '{{}}', '[]', 'null')
-                       THEN "Tags" END)                                     AS tags,
-              BOOL_AND("Tags" IS NOT NULL AND
-                       (COALESCE("BillingCostBasis" = 'FOCUS', FALSE) OR
-                        TRIM("Tags") NOT IN ('', 'null')))                    AS tags_available,
               CASE WHEN COUNT(DISTINCT COALESCE("SubAccountId", '')) = 1
-                   THEN MAX(NULLIF("SubAccountId", '')) END                   AS subscription_id
-            FROM costs
-            WHERE {display_window}
-            GROUP BY 1, 6
-            ORDER BY cost DESC, id, currency
-            """,
-            limit=MAX_RESOURCES + 1,
-        )
+                   THEN MAX(NULLIF("SubAccountId", '')) END                   AS subscription_id"""
+        if tag_source:
+            # The subscription's display name from the rollup, which holds it per
+            # subscription; the per-resource summary does not carry it.
+            rows = r.rows(
+                f"""
+                WITH names AS (
+                  SELECT "SubAccountId" AS name_sub, MAX("SubAccountName") AS name_text
+                  FROM {agg} WHERE {display_window} GROUP BY 1
+                ), top AS (
+                  SELECT {identity}
+                    MAX(COALESCE(name_text, ''))                              AS subscription,
+                    {grouped}
+                  FROM {named} LEFT JOIN names ON name_sub = "SubAccountId"
+                  WHERE {display_window}
+                  GROUP BY 1, 6
+                  ORDER BY cost DESC, id, currency
+                  LIMIT {MAX_RESOURCES + 1}
+                )
+                SELECT top.*, tg.tags, NOT tg.unknown AS tags_available FROM top
+                {resource_tags.lateral_sql(tag_source, "top.id", "top.currency", start, str(hi)[:10])}
+                ORDER BY cost DESC, id, currency
+                """,
+                limit=MAX_RESOURCES + 1,
+            )
+        else:
+            rows = r.rows(
+                f"""
+                SELECT {identity}
+                  MAX(COALESCE("SubAccountName", ''))                         AS subscription,
+                  {grouped},
+                  MAX(CASE WHEN TRIM(COALESCE("Tags", '')) NOT IN ('', '{{}}', '[]', 'null')
+                           THEN "Tags" END)                                   AS tags,
+                  BOOL_AND("Tags" IS NOT NULL AND
+                           (COALESCE("BillingCostBasis" = 'FOCUS', FALSE) OR
+                            TRIM("Tags") NOT IN ('', 'null')))                AS tags_available
+                FROM costs
+                WHERE {display_window}
+                GROUP BY 1, 6
+                ORDER BY cost DESC, id, currency
+                """,
+                limit=MAX_RESOURCES + 1,
+            )
 
         # Per resource per day. Needed for both the trend and the day drill-down, and both are
         # driven entirely client-side: the whole point of the tab is that changing the tag
@@ -222,7 +257,7 @@ def cost_by_tag(scope: list[str] | None = None, days: int = 30,
               "ChargePeriodStart"                                             AS day,
               COALESCE(NULLIF("BillingCurrency", ''), 'unknown')              AS currency,
               SUM(COALESCE("BilledCost", 0))                                  AS cost
-            FROM costs
+            FROM {named}
             WHERE {display_window}
             GROUP BY 1, 2, 3
             """,
@@ -236,7 +271,7 @@ def cost_by_tag(scope: list[str] | None = None, days: int = 30,
             f"""SELECT "SubAccountId" AS subscription_id,
                        STRING_AGG(DISTINCT COALESCE(NULLIF(UPPER(TRIM("BillingCurrency")), ''), 'unknown'), ',')
                          AS currencies
-                FROM costs WHERE {window}
+                FROM {getattr(r, "agg", "costs")} WHERE {window}
                 GROUP BY "SubAccountId" """,
             limit=MAX_RESOURCES + 1,
         )
@@ -276,6 +311,10 @@ def cost_by_tag(scope: list[str] | None = None, days: int = 30,
         cost = float(cell.get("cost") or 0.0)
         per_resource.setdefault(cell["id"], []).append([i, cost])
         daily_total[i] += cost
+    # In day order. The query does not order its groups, so without this the same data
+    # produced a differently ordered series from one run -- or one source table -- to the next.
+    for series in per_resource.values():
+        series.sort(key=lambda cell: cell[0])
 
     resources: list[dict[str, Any]] = []
     key_totals: dict[str, dict[str, Any]] = {}

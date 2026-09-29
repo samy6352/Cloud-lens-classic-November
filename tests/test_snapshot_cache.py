@@ -3,8 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
 import threading
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI, HTTPException, Request
@@ -15,9 +19,12 @@ from app.snapshot_cache import (
     AI_BILLING,
     CacheContext,
     Policy,
+    Snapshot,
+    SnapshotBusy,
     SnapshotCache,
     SnapshotStore,
     application_version,
+    cache_family_key,
     cache_key,
     install_snapshot_routes,
 )
@@ -56,6 +63,12 @@ class MemoryStore:
         if item and (item.partition != partition or item.retain_until <= now):
             item = None
         return item, self.generation
+
+    def load_family(self, family_key, partition, now, scope=None):
+        rows = [item for item in self.rows.values()
+                if item.family_key == family_key and item.partition == partition
+                and item.retain_until > now]
+        return max(rows, key=lambda item: (item.created, item.key), default=None)
 
     def put(self, item):
         if item.generation != self.generation:
@@ -109,7 +122,26 @@ def test_only_ai_billing_uses_imported_data_day_policy():
     from app.snapshot_cache import DEFAULT_POLICIES
 
     assert [path for path, policy in DEFAULT_POLICIES.items() if policy.daily] == [AI_PATH]
-    assert DEFAULT_POLICIES["/api/dashboard/recommendations"].ttl == 900
+    assert {policy.ttl for policy in DEFAULT_POLICIES.values()} == {86400}
+    assert {policy.retention for policy in DEFAULT_POLICIES.values()} == {7 * 86400}
+
+
+def test_snapshot_policy_ttl_and_retention_env_are_validated():
+    root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "SNAPSHOT_TTL_SECONDS": "42", "SNAPSHOT_RETENTION_SECONDS": "43"}
+    check = (
+        "from app.snapshot_cache import DEFAULT_POLICIES; "
+        "assert {p.ttl for p in DEFAULT_POLICIES.values()} == {42}; "
+        "assert {p.retention for p in DEFAULT_POLICIES.values()} == {43}"
+    )
+    result = subprocess.run([sys.executable, "-c", check], cwd=root, env=env,
+                            stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    env["SNAPSHOT_RETENTION_SECONDS"] = "41"
+    result = subprocess.run([sys.executable, "-c", "import app.snapshot_cache"], cwd=root,
+                            env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "Cache retention must be at least" in result.stderr
 
 
 def test_daily_snapshot_survives_same_day_import_midnight_and_worker_restart():
@@ -196,7 +228,7 @@ def test_daily_data_day_changes_serve_honest_last_good_then_coalesce_refresh(day
     ("scope=b", {"selected": ("b",)}),
     ("", {"principal": "different-user"}), ("", {"tenant": "different-tenant"}),
     ("", {"allowed": ("a",)}), ("", {"authorization_version": "new-roles"}),
-    ("", {"fx_version": "new-fx"}), ("", {"period_version": "2026-08"}),
+    ("", {"fx_version": "new-fx"}),
 ])
 def test_daily_new_selection_never_borrows_incompatible_snapshot(query, changes):
     async def scenario():
@@ -345,6 +377,24 @@ def test_identity_entitlements_scope_and_fx_are_isolated(context):
     assert cache_key(request(), context, "v", POLICY) != cache_key(request(), CONTEXT, "v", POLICY)
 
 
+def test_family_key_ignores_period_version_but_keeps_partition_fx_query_and_source():
+    next_period = replace(CONTEXT, period_version="next-reporting-day")
+    assert cache_key(request(), next_period, "v", POLICY) != cache_key(
+        request(), CONTEXT, "v", POLICY)
+    assert cache_family_key(request(), next_period, "v", POLICY) == cache_family_key(
+        request(), CONTEXT, "v", POLICY)
+    for context in [
+        replace(CONTEXT, principal="another-oid"),
+        replace(CONTEXT, fx_version="new-fx"),
+    ]:
+        assert cache_family_key(request(), context, "v", POLICY) != cache_family_key(
+            request(), CONTEXT, "v", POLICY)
+    assert cache_family_key(request("days=7"), CONTEXT, "v", POLICY) != cache_family_key(
+        request(), CONTEXT, "v", POLICY)
+    assert cache_family_key(request(), CONTEXT, "v", Policy("other", 10, 100)) != (
+        cache_family_key(request(), CONTEXT, "v", POLICY))
+
+
 @pytest.mark.parametrize("context", [
     replace(CONTEXT, principal=""), replace(CONTEXT, tenant=""),
     replace(CONTEXT, allowed=()), replace(CONTEXT, selected=("c",)),
@@ -353,6 +403,45 @@ def test_identity_entitlements_scope_and_fx_are_isolated(context):
 def test_invalid_authorization_context_fails_closed(context):
     with pytest.raises(HTTPException):
         context.partition()
+
+
+def test_local_account_snapshot_partition_uses_account_secret(monkeypatch):
+    from app import main
+    from app.auth import COOKIE, User
+
+    class Users:
+        def __init__(self):
+            self.secrets = {"alice": "secret-a", "bob": "secret-b"}
+
+        def secret_for(self, name):
+            return self.secrets.get(name.casefold(), "")
+
+    class Auth:
+        users = Users()
+        sso = type("SSO", (), {"delegated": False})()
+
+    auth = Auth()
+
+    async def permitted(_user):
+        return None
+
+    monkeypatch.setattr(main, "auth_service", lambda: auth)
+    monkeypatch.setattr(main, "permitted", permitted)
+
+    def signed_context(user, cookie):
+        req = request(headers=[(b"cookie", f"{COOKIE}={cookie}".encode())])
+        req.state.user = user
+        return asyncio.run(main.authorize_snapshot(req))
+
+    first = signed_context(User("Alice", source="file"), "session-one").partition()
+    second = signed_context(User("ALICE", source="file"), "session-two").partition()
+    assert second == first
+    assert signed_context(User("Bob", source="file"), "session-one").partition() != first
+    auth.users.secrets["alice"] = "rotated"
+    assert signed_context(User("Alice", source="file"), "session-three").partition() != first
+    token_one = signed_context(User("token-reader", source="token"), "token-session-one").partition()
+    token_two = signed_context(User("token-reader", source="token"), "token-session-two").partition()
+    assert token_two != token_one
 
 
 def test_warm_hit_reauthorizes_no_origin_or_database_writes_and_etag():
@@ -377,6 +466,63 @@ def test_warm_hit_reauthorizes_no_origin_or_database_writes_and_etag():
         with pytest.raises(HTTPException) as exc:
             await cache.get(request(), origin, auth)
         assert exc.value.status_code == 403
+        await cache.close()
+
+    asyncio.run(scenario())
+
+
+def test_period_family_serves_previous_snapshot_and_refreshes_exact_key():
+    async def scenario():
+        now = [1000.0]
+        store, calls = MemoryStore(), []
+        first_context = replace(CONTEXT, period_version="2026-09-29")
+        second_context = replace(CONTEXT, period_version="2026-09-30")
+        cache = make_cache(store, clock=lambda: now[0])
+        auth = Authorize(first_context)
+
+        async def origin():
+            calls.append(1)
+            return JSONResponse({"total": len(calls)})
+
+        first = await cache.get(request(), origin, auth)
+        assert json.loads(first.body)["total"] == 1
+        auth.context = second_context
+        now[0] += 1
+        boundary = await cache.get(request(), origin, auth)
+        assert json.loads(boundary.body)["total"] == 1
+        assert boundary.headers["x-cloudlens-cache"] == "stale"
+        assert boundary.headers["x-cloudlens-stale"] == "true"
+        assert boundary.headers["x-cloudlens-revalidating"] == "true"
+        await settle(cache)
+        assert calls == [1, 1]
+        refreshed = await cache.get(request(), origin, auth)
+        assert json.loads(refreshed.body)["total"] == 2
+        assert refreshed.headers["x-cloudlens-cache"] == "hit"
+        await cache.close()
+
+    asyncio.run(scenario())
+
+
+def test_family_fallback_never_crosses_partitions():
+    async def scenario():
+        now = [1000.0]
+        store, calls = MemoryStore(), []
+        context = replace(CONTEXT, period_version="2026-09-30")
+        cache = make_cache(store, clock=lambda: now[0])
+        current_family = cache_family_key(request(), context, cache.version, POLICY)
+        store.rows["wrong-partition"] = Snapshot(
+            "wrong-partition", "other-partition", store.generation, b'{"total":99}',
+            900, 2000, 3000, '"wrong"', family_key=current_family)
+        auth = Authorize(context)
+
+        async def origin():
+            calls.append(1)
+            return JSONResponse({"total": 1})
+
+        result = await cache.get(request(), origin, auth)
+        assert json.loads(result.body)["total"] == 1
+        assert result.headers["x-cloudlens-cache"] == "miss"
+        assert calls == [1]
         await cache.close()
 
     asyncio.run(scenario())
@@ -410,6 +556,118 @@ def test_stale_immediately_serves_last_good_and_failed_refresh_backs_off():
         await cache.close()
 
     asyncio.run(scenario())
+
+
+def test_snapshot_busy_write_returns_fresh_response_uncached_without_failure():
+    class BusyStore(MemoryStore):
+        def put(self, item):
+            raise SnapshotBusy("generation row locked")
+
+    async def scenario():
+        cache, auth, calls = make_cache(BusyStore()), Authorize(), []
+
+        async def origin():
+            calls.append(1)
+            return JSONResponse({"total": 12})
+
+        result = await cache.get(request("fresh=true"), origin, auth)
+        assert result.status_code == 200
+        assert json.loads(result.body)["total"] == 12
+        assert result.headers["cache-control"] == "private, no-store"
+        assert result.headers["x-cloudlens-cache"] == "bypass"
+        assert "x-cloudlens-refresh-error" not in result.headers
+        assert cache._failures == {}
+        assert cache.store.rows == {}
+        assert calls == [1]
+        await cache.close()
+
+    asyncio.run(scenario())
+
+
+def test_partial_report_is_cached_briefly_and_served_as_partial():
+    from app.snapshot_cache import PARTIAL_TTL
+
+    async def scenario():
+        now = [1000.0]
+        cache = SnapshotCache(MemoryStore(), version="calculation-v1",
+                              policies={PATH: Policy("warehouse", 86400, 604800)},
+                              clock=lambda: now[0])
+        auth, calls = Authorize(), []
+
+        async def origin():
+            calls.append(1)
+            return JSONResponse({"total_cost": 40, "partial": True,
+                                 "errors": [{"subscription": "b", "error": "throttled"}]})
+
+        first = await cache.get(request(), origin, auth)
+        assert first.headers["x-cloudlens-cache"] == "miss"
+        assert first.headers["x-cloudlens-coverage"] == "partial"
+        item = next(iter(cache.store.rows.values()))
+        assert item.expires == item.created + min(86400, PARTIAL_TTL)
+        second = await cache.get(request(), origin, auth)
+        assert second.headers["x-cloudlens-cache"] == "hit"
+        assert calls == [1], "a partial answer is served from cache, not recomputed per view"
+        await cache.close()
+
+    asyncio.run(scenario())
+
+
+def test_partial_report_never_replaces_a_complete_snapshot():
+    async def scenario():
+        now = [1000.0]
+        cache, auth = make_cache(clock=lambda: now[0]), Authorize()
+        partial = False
+
+        async def origin():
+            if partial:
+                return JSONResponse({"total_cost": 5, "errors": ["throttled"]})
+            return JSONResponse({"total_cost": 40})
+
+        await cache.get(request(), origin, auth)
+        now[0] += 11
+        partial = True
+        stale = await cache.get(request(), origin, auth)
+        await settle(cache)
+        assert json.loads(stale.body)["total_cost"] == 40
+        again = await cache.get(request(), origin, auth)
+        assert json.loads(again.body)["total_cost"] == 40, "the complete answer is kept"
+        assert again.headers["x-cloudlens-refresh-error"] == "source_incomplete"
+        await cache.close()
+
+    asyncio.run(scenario())
+
+
+def test_whole_request_failure_is_never_cached_as_partial():
+    async def scenario():
+        cache, auth, calls = make_cache(), Authorize(), []
+
+        async def origin():
+            calls.append(1)
+            return JSONResponse({"budgets": [], "count": 0, "error": "Azure refused"})
+
+        await cache.get(request(), origin, auth)
+        await cache.get(request(), origin, auth)
+        assert cache.store.rows == {}
+        assert len(calls) == 2
+        await cache.close()
+
+    asyncio.run(scenario())
+
+
+def test_live_azure_views_are_cached_and_budget_views_are_named():
+    from app.main import BUDGET_VIEWS
+    from app.snapshot_cache import DEFAULT_POLICIES
+
+    assert {"/api/budgets", "/api/insights"} <= set(DEFAULT_POLICIES)
+    assert {"/api/budgets", "/api/insights"} == BUDGET_VIEWS
+
+
+def test_budget_revision_changes_the_partition():
+    first = replace(CONTEXT, authorization_version="policy-with-budget-revision-1")
+    second = replace(CONTEXT, authorization_version="policy-with-budget-revision-2")
+    assert first.partition() != second.partition()
+    assert (cache_family_key(request(), first, "v", POLICY)
+            != cache_family_key(request(), second, "v", POLICY))
 
 
 def test_expired_retention_cannot_be_served_as_last_good():

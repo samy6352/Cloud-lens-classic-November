@@ -30,62 +30,84 @@ class Resources:
                   currency: str | None = None,
                   filters: dict[str, list[str]] | None = None) -> dict[str, Any]:
         """Compare adjacent windows in one aggregation, keeping currency groups separate."""
-        from . import reporting
+        from . import reporting, resource_tags
         from .dashboard import _group_for_family
         from .tags import _pairs
 
         days = reporting.period_days(days)
-        with reporting.comparison_history(), self.wh.reader(scope, currency, filters) as r:
+        with reporting.comparison_history(), \
+                self.wh.reader(scope, currency, filters, usage=("tags",)) as r:
             hi, start, prev = reporting.window(r, days)
             if not hi:
                 return {"empty": True, "days": days, "resources": []}
 
+            # The per-resource summary and the rollup when they can answer this connection
+            # exactly, `costs` when they cannot -- the SQL is the same either way. Reading
+            # `costs` directly here timed out on a 16.9M-row estate.
+            tag_source = getattr(r, "tags", None)
+            source = getattr(r, "named", "costs") if tag_source else "costs"
+            agg = getattr(r, "agg", "costs")
             combined = f'"ChargePeriodStart" > {prev} AND "ChargePeriodStart" <= DATE \'{hi}\''
             period = f'"ChargePeriodStart" > {start}'
             previous = f'"ChargePeriodStart" > {prev} AND "ChargePeriodStart" <= {start}'
             resource_identity = (
-                'LOWER(TRIM("ResourceId")), LOWER(COALESCE("SubAccountId", \'\')), '
-                'COALESCE(NULLIF(NULLIF(UPPER(TRIM("BillingCurrency")), \'\'), \'UNKNOWN\'), \'unknown\')')
-            identity = resource_identity + ', "ServiceName", "ServiceFamily"'
-            representative = (
-                'service_current DESC, abs(service_cost) DESC, abs(service_prior_cost) DESC, '
-                '"ServiceName", "ServiceFamily", "ChargePeriodStart" DESC')
-
-            rows = r.rows(
-                'WITH scoped AS (SELECT *, '
-                f'SUM(CASE WHEN {period} THEN "BilledCost" ELSE 0 END) '
-                f'OVER (PARTITION BY {identity}) AS service_cost, '
-                f'SUM(CASE WHEN {previous} THEN "BilledCost" ELSE 0 END) '
-                f'OVER (PARTITION BY {identity}) AS service_prior_cost, '
-                f'MAX(CASE WHEN {period} THEN 1 ELSE 0 END) '
-                f'OVER (PARTITION BY {identity}) AS service_current '
-                f'FROM costs WHERE {combined} '
-                'AND "ResourceId" IS NOT NULL AND TRIM("ResourceId") <> \'\'), '
-                'ranked AS (SELECT *, row_number() OVER ('
-                f'PARTITION BY {resource_identity} ORDER BY {representative}) AS service_rank FROM scoped) '
-                'SELECT LOWER(TRIM("ResourceId")) AS id, '
-                'MAX(COALESCE(NULLIF("ResourceName", \'\'), \'(unnamed)\'))     AS name, '
-                'MAX(COALESCE("ResourceGroup", \'\'))                          AS resource_group, '
-                'MAX(COALESCE("SubAccountName", "SubAccountId", \'\'))         AS subscription, '
-                'LOWER(COALESCE("SubAccountId", \'\'))                        AS subscription_id, '
+                'LOWER(TRIM("ResourceId")) AS id, LOWER(COALESCE("SubAccountId", \'\')) '
+                'AS subscription_id, COALESCE(NULLIF(NULLIF(UPPER(TRIM("BillingCurrency")), '
+                '\'\'), \'UNKNOWN\'), \'unknown\') AS currency')
+            # Ranked per service rather than per row: every ranking key but the date is a
+            # per-service figure, so the first-ranked service is the same, and the window
+            # function sorts services instead of every charge.
+            inline_tags = "" if tag_source else ', MAX(COALESCE("Tags", \'\')) AS tags'
+            top = (
+                'WITH names AS (SELECT LOWER(COALESCE("SubAccountId", \'\')) AS name_sub, '
+                'MAX(COALESCE("SubAccountName", "SubAccountId", \'\')) AS name_text '
+                f'FROM {agg} WHERE {combined} GROUP BY 1), '
+                f'svc AS (SELECT {resource_identity}, "ServiceName", "ServiceFamily", '
+                f'SUM(CASE WHEN {period} THEN "BilledCost" ELSE 0 END) AS service_cost, '
+                f'SUM(CASE WHEN {previous} THEN "BilledCost" ELSE 0 END) AS service_prior_cost, '
+                f'MAX(CASE WHEN {period} THEN 1 ELSE 0 END) AS service_current, '
+                'MAX(COALESCE(NULLIF("ResourceName", \'\'), \'(unnamed)\')) AS name, '
+                'MAX(COALESCE("ResourceGroup", \'\')) AS resource_group, '
+                'MAX(COALESCE("RegionName", \'\')) AS region, '
+                'MIN("ChargePeriodStart") AS first_seen, MAX("ChargePeriodStart") AS last_seen'
+                f'{inline_tags} '
+                f'FROM {source} WHERE {combined} '
+                'AND "ResourceId" IS NOT NULL AND TRIM("ResourceId") <> \'\' '
+                'GROUP BY 1, 2, 3, "ServiceName", "ServiceFamily"), '
+                'ranked AS (SELECT *, row_number() OVER (PARTITION BY id, subscription_id, currency '
+                'ORDER BY service_current DESC, abs(service_cost) DESC, '
+                'abs(service_prior_cost) DESC, "ServiceName", "ServiceFamily") AS service_rank '
+                'FROM svc), '
+                'top AS (SELECT id, MAX(name) AS name, MAX(resource_group) AS resource_group, '
+                'COALESCE(MAX(name_text), \'\') AS subscription, subscription_id, '
                 'MAX(CASE WHEN service_rank = 1 THEN COALESCE("ServiceName", \'\') END) AS service, '
                 'MAX(CASE WHEN service_rank = 1 THEN COALESCE("ServiceFamily", \'\') END) AS family, '
-                'MAX(COALESCE("RegionName", \'\'))                            AS region, '
-                'COALESCE(NULLIF(NULLIF(UPPER(TRIM("BillingCurrency")), \'\'), \'UNKNOWN\'), '
-                '\'unknown\')                                               AS currency, '
-                f'SUM(CASE WHEN {period} THEN "BilledCost" ELSE 0 END)         AS cost, '
-                f'SUM(CASE WHEN {previous} THEN "BilledCost" ELSE 0 END)       AS prior_cost, '
-                'MAX(COALESCE("Tags", \'\'))                                  AS tags, '
-                'MIN("ChargePeriodStart")                                    AS first_seen, '
-                'MAX("ChargePeriodStart")                                    AS last_seen, '
+                'MAX(region) AS region, currency, '
+                'SUM(service_cost) AS cost, SUM(service_prior_cost) AS prior_cost, '
+                + ('MAX(tags) AS tags, ' if inline_tags else '')
+                + 'MIN(first_seen) AS first_seen, MAX(last_seen) AS last_seen, '
                 'COALESCE(json_agg(DISTINCT NULLIF("ServiceName", \'\')) '
-                f'FILTER (WHERE {period}), json_agg(DISTINCT NULLIF("ServiceName", \'\'))) '
+                'FILTER (WHERE service_current = 1), json_agg(DISTINCT NULLIF("ServiceName", \'\'))) '
                 'AS service_names '
-                'FROM ranked '
-                "GROUP BY 1, 5, 9 "
-                "ORDER BY cost DESC, prior_cost DESC, id, subscription_id, currency",
-                limit=MAX_RESOURCES + 1,
-            )
+                'FROM ranked LEFT JOIN names ON name_sub = subscription_id '
+                'GROUP BY id, subscription_id, currency '
+                'ORDER BY cost DESC, prior_cost DESC, id, subscription_id, currency '
+                f'LIMIT {MAX_RESOURCES + 1})')
+            if tag_source:
+                rows = r.rows(
+                    f'{top} SELECT top.*, COALESCE(tg.tags, \'\') AS tags FROM top '
+                    + resource_tags.lateral_sql(
+                        tag_source, "top.id", "top.currency", prev, str(hi)[:10],
+                        "COALESCE(NULLIF(NULLIF(UPPER(TRIM({c})), ''), 'UNKNOWN'), 'unknown')")
+                    + ' ORDER BY cost DESC, prior_cost DESC, id, subscription_id, currency',
+                    limit=MAX_RESOURCES + 1,
+                )
+            else:
+                rows = r.rows(
+                    f'{top} SELECT * FROM top '
+                    'ORDER BY cost DESC, prior_cost DESC, id, subscription_id, currency',
+                    limit=MAX_RESOURCES + 1,
+                )
 
         truncated = len(rows) > MAX_RESOURCES
         rows = rows[:MAX_RESOURCES]

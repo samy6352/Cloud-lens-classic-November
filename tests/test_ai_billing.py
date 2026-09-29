@@ -92,7 +92,7 @@ def backend(monkeypatch):
             return copy.deepcopy(state.rows[:limit])
 
     @contextmanager
-    def reader(*, scope, currency=None, filters=None):
+    def reader(*, scope, currency=None, filters=None, **options):
         state.readers.append((scope, currency, filters, reporting.selected_month(), cost._caller_id.get()))
         yield Reader()
 

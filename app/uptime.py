@@ -27,8 +27,9 @@ MAX_DAILY_CELLS = 150_000
 
 # Pure time units only: "Hours", "1 Hour", "1/Hour", "10 Hours", "100 Hours". Anchored at
 # both ends so "1 GiB Hour" and "1 GiB Second" — which are quantity x duration, not duration —
-# cannot match. See the module docstring.
-HOUR_UNIT = r'^(?:[0-9]+(?:\.[0-9]+)?\s*/?\s*)?hours?$'
+# cannot match. See the module docstring. Shared with `hourly_usage`, which keeps only these
+# rows; one definition so the summary and this filter cannot disagree.
+from .hourly_usage import HOUR_UNIT  # noqa: E402
 
 # The leading multiplier: a "10 Hours" row of quantity 3 is 30 hours, not 3.
 # No capture group: PostgreSQL substring would otherwise return only the decimal part.
@@ -51,21 +52,29 @@ WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", 
 def hourly_cost(scope: list[str] | None = None, days: int = 30,
                 currency: str | None = None) -> dict[str, Any]:
     """Billed hours, derived rates and estimated billed coverage for the window."""
-    from . import reporting
+    from . import reporting, resource_tags
     from .warehouse import warehouse
 
     days = reporting.period_days(days)
-    with warehouse.reader(scope=scope, currency=currency) as r:
+    with warehouse.reader(scope=scope, currency=currency, usage=("hourly", "tags")) as r:
+        # Each relation below is the precomputed summary when it can answer this
+        # connection exactly and the same grain over the scoped `costs` view when it
+        # cannot, so the SQL is identical either way; only the speed differs. Reading
+        # `costs` here directly timed out on a 16.9M-row estate.
+        agg = getattr(r, "agg", "costs")
+        source = getattr(r, "hourly", None) or "costs"
+        tag_source = getattr(r, "tags", None)
         # Anchored to the newest data rather than to today, for the same reason every other
         # warehouse view is: cost lands a day or two late, so a window ending at CURRENT_DATE
         # drops the most recent complete day and, on a stale warehouse, returns nothing at all
         # — which reads as "nothing ran" instead of "this data is old".
-        edge = r.rows('SELECT max("ChargePeriodStart") AS hi FROM costs')
+        edge = r.rows(f'SELECT max("ChargePeriodStart") AS hi FROM {agg}')
         hi = edge[0]["hi"] if edge and edge[0]["hi"] else None
         if hi is None:
             return _empty(days)
 
-        window = f'"ChargePeriodStart" > {reporting.start_sql(hi, days)}'
+        start = reporting.start_sql(hi, days)
+        window = f'"ChargePeriodStart" > {start}'
 
         # Every row in the window, so the tab can say what share of spend is hour-billed at
         # all. Without it a small hourly total is indistinguishable from a small estate.
@@ -73,7 +82,7 @@ def hourly_cost(scope: list[str] | None = None, days: int = 30,
             f"""
             SELECT COALESCE(NULLIF("BillingCurrency", ''), 'unknown') AS currency,
                    SUM(COALESCE("BilledCost", 0))         AS cost
-            FROM costs WHERE {window} GROUP BY 1
+            FROM {agg} WHERE {window} GROUP BY 1
             """,
             limit=64,
         )
@@ -95,16 +104,25 @@ def hourly_cost(scope: list[str] | None = None, days: int = 30,
               COALESCE("RegionName", '')                                      AS region,
               COALESCE("MeterName", '')                                       AS meter,
               COALESCE(NULLIF("BillingCurrency", ''), 'unknown')              AS currency,
-              COALESCE("Tags", '')                                            AS tags,
               "ChargePeriodStart"                                             AS day,
               COALESCE("PricingQuantity", 0) * COALESCE(
                 TRY_CAST(regexp_extract(trim("UnitOfMeasure"), '{HOUR_MULTIPLIER}') AS DOUBLE),
                 1) AS hours,
               COALESCE("BilledCost", 0)                                       AS cost
-            FROM costs
+            FROM {source}
             WHERE {window}
               AND regexp_matches(lower(trim(COALESCE("UnitOfMeasure", ''))), '{HOUR_UNIT}')
         """
+
+        # Tags for the meters actually returned, looked up per resource rather than carried
+        # through every row: they are most of the bytes of a charge and vary within a day.
+        if tag_source:
+            tagged = ("SELECT meters.*, tg.tags FROM meters "
+                      + resource_tags.lateral_sql(tag_source, "meters.id", "meters.currency",
+                                                  start, str(hi)[:10])
+                      + " ORDER BY meters.cost DESC")
+        else:
+            tagged = "SELECT meters.*, NULL AS tags FROM meters ORDER BY meters.cost DESC"
 
         # One row per resource, meter and day is the grain everything else is built from: the
         # peak day gives the instance count, and the day list gives the weekday profile.
@@ -116,27 +134,29 @@ def hourly_cost(scope: list[str] | None = None, days: int = 30,
                           SUM(hours) AS hours, SUM(cost) AS cost,
                           MAX(name) AS name, MAX(service) AS service,
                           MAX(subscription) AS subscription,
-                          MAX(resource_group) AS resource_group, MAX(region) AS region,
-                          MAX(tags) AS tags
+                          MAX(resource_group) AS resource_group, MAX(region) AS region
                    FROM src GROUP BY id, meter, currency, day
+                 ),
+                 meters AS (
+                   SELECT id, meter, currency,
+                          MAX(name)            AS name,
+                          MAX(service)         AS service,
+                          MAX(subscription)    AS subscription,
+                          MAX(resource_group)  AS resource_group,
+                          MAX(region)          AS region,
+                          SUM(hours)           AS hours,
+                          SUM(cost)            AS cost,
+                          MAX(hours)           AS peak_day_hours,
+                          COUNT(*)             AS days_billed,
+                          MIN(day)             AS first_day,
+                          MAX(day)             AS last_day
+                   FROM daily
+                   GROUP BY id, meter, currency
+                   HAVING SUM(hours) > 0
+                   ORDER BY cost DESC
+                   LIMIT {MAX_ROWS + 1}
                  )
-            SELECT id, meter, currency,
-                   MAX(name)            AS name,
-                   MAX(service)         AS service,
-                   MAX(subscription)    AS subscription,
-                   MAX(resource_group)  AS resource_group,
-                   MAX(region)          AS region,
-                   MAX(tags)            AS tags,
-                   SUM(hours)           AS hours,
-                   SUM(cost)            AS cost,
-                   MAX(hours)           AS peak_day_hours,
-                   COUNT(*)             AS days_billed,
-                   MIN(day)             AS first_day,
-                   MAX(day)             AS last_day
-            FROM daily
-            GROUP BY id, meter, currency
-            HAVING SUM(hours) > 0
-            ORDER BY cost DESC
+            {tagged}
             """,
             limit=MAX_ROWS + 1,
         )
@@ -246,6 +266,10 @@ def _cells(cells: list[dict[str, Any]], keep: set[str],
             round(float(cell.get("hours") or 0.0), 3),
             round(float(cell.get("cost") or 0.0), 6),
         ])
+    # In day order: the query does not order its groups, so the same data could otherwise
+    # arrive as a differently ordered series from one run, or one source table, to the next.
+    for series in out.values():
+        series.sort(key=lambda cell: cell[0])
     return labels, out, False
 
 

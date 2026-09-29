@@ -25,6 +25,7 @@ async (page) => {
     export const esc=v=>String(v??"").replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     export const money=(v,c='USD')=>c+' '+Number(v||0).toFixed(2),moneyHtml=money;
     export const get=async(url,options={})=>{const r=await fetch(url,{signal:options.signal});if(!r.ok)throw new Error('Fixture request failed');return r.json()};
+    export const freshReads=async fn=>fn();
     export const post=async()=>({});
     export const scopeIds=()=>['fixture-sub'],allSubscriptions=()=>[{id:'fixture-sub',name:'Fixture'}];
     export const whoAmI=async()=>({authenticated:true,user:{admin:false}});

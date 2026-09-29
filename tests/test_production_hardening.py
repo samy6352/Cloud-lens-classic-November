@@ -58,16 +58,20 @@ def test_scope_predicate_never_matches_display_names(monkeypatch):
         billing_serving,
         environment,
         fx_rollup,
+        hourly_usage,
         presence,
         reporting,
+        resource_tags,
         rollup,
+        usage_signals,
     )
 
     monkeypatch.setattr(reporting, "view_predicate", lambda: "")
     statements = []
     connection = SimpleNamespace(execute=lambda sql, *args: statements.append(sql),
                                  close=lambda: None)
-    owner = SimpleNamespace(_store=SimpleNamespace(connect=lambda: connection),
+    owner = SimpleNamespace(_store=SimpleNamespace(connect=lambda: connection,
+                                                   statement_timeout=""),
                             _columns_sql=lambda *args, **kw: "*", _pg_table="public.costs",
                             _filter_sql=lambda *args, **kw: "",
                             _rollup_schema="public",
@@ -75,8 +79,10 @@ def test_scope_predicate_never_matches_display_names(monkeypatch):
     # The shadowing helpers reach for the modules that decide where derived rows live and
     # how native currency is restored; exec'ing them into a namespace without those is how
     # this harness used to report a NameError in place of the contract it means to check.
+    usage_modules = {"hourly": hourly_usage, "signals": usage_signals, "tags": resource_tags}
     shared = {"__package__": "app", "canonical_sub_id": lambda value: value,
-              "environment": environment, "fx_rollup": fx_rollup, "log": logging.getLogger(__name__)}
+              "environment": environment, "fx_rollup": fx_rollup, "log": logging.getLogger(__name__),
+              "USAGE_MODULES": usage_modules, "resource_tags": resource_tags}
     connect = load_function("app/warehouse.py", "connect", dict(shared), class_name="Warehouse")
     prepare = load_function("app/warehouse.py", "_prepare_connection", dict(shared),
                             class_name="Warehouse")
@@ -91,11 +97,20 @@ def test_scope_predicate_never_matches_display_names(monkeypatch):
     shadow_serving = load_function("app/warehouse.py", "_shadow_billing_serving",
                                    {**shared, "billing_serving": billing_serving},
                                    class_name="Warehouse")
+    shadow_usage = load_function("app/warehouse.py", "_shadow_usage", dict(shared),
+                                 class_name="Warehouse")
+    shadow_tags = load_function("app/warehouse.py", "_shadow_resource_tags", dict(shared),
+                                class_name="Warehouse")
+    shadow_aux = load_function("app/warehouse.py", "_shadow_auxiliary_rollup", dict(shared),
+                               class_name="Warehouse")
     owner._prepare_connection = lambda *args, **kw: prepare(owner, *args, **kw)
     owner._shadow_rollup = lambda *args, **kw: shadow(owner, *args, **kw)
     owner._shadow_presence = lambda *args, **kw: shadow_seen(owner, *args, **kw)
     owner._shadow_billing_rollup = lambda *args, **kw: shadow_bill(owner, *args, **kw)
     owner._shadow_billing_serving = lambda *args, **kw: shadow_serving(owner, *args, **kw)
+    owner._shadow_usage = lambda *args, **kw: shadow_usage(owner, *args, **kw)
+    owner._shadow_resource_tags = lambda *args, **kw: shadow_tags(owner, *args, **kw)
+    owner._shadow_auxiliary_rollup = lambda *args, **kw: shadow_aux(owner, *args, **kw)
     assert connect(owner, scope=["allowed-id"]) is connection
 
     # All five of them: none of the derived tables is scope-filtered, so the views
@@ -109,6 +124,17 @@ def test_scope_predicate_never_matches_display_names(monkeypatch):
     for view in views:
         assert 'lower("SubAccountId") IN' in view
         assert "SubAccountName" not in view
+
+    # The opt-in usage summaries hold every subscription too, so a reader asking for them
+    # must get views carrying exactly the same predicate.
+    statements.clear()
+    assert connect(owner, read_only=True, scope=["allowed-id"],
+                   usage=("hourly", "signals", "tags")) is connection
+    views = [statement for statement in statements if "CREATE TEMP VIEW" in statement]
+    for table in (hourly_usage.TABLE, usage_signals.TABLE, resource_tags.TABLE):
+        view = next(v for v in views if f"CREATE TEMP VIEW {table} " in v)
+        assert 'lower("SubAccountId") IN' in view, table
+        assert "SubAccountName" not in view.split("WHERE", 1)[-1], table
 
 
 def test_history_strips_privileged_roles_and_orphaned_tool_messages():

@@ -230,6 +230,37 @@ def _stamped_tables(con: Any) -> frozenset[str]:
     return frozenset(name for name in (part.strip() for part in row[0].split(",")) if name)
 
 
+def stamped_tables(con: Any) -> frozenset[str]:
+    return _stamped_tables(con)
+
+
+def unstamp(con: Any, tables: Sequence[str]) -> None:
+    """Withdraw the ready stamp from `tables` alone, leaving every other table trusted.
+
+    For a table whose contents could not be preserved -- new, recreated for a changed
+    grain, or failing its storage check. Invalidating the whole generation instead
+    sends *every* dashboard read back to the detail table until a full rebuild of every
+    table finishes: hours at a year of retained history, for a change to one table.
+    Readers already refuse a table missing from the roster, and `refresh_rollup` builds
+    exactly the tables missing from it, so this is sufficient on both sides.
+    """
+    drop = set(tables)
+    stamped = _stamped_tables(con)
+    if not drop & stamped:
+        return
+    remaining = stamped - drop
+    if not remaining:
+        # An empty roster reads back as the legacy default, which would trust tables
+        # that were never stamped. Nothing is left to protect, so rebuild everything.
+        invalidate_rollup(con)
+        return
+    con.execute(
+        "INSERT INTO meta (key,value,updated_at) VALUES (?,?,now()) "
+        "ON CONFLICT (key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+        [ROLLUP_TABLES_KEY, ",".join(sorted(remaining))],
+    )
+
+
 def fresh_derived_tables(con: Any) -> frozenset[str]:
     """Which derived tables may be read as current, in one round trip.
 
@@ -249,6 +280,33 @@ def generation_ready(expected: int) -> bool:
     with warehouse.connect(read_only=True) as con:
         source, ready = _generation_pair(con)
         return source == expected and _ready(con, source, ready)
+
+
+def derived_complete() -> bool:
+    """Whether the ready stamp covers every derived table this release defines.
+
+    A release that adds a table boots with the generation still coherent for the old
+    roster, so `generation_ready` alone would never build the new one until the next
+    import -- and its readers would stay on the detail table until then.
+    """
+    from .warehouse import warehouse
+
+    with warehouse.connect(read_only=True) as con:
+        return rollup_complete(con)
+
+
+def rollup_complete(con: Any) -> bool:
+    """`rollup_current`, and every table this release defines is covered by the stamp.
+
+    The question an import asks before deciding whether a rebuild is owed: a table
+    withdrawn by `unstamp` leaves the generation coherent, but still has to be built.
+    """
+    from .warehouse import DERIVED_MODULES
+
+    if not rollup_current(con):
+        return False
+    stamped = _stamped_tables(con)
+    return all(module.TABLE in stamped for module in DERIVED_MODULES)
 
 
 class RollupTransaction:

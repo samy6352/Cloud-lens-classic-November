@@ -8,7 +8,7 @@
  * Tab families load on demand through an explicit context, never by importing this shell.
  * Savings joins four independent live scans and paints their progress without blocking edits.
  */
-import { allSubscriptions, askAgent, drawChart, esc, get, money, moneyHtml, onScopeChange, post, refreshHeader, scopeIds, selectSubscriptions, setGlanceSpark, whoAmI } from "./app.js";
+import { allSubscriptions, askAgent, drawChart, esc, freshReads, get, money, moneyHtml, onScopeChange, post, refreshHeader, scopeIds, selectSubscriptions, setGlanceSpark, whoAmI } from "./app.js";
 import { close as closeAnalysis, invalidate as invalidateAnalysis, isOpen as isAnalysisOpen, openAnalysis, setAnalysisContext, wireAnalysis } from "./analysis.js";
 import { mountBot, setBotState } from "./bot.js";
 import { railIcon } from "./icons.js";
@@ -552,7 +552,7 @@ function renderViewActions() {
     let retry;
     try {
       if (current === "ai-billing") retry = (await loadFamily("ai")).refreshOnce();
-      await loadTabs({ preserve: true });
+      await freshReads(() => loadTabs({ preserve: true }));
     } finally { retry?.(); button.disabled = false; }
   };
   host.onkeydown = event => {

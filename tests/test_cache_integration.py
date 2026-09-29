@@ -236,20 +236,24 @@ async def test_lifespan_owns_cache_and_gates_mutating_background_workers(monkeyp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("ready", [True, False])
-async def test_startup_prepares_missing_generation_without_reimporting_costs(monkeypatch, ready):
+@pytest.mark.parametrize("ready,complete", [(True, True), (False, True), (True, False)])
+async def test_startup_prepares_missing_generation_without_reimporting_costs(
+        monkeypatch, ready, complete):
     from app import jobs
 
-    current = {"ready": ready}
+    current = {"ready": ready, "complete": complete}
 
     async def rebuild():
-        current["ready"] = True
+        current["ready"] = current["complete"] = True
 
     monkeypatch.setattr(jobs, "read_generation", lambda: 0)
     monkeypatch.setattr(jobs, "generation_ready",
                         lambda generation: current["ready"] and generation == 0)
+    # A release that adds a derived table boots with a coherent generation that does not
+    # yet cover it; startup must build it rather than wait for the next import.
+    monkeypatch.setattr(jobs, "derived_complete", lambda: current["complete"])
     warehouse = SimpleNamespace(refresh_rollup_async=AsyncMock(side_effect=rebuild))
     state = SimpleNamespace(snapshot_bootstrap_ready=False, snapshot_bootstrap_error=None)
     await main._prepare_snapshot_generation(warehouse, state)
     assert state.snapshot_bootstrap_ready is True
-    assert warehouse.refresh_rollup_async.await_count == (0 if ready else 1)
+    assert warehouse.refresh_rollup_async.await_count == (0 if ready and complete else 1)

@@ -40,11 +40,14 @@ from . import (
     derived,
     environment,
     fx_rollup,
+    hourly_usage,
     presence,
+    resource_tags,
     rollup,
     schema_v2,
     spot_rates,
     store,
+    usage_signals,
 )
 from .sqldialect import SHIM_SCHEMA, strip_literals
 
@@ -55,9 +58,18 @@ log = logging.getLogger("cloudlens.warehouse")
 # roster together -- the four had drifted apart once, and a table that was rebuilt
 # by none of them but trusted by the reader served an empty relation as truth.
 DERIVED_MODULES = (
-    rollup, presence, billing_rollup, billing_serving, commitment_benefits, spot_rates)
+    rollup, presence, billing_rollup, billing_serving, commitment_benefits, spot_rates,
+    hourly_usage, usage_signals, resource_tags)
 if fx_rollup.ENABLED:
     DERIVED_MODULES += (fx_rollup,)
+
+# Summaries a reader opts into by name. Each costs a temp view and a freshness read per
+# connection, so only the tabs that need one ask for it.
+USAGE_MODULES = {
+    "hourly": hourly_usage,
+    "signals": usage_signals,
+    "tags": resource_tags,
+}
 
 ARM = "https://management.azure.com"
 DETAILS_API = "2023-11-01"
@@ -468,7 +480,8 @@ class Reader:
                  named: str = "costs", billing: str = "costs", *,
                  benefit: str = "costs", spot: str = "costs",
                  bill_stored: bool = False, bill_serving: str | None = None,
-                 bill_indexed: bool = False, res_ordered: bool = False) -> None:
+                 bill_indexed: bool = False, res_ordered: bool = False,
+                 usage: dict[str, str] | None = None) -> None:
         self._con = con
         self.agg = aggregate
         self.res = counted
@@ -484,6 +497,13 @@ class Reader:
         self.bill_serving = bill_serving
         self.bill_indexed = bill_indexed
         self.res_ordered = res_ordered
+        # Opt-in summaries (see `USAGE_MODULES`). Each names a relation that answers
+        # this connection exactly -- the stored table when it can, the same grain over
+        # the scoped `costs` view when it cannot -- or is absent when not requested.
+        usage = usage or {}
+        self.hourly = usage.get("hourly")
+        self.signals = usage.get("signals")
+        self.tags = usage.get("tags")
 
     @property
     def aggregated(self) -> bool:
@@ -653,32 +673,58 @@ class Warehouse:
             with jobs.coherent_rollup(self, tables) as con:
                 derived.lock_rebuild(con, self._rollup_schema)
                 self._ensure_derived(con, self._rollup_schema)
+                # A table the current stamp does not cover -- new in this release, or
+                # recreated because its shape changed -- is built in full on its own. The
+                # others only need the periods written since they were last current.
+                # Rebuilding every table because one was added cost hours at retention
+                # scale and sent every dashboard read to `costs` for the duration.
+                stamped = jobs.stamped_tables(con)
+                missing = [m for m in DERIVED_MODULES if m.TABLE not in stamped]
+                present = [m for m in DERIVED_MODULES if m.TABLE in stamped]
+                pending = (jobs.rebuild_windows(con, [m.TABLE for m in present], window)
+                           if present else None)
+                missing_names = {m.TABLE for m in missing}
+                if pending is not None and any(
+                        getattr(m, "SOURCE_TABLE", None)
+                        and (m in missing or m.SOURCE_TABLE in missing_names)
+                        for m in DERIVED_MODULES):
+                    # A dependent table is built from its source within one rebuild call,
+                    # so a dependency that straddles the missing/present split cannot be
+                    # served by the two-part path. Rebuild everything instead.
+                    pending = None
+                transaction = jobs.RollupTransaction(con)
                 # Every table in one call, so their contents describe the same
                 # generation of `costs` and the generation stamp `coherent_rollup`
                 # writes covers all of them or none -- and so the exclusive locks their
                 # swaps need are taken together at the end, rather than one being
                 # held for the duration of the other's build.
-                pending = jobs.rebuild_windows(con, tables, window)
-                transaction = jobs.RollupTransaction(con)
                 if pending is None:
+                    built = list(DERIVED_MODULES)
                     counts = derived.rebuild(transaction, self._rollup_schema,
                                             DERIVED_MODULES, self._pg_table, cleanup=False)
-                elif pending:
-                    counts = derived.rebuild(
-                        transaction, self._rollup_schema, DERIVED_MODULES, self._pg_table,
-                        pending[0] if len(pending) == 1 else None, cleanup=False,
-                        **({"windows": pending} if len(pending) > 1 else {}))
                 else:
+                    built = missing
                     counts = {rollup.TABLE: 0}
+                    if missing:
+                        log.info("warehouse: building %s, new since the last stamp",
+                                 ", ".join(m.TABLE for m in missing))
+                        counts.update(derived.rebuild(
+                            transaction, self._rollup_schema, missing, self._pg_table,
+                            cleanup=False))
+                    if pending:
+                        counts.update(derived.rebuild(
+                            transaction, self._rollup_schema, present, self._pg_table,
+                            pending[0] if len(pending) == 1 else None, cleanup=False,
+                            **({"windows": pending} if len(pending) > 1 else {})))
         except Exception as exc:  # noqa: BLE001
             log.warning("warehouse: could not rebuild the rollup (%s); "
                         "the previous ready generation is retained", exc)
             if strict:
                 raise
             return 0
-        if pending is None:
+        if built:
             with self.connect() as con:
-                for module in DERIVED_MODULES:
+                for module in built:
                     derived.retire(con, self._rollup_schema, module)
         return counts[rollup.TABLE]
 
@@ -841,7 +887,8 @@ class Warehouse:
                 scope: list[str] | None = None,
                 currency: str | None = None,
                 filters: dict[str, list[str]] | None = None,
-                *, include_commitments: bool = False) -> Any:
+                *, include_commitments: bool = False,
+                usage: tuple[str, ...] = ()) -> Any:
         """A pooled PostgreSQL session, optionally restricted to a set of subscriptions.
 
         Scope is enforced by shadowing `costs` with a temp view holding only the selected
@@ -878,7 +925,7 @@ class Warehouse:
         try:
             return self._prepare_connection(
                 con, read_only, scope, currency, filters,
-                include_commitments=include_commitments)
+                include_commitments=include_commitments, usage=usage)
         except BaseException:
             try:
                 con.close()
@@ -889,9 +936,15 @@ class Warehouse:
     def _prepare_connection(self, con: Any, read_only: bool,
                             scope: list[str] | None, currency: str | None,
                             filters: dict[str, list[str]] | None, *,
-                            include_commitments: bool = False) -> Any:
+                            include_commitments: bool = False,
+                            usage: tuple[str, ...] = ()) -> Any:
         if include_commitments and not read_only:
             raise ValueError("Commitment summaries require a read-only warehouse connection.")
+        unknown_usage = set(usage) - set(USAGE_MODULES)
+        if unknown_usage:
+            raise ValueError(f"Unknown usage summaries: {', '.join(sorted(unknown_usage))}")
+        if usage and not read_only:
+            raise ValueError("Usage summaries require a read-only warehouse connection.")
         # Before the early exit below, because an unscoped reader is still a reader: it
         # runs the same dashboard queries against the same tables and can be abandoned the
         # same way. See `PostgresStore.statement_timeout` for why the bound has to be the
@@ -914,6 +967,7 @@ class Warehouse:
             if include_commitments:
                 self._shadow_auxiliary_rollup(con, "", None, None, commitment_benefits)
                 self._shadow_auxiliary_rollup(con, "", None, None, spot_rates)
+            self._shadow_usage(con, usage, "", "", None, "", None)
             return con
 
         select = self._columns_sql(rate, target)
@@ -933,6 +987,10 @@ class Warehouse:
             con.execute("CREATE TEMP TABLE _scope (id text)")
             con.execute(f"INSERT INTO _scope (id) VALUES {values}", ids)
             where = 'WHERE (lower("SubAccountId") IN (SELECT id FROM _scope))'
+        # Scope alone, before the filter bar and the period narrow it further. Tags are
+        # looked up per resource *after* those have chosen the resources, and are kept
+        # per month, so a day-level period predicate must not be applied to them.
+        scope_where = where
 
         # The filter bar narrows the same view the scope does, so every tab, the export, the
         # report and the agent all inherit it without any of them knowing it exists. Doing it
@@ -977,7 +1035,42 @@ class Warehouse:
         if include_commitments:
             self._shadow_auxiliary_rollup(con, where, rate, filters, commitment_benefits)
             self._shadow_auxiliary_rollup(con, where, rate, filters, spot_rates)
+        self._shadow_usage(con, usage, where, scope_where, rate, target, filters)
         return con
+
+    def _shadow_usage(self, con: Any, usage: tuple[str, ...], where: str, scope_where: str,
+                      rate: float | None, target: str,
+                      filters: dict[str, list[str]] | None) -> None:
+        """Scope-matched views of the opt-in summaries this connection asked for.
+
+        Every one is shadowed, including on the unscoped path: the published tables hold
+        every subscription and may be behind the detail table, so an unqualified read
+        must always meet either a checked table or the same grain computed from `costs`.
+        """
+        for name in usage:
+            module = USAGE_MODULES[name]
+            if module is resource_tags:
+                self._shadow_resource_tags(con, scope_where, rate, target)
+            else:
+                self._shadow_auxiliary_rollup(con, where, rate, filters, module)
+
+    def _shadow_resource_tags(self, con: Any, scope_where: str, rate: float | None,
+                              target: str) -> None:
+        """Tags carry no money, so a converted currency only relabels the currency.
+
+        The label matters: callers match tags to their own rows on currency, and under a
+        conversion the `costs` view reports every row in the target currency. Scope is
+        applied; the filter bar and period are not -- see `scope_where`.
+        """
+        if self._rollup_fresh(con, resource_tags.TABLE):
+            currency = f"'{target}' AS \"BillingCurrency\"" if rate is not None else '"BillingCurrency"'
+            con.execute(
+                f'CREATE TEMP VIEW {resource_tags.TABLE} AS SELECT "{resource_tags.PERIOD}", '
+                f'"SubAccountId", "ResourceKey", {currency}, "TaggedOn", "Tags", "UnknownDays" '
+                f'FROM "{self._rollup_schema}".{resource_tags.TABLE} {scope_where}')
+        else:
+            con.execute(f"CREATE TEMP VIEW {resource_tags.TABLE} AS "
+                        f"{resource_tags.select_sql('costs')}")
 
     def _shadow_billing_rollup(self, con: Any, where: str, rate: float | None,
                                filters: dict[str, list[str]] | None) -> bool:
@@ -1143,7 +1236,8 @@ class Warehouse:
                currency: str | None = None,
                filters: dict[str, list[str]] | None = None,
                budget_ms: int | None = None,
-               *, include_commitments: bool = False) -> Iterator[Reader]:
+               *, include_commitments: bool = False,
+               usage: tuple[str, ...] = ()) -> Iterator[Reader]:
         """One read-only connection reused across a burst of internal queries.
 
         Opening a connection is the expensive part — and under a scope it also rebuilds the
@@ -1170,7 +1264,9 @@ class Warehouse:
         caller cannot award itself more time than the server allows, and `NULLIF` treats
         an unlimited server bound as no competitor rather than as zero.
         """
-        connect_options = {"include_commitments": True} if include_commitments else {}
+        connect_options: dict[str, Any] = {"include_commitments": True} if include_commitments else {}
+        if usage:
+            connect_options["usage"] = tuple(usage)
         con = self.connect(
             read_only=True, scope=scope, currency=currency, filters=filters, **connect_options)
         try:
@@ -1198,7 +1294,8 @@ class Warehouse:
                     spot=spot_rates.TABLE if include_commitments else "costs",
                     bill_stored=con.bill_stored, bill_serving=con.bill_serving,
                     bill_indexed=billing_rollup.TABLE in indexed,
-                    res_ordered=presence.TABLE in indexed)
+                    res_ordered=presence.TABLE in indexed,
+                    usage={name: USAGE_MODULES[name].TABLE for name in usage})
         finally:
             con.close()
 
@@ -1421,18 +1518,23 @@ class Warehouse:
             self._ensure_query_role(con)
 
     def _ensure_derived(self, con: Any, schema: str) -> None:
-        """Called under generation/rebuild locks, with invalidation atomic with DDL."""
+        """Called under generation/rebuild locks, with invalidation atomic with DDL.
+
+        A table whose contents could not be kept loses its own ready stamp and nothing
+        else's, so the tables that are still correct keep serving while it is rebuilt.
+        """
         from . import jobs
 
         self._drop_outdated_derived(con, schema)
         for module in DERIVED_MODULES:
             if derived.ensure(con, schema, module):
-                jobs.invalidate_rollup(con)
+                jobs.unstamp(con, [module.TABLE])
             try:
                 derived.validate_storage(con, schema, module)
             except derived.RebuildRequired as exc:
-                log.warning("warehouse: invalidating derived readiness: %s", exc)
-                jobs.invalidate_rollup(con)
+                log.warning("warehouse: withdrawing %s until it is rebuilt: %s",
+                            module.TABLE, exc)
+                jobs.unstamp(con, [module.TABLE])
 
     def _drop_outdated_derived(self, con: Any, schema: str) -> None:
         """Drop a derived table whose columns no longer match the grain that defines it.
@@ -1481,16 +1583,30 @@ class Warehouse:
                     con.execute(f'CREATE OR REPLACE VIEW "{schema}".{module.TABLE} AS '
                                 f'SELECT * FROM "{schema}".{active}')
                 continue
-            if found and found != expected:
-                jobs.invalidate_rollup(con)
-                log.info("warehouse: rebuilding %s; its columns no longer match the grain "
-                         "(missing %s, extra %s)", module.TABLE,
-                         sorted(expected - found) or "none", sorted(found - expected) or "none")
+            layout = getattr(module, "layout", None)
+            layout_key = f"derived_layout:{module.TABLE}"
+            recorded = (con.execute("SELECT value FROM meta WHERE key = ?", [layout_key]).fetchone()
+                        if layout else None)
+            # A build filter that changed means the stored rows answer an older question,
+            # even though every column is still where the reader expects it.
+            relaid = bool(layout and found and recorded and recorded[0] != layout())
+            if found and (found != expected or relaid):
+                jobs.unstamp(con, [module.TABLE])
+                log.info("warehouse: rebuilding %s; %s", module.TABLE,
+                         "its build filter changed" if relaid and found == expected else
+                         f"its columns no longer match the grain (missing "
+                         f"{sorted(expected - found) or 'none'}, extra "
+                         f"{sorted(found - expected) or 'none'})")
                 con.execute(f'DROP VIEW IF EXISTS "{schema}".{module.TABLE}')
                 for suffix in derived.SIDES:
                     con.execute(
                         f'DROP TABLE IF EXISTS "{schema}".{module.TABLE}{suffix} CASCADE')
                 con.execute(f'DROP TABLE IF EXISTS "{schema}".{module.TABLE} CASCADE')
+            if layout and (not recorded or recorded[0] != layout()):
+                con.execute(
+                    "INSERT INTO meta (key,value,updated_at) VALUES (?,?,now()) "
+                    "ON CONFLICT (key) DO UPDATE SET value=excluded.value,"
+                    "updated_at=excluded.updated_at", [layout_key, layout()])
 
     # The command that moves a relation between schemas depends on what it is; ALTER TABLE
     # accepts some of these but not all, and errors rather than doing the right thing.

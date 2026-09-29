@@ -229,6 +229,37 @@ assert.ok(source.includes("me.required && me.authenticated && me.features?.snaps
 """)
 
 
+def test_fresh_reads_scope_adds_fresh_only_to_interactive_cacheable_gets():
+    run_node(HARNESS + r"""
+import fs from "node:fs";
+const source=fs.readFileSync("./web/assets/app.js","utf8");
+const text=source.slice(source.indexOf("let cacheWarmer ="),
+  source.indexOf("\n/**\n * A write,")).replace("export async function get","async function get");
+let seen=[], delays=[];
+globalThis.setTimeout=(fn,delay)=>{delays.push(delay);return delays.length;};
+globalThis.clearTimeout=()=>{};
+const fetch=async(url,opts)=>{
+  seen.push({url,opts});
+  return {ok:true,status:200,statusText:"OK",headers:new Headers(),json:async()=>({total:1})};
+};
+const client=new Function("location","recordSnapshot","toLogin","fetch",text+
+  "\nreturn {get,freshReads};")( {origin}, data=>data, ()=>{}, fetch);
+await client.freshReads(async()=>{
+  await client.get("/api/dashboard/executive?scope=s1", {timeout:20});
+  await client.get("/api/filters?scope=s1", {cacheWarming:true,timeout:20});
+  await client.get("/api/auth/me", {timeout:20});
+  await client.get("/api/dashboard/ai-billing?force=true", {timeout:20});
+});
+assert.equal(seen[0].url,"/api/dashboard/executive?scope=s1&fresh=true");
+assert.equal(delays[0],180000);
+assert.equal(seen[1].url,"/api/filters?scope=s1");
+assert.equal(delays[1],20);
+assert.equal(seen[2].url,"/api/auth/me");
+assert.equal(seen[3].url,"/api/dashboard/ai-billing?force=true&fresh=true");
+assert.equal(delays[3],180000);
+""")
+
+
 def test_central_helper_timeout_failed_json_and_warm_auth_failure_do_not_redirect_or_register():
     run_node(HARNESS + r"""
 import fs from "node:fs";
@@ -274,3 +305,34 @@ def test_feature_config_defaults_and_validation_without_importing_app(monkeypatc
     monkeypatch.setenv("SNAPSHOT_WARMING_ENABLED", "perhaps")
     with pytest.raises(ValueError, match="SNAPSHOT_WARMING_ENABLED"):
         enabled()
+
+
+def test_snapshot_cache_bounds_defaults_and_validation_without_importing_app(monkeypatch):
+    tree = ast.parse((ROOT / "app" / "main.py").read_text(encoding="utf-8"))
+    wanted = {"_positive_int_env", "snapshot_cache_settings"}
+    functions = [node for node in tree.body
+                 if isinstance(node, ast.FunctionDef) and node.name in wanted]
+    namespace = {"os": os}
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "<cache-config>", "exec"),
+         namespace)
+    settings = namespace["snapshot_cache_settings"]
+    for name in (
+        "SNAPSHOT_MAX_BYTES", "SNAPSHOT_MAX_ENTRIES", "SNAPSHOT_MAX_PAYLOAD",
+        "SNAPSHOT_ORIGIN_TIMEOUT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    assert settings() == {
+        "max_bytes": 256 * 1024 * 1024,
+        "max_entries": 4096,
+        "max_payload": 8 * 1024 * 1024,
+        "origin_timeout": 300,
+    }
+    monkeypatch.setenv("SNAPSHOT_MAX_BYTES", "123")
+    monkeypatch.setenv("SNAPSHOT_MAX_ENTRIES", "4")
+    monkeypatch.setenv("SNAPSHOT_MAX_PAYLOAD", "5")
+    monkeypatch.setenv("SNAPSHOT_ORIGIN_TIMEOUT", "6")
+    assert settings() == {"max_bytes": 123, "max_entries": 4,
+                          "max_payload": 5, "origin_timeout": 6}
+    monkeypatch.setenv("SNAPSHOT_MAX_ENTRIES", "0")
+    with pytest.raises(ValueError, match="SNAPSHOT_MAX_ENTRIES"):
+        settings()

@@ -162,10 +162,39 @@ def _completed_data(reader) -> dict:
     published = (
         "(SELECT CAST(updated_at AT TIME ZONE current_setting('TimeZone') "
         "AT TIME ZONE 'UTC' AS DATE) FROM meta WHERE key = 'data_generation')")
+    # The rollup holds every charge date `costs` does, so the latest one is the same
+    # read at a fraction of the rows; this runs on every AI Billing request.
+    source = getattr(reader, "agg", "costs")
     rows = reader.rows(
-        f'SELECT max("ChargePeriodStart") AS hi, {published} AS published_day FROM costs '
+        f'SELECT max("ChargePeriodStart") AS hi, {published} AS published_day FROM {source} '
         f'WHERE "ChargePeriodStart" < {published}')
     return rows[0] if rows else {}
+
+
+def _measures(summarised: bool) -> dict[str, str]:
+    """Data-quality counts, spelled for the detail table or for `usage_signals`.
+
+    The summary carries each count as a stored sum, so `count(*)` over charges is
+    `sum("Charges")` over its groups and every check below keeps its exact meaning.
+    """
+    if not summarised:
+        return {
+            "rows": "COUNT(*)",
+            "cost_rows": 'COUNT("BilledCost")',
+            "negative_rows": 'SUM(CASE WHEN "BilledCost" < 0 THEN 1 ELSE 0 END)',
+            "quantity": ('CASE WHEN COUNT(NULLIF(TRIM("UnitOfMeasure"), \'\')) = COUNT(*) '
+                         'AND COUNT("PricingQuantity") = COUNT(*) '
+                         'THEN SUM("PricingQuantity") END'),
+        }
+    return {
+        "rows": 'CAST(SUM("Charges") AS bigint)',
+        "cost_rows": 'CAST(SUM("CostRows") AS bigint)',
+        "negative_rows": 'CAST(SUM("NegativeRows") AS bigint)',
+        "quantity": ('CASE WHEN SUM(CASE WHEN NULLIF(TRIM("UnitOfMeasure"), \'\') IS NULL '
+                     'THEN 0 ELSE "Charges" END) = SUM("Charges") '
+                     'AND SUM("QuantityRows") = SUM("Charges") '
+                     'THEN SUM("PricingQuantity") END'),
+    }
 
 
 def snapshot_data_day(scope: list[str], filters: dict | None = None) -> str:
@@ -205,7 +234,10 @@ def _cost_history(scope: list[str], currency: str | None, filters: dict | None,
     try:
         # Only this explicit bounded baseline read bypasses the selected-month view;
         # the selected cost/quantity query and returned reporting window stay unchanged.
-        with reporting.select(None), warehouse.reader(scope=scope, currency=currency, filters=filters) as reader:
+        with reporting.select(None), warehouse.reader(
+                scope=scope, currency=currency, filters=filters, usage=("signals",)) as reader:
+            source = getattr(reader, "signals", None)
+            m = _measures(bool(source))
             rows = reader.rows(
                 f"""
                 SELECT LOWER(COALESCE("SubAccountId", '')) AS subscription_id,
@@ -216,10 +248,10 @@ def _cost_history(scope: list[str], currency: str | None, filters: dict | None,
                        THEN COALESCE("ServiceName", '') ELSE '' END AS service,
                   COALESCE(NULLIF("BillingCurrency", ''), 'unknown') AS currency,
                   CAST("ChargePeriodStart" AS DATE) AS day,
-                  SUM("BilledCost") AS cost, COUNT(*) AS billing_rows,
-                  COUNT("BilledCost") AS cost_rows,
-                  SUM(CASE WHEN "BilledCost" < 0 THEN 1 ELSE 0 END) AS negative_rows
-                FROM costs WHERE "ChargePeriodStart" >= DATE '{first.isoformat()}'
+                  SUM("BilledCost") AS cost, {m["rows"]} AS billing_rows,
+                  {m["cost_rows"]} AS cost_rows,
+                  {m["negative_rows"]} AS negative_rows
+                FROM {source or "costs"} WHERE "ChargePeriodStart" >= DATE '{first.isoformat()}'
                   AND "ChargePeriodStart" <= DATE '{last.isoformat()}' AND {_ai_predicate()}
                 GROUP BY 1, 2, 3, 4, 5, 6
                 ORDER BY subscription_id, resource_id, resource_name, service, currency, day
@@ -277,7 +309,8 @@ def _costs(scope: list[str], days: int, currency: str | None, filters: dict | No
     if scope:
         from .warehouse import warehouse
 
-        with warehouse.reader(scope=scope, currency=currency, filters=filters) as reader:
+        with warehouse.reader(scope=scope, currency=currency, filters=filters,
+                              usage=("signals",)) as reader:
             # Daily evidence stops at a completed UTC day, not the current hour.
             # Closed calendar months retain their exact reporting bounds.
             available = _completed_data(reader)
@@ -290,6 +323,8 @@ def _costs(scope: list[str], days: int, currency: str | None, filters: dict | No
                     end = min(bounds[1], completed)
                     days = max(0, (end - start).days + 1)
                 lower = reporting.start_sql(end, days)
+                source = getattr(reader, "signals", None)
+                m = _measures(bool(source))
                 rows = reader.rows(
                     f"""
                     SELECT
@@ -302,12 +337,10 @@ def _costs(scope: list[str], days: int, currency: str | None, filters: dict | No
                       COALESCE("MeterName", '') AS meter,
                       COALESCE("UnitOfMeasure", '') AS unit,
                       COALESCE(NULLIF("BillingCurrency", ''), 'unknown') AS currency,
-                      SUM("BilledCost") AS cost, COUNT(*) AS billing_rows,
-                      COUNT("BilledCost") AS cost_rows,
-                      CASE WHEN COUNT(NULLIF(TRIM("UnitOfMeasure"), '')) = COUNT(*)
-                            AND COUNT("PricingQuantity") = COUNT(*)
-                           THEN SUM("PricingQuantity") END AS quantity
-                    FROM costs
+                      SUM("BilledCost") AS cost, {m["rows"]} AS billing_rows,
+                      {m["cost_rows"]} AS cost_rows,
+                      {m["quantity"]} AS quantity
+                    FROM {source or "costs"}
                     WHERE "ChargePeriodStart" > {lower}
                       AND "ChargePeriodStart" <= DATE '{end.isoformat()}'
                       AND {_ai_predicate()}

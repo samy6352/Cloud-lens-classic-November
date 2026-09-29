@@ -111,6 +111,7 @@ const makeControls=new Function("ctx","ai","aiCache",`
   let renderedComplete=true, beforeLoad=async()=>{};
   const key=ctx.key, activeTabs=ai, button={disabled:false};
   const actions={querySelector:()=>button};
+  const freshReads=async fn=>{ctx.freshCalls=(ctx.freshCalls||0)+1;return await fn();};
   const clearCache=()=>aiCache.clear(), invalidateAnalysis=()=>{};
   const loadFamily=async family=>{
     if(family!=="ai")throw Error("Only the AI module needs explicit retry");
@@ -140,6 +141,7 @@ assert.ok(!requests[0].includes("force="));
 await refresh.click();
 assert.equal(refresh.button.disabled,false);
 assert.equal(requests.length,2);
+assert.equal(ctx.freshCalls,1,"Refresh views runs the tab load inside freshReads");
 const forced=new URL(requests[1],"http://cloudlens.local");
 assert.equal(forced.searchParams.get("force"),"true");
 assert.equal(forced.searchParams.getAll("force").length,1);

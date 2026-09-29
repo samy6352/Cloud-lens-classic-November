@@ -113,7 +113,33 @@ function toLogin() {
 /** fetch with a timeout, so a stalled request can't wedge the UI. */
 let cacheWarmer = null;
 
+async function freshReads(fn) {
+  globalThis.__cloudLensFreshReadDepth = (globalThis.__cloudLensFreshReadDepth || 0) + 1;
+  try { return await fn(); }
+  finally { globalThis.__cloudLensFreshReadDepth--; }
+}
+
 export async function get(url, { timeout = 20000, signal, cacheWarming = false, ...opts } = {}) {
+  if (!cacheWarming && (globalThis.__cloudLensFreshReadDepth || 0) > 0) {
+    const freshURL = (() => {
+      if ((opts.method || "GET").toUpperCase() !== "GET") return null;
+      let parsed;
+      try { parsed = new URL(url, location.origin); } catch { return null; }
+      if (parsed.origin !== location.origin) return null;
+      if (!(parsed.pathname === "/api/overview" || parsed.pathname === "/api/filters"
+        || parsed.pathname.startsWith("/api/dashboard/"))) return null;
+      if (parsed.searchParams.has("fresh")) return String(url);
+      const text = String(url);
+      const hashAt = text.indexOf("#");
+      const base = hashAt === -1 ? text : text.slice(0, hashAt);
+      const hash = hashAt === -1 ? "" : text.slice(hashAt);
+      return `${base}${base.includes("?") ? "&" : "?"}fresh=true${hash}`;
+    })();
+    if (freshURL) {
+      url = freshURL;
+      timeout = Math.max(timeout, 180000);
+    }
+  }
   const warmingKey = cacheWarming ? null : cacheWarmer?.begin(url, opts);
   const ac = new AbortController();
   const abort = () => ac.abort(signal?.reason);
@@ -186,6 +212,8 @@ export async function post(url, body = null, { timeout = 30000 } = {}) {
     clearTimeout(timer);
   }
 }
+
+export { freshReads };
 
 // marked + DOMPurify are 57 KB and only matter once the agent answers, so they load on first
 // use. Streaming starts before they arrive, hence the escaped-text fallback below: early tokens
