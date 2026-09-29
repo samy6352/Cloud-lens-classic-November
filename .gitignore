@@ -38,6 +38,14 @@ infra/main.json
 infra/terraform/.terraform/
 infra/terraform/*.tfstate*
 
+# Ad-hoc probe scripts written while chasing a query plan. They are notes, not code:
+# they hard-code one estate's ids and stop being true the moment the data changes.
+_probe_*.sql
+tmp_*.py
+tmp_*.log
+tools/_q_*.sql
+tools/resources_tab.sql
+
 # Editor and OS leftovers.
 .vscode/
 .idea/
