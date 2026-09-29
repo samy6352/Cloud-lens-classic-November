@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -38,8 +39,21 @@ def overview(monkeypatch):
             "rows": 1, "to": datetime.now(UTC).date().isoformat(),
             "currency": "USD", "subscriptions": 2,
         }),
-        query=Mock(return_value={"rows": [{"mtd": 123.45, "prev": 98.76}]}),
+        agg="costs_rollup",
     )
+    warehouse.month_rows = [{"currency": "USD", "mtd": 123.45, "prev": 98.76}]
+
+    @contextmanager
+    def reader(scope=None, **_kwargs):
+        fake = SimpleNamespace(
+            agg=warehouse.agg,
+            rows=Mock(side_effect=lambda sql, limit: warehouse.month_rows),
+        )
+        warehouse.latest_reader = fake
+        yield fake
+
+    warehouse.reader = Mock(side_effect=reader)
+    warehouse.latest_reader = None
     module = ModuleType("app.warehouse")
     module.warehouse = warehouse
     monkeypatch.setitem(sys.modules, "app.warehouse", module)
@@ -50,7 +64,8 @@ def overview(monkeypatch):
     forecast = AsyncMock(return_value={"projected_total": 234.56})
     monkeypatch.setattr(cost, "_forecast_by_subscription", forecast)
 
-    def run(result, scope=None, subscriptions=None):
+    def run(result, scope=None, subscriptions=None, timings=None, failures=None,
+            warehouse_rows=None, warehouse_source="costs_rollup", warehouse_size=1):
         listing = AsyncMock(return_value={"subscriptions": SUBS})
         if isinstance(subscriptions, Exception):
             listing.side_effect = subscriptions
@@ -61,22 +76,88 @@ def overview(monkeypatch):
         if isinstance(result, Exception):
             lookup.side_effect = result
         monkeypatch.setattr(cost, "budgets", lookup)
+        if warehouse_rows is not None:
+            warehouse.month_rows = warehouse_rows
+        warehouse.agg = warehouse_source
+        warehouse.summary.return_value["rows"] = warehouse_size
 
-        answer = asyncio.run(cost.overview(scope))
+        answer = asyncio.run(cost.overview(
+            scope, timings=timings, failed_phases=failures))
         lookup.assert_awaited_once_with(scope)
         listing.assert_awaited_once_with()
         assert forecast.await_args.args == (scope,)
-        assert warehouse.query.call_args.kwargs == {"scope": scope}
+        assert warehouse.reader.call_args.args == (scope,)
         azure_request.assert_not_awaited()
         summary.assert_not_awaited()
-        assert answer["month_to_date"] == 123.45
-        assert answer["last_month"] == 98.76
+        if warehouse_rows is None and warehouse_source != "costs":
+            assert answer["month_to_date"] == 123.45
+            assert answer["last_month"] == 98.76
+        else:
+            assert answer["month_to_date"] is None
+            assert answer["last_month"] is None
         assert answer["forecast_30d"] == 234.56
-        assert answer["currency"] == "USD"
+        assert answer["currency"] == (
+            "USD" if warehouse_rows is None and warehouse_source != "costs" else None)
         assert answer["scope"] == (scope or None)
         return answer
 
     return run
+
+
+def test_overview_records_warehouse_and_remote_dependency_timings(overview):
+    timings = {}
+    overview(payload(), timings=timings)
+    assert set(timings) == {
+        "warehouse_summary", "warehouse_month_totals",
+        "subscriptions", "forecast", "budgets",
+    }
+    assert all(isinstance(value, float) and value >= 0 for value in timings.values())
+
+
+def test_overview_marks_failed_remote_dependency_by_fixed_phase_name(overview):
+    timings, failures = {}, set()
+    overview(cost.CostError("private error"), timings=timings, failures=failures)
+    assert failures == {"budgets"}
+    assert "private error" not in str(failures)
+
+
+def test_demo_budget_mode_is_not_reported_as_a_failed_or_empty_azure_read(overview):
+    answer = overview(payload(
+        subscriptions_requested=0, subscriptions_read=0, demo_mode=True,
+        note="Budgets are not part of the PostgreSQL demo data.",
+    ))
+    assert answer["budget_status"] == "demo"
+    assert answer["budget"] is None
+    assert "PostgreSQL demo data" in answer["budget_note"]
+
+
+def test_mixed_currency_warehouse_totals_stay_separate_without_azure_fallback(overview):
+    answer = overview(payload(), warehouse_rows=[
+        {"currency": "INR", "mtd": 1000, "prev": 2000},
+        {"currency": "USD", "mtd": 10, "prev": 20},
+    ])
+    assert answer["month_to_date"] is None
+    assert answer["last_month"] is None
+    assert answer["currency"] is None
+    assert answer["month_to_date_by_currency"] == [
+        {"currency": "INR", "cost": 1000},
+        {"currency": "USD", "cost": 10},
+    ]
+    assert answer["last_month_by_currency"] == [
+        {"currency": "INR", "cost": 2000},
+        {"currency": "USD", "cost": 20},
+    ]
+    assert "span multiple currencies" in answer["currency_note"]
+
+
+def test_large_warehouse_with_stale_rollup_does_not_scan_detail_for_header(overview):
+    answer = overview(payload(), warehouse_source="costs", warehouse_size=200_001)
+    assert answer["month_to_date"] is None
+    assert answer["last_month"] is None
+    assert answer["currency_note"]
+    assert "raw charges" in answer["currency_note"]
+    warehouse = sys.modules["app.warehouse"].warehouse
+    warehouse.latest_reader.rows.assert_not_called()
 
 
 @pytest.mark.parametrize("percent", [0, 25, 85, 105])

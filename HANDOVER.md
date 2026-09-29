@@ -240,11 +240,14 @@ difference was load contamination, not code. Known concrete UI faults, all pre-e
 **Vanilla ES modules, not React.** The only npm dependencies are `playwright` and
 `axe-core`, both test-only. React advice does not apply.
 
-**Four-layer read path.** The dashboard almost never reads `costs`:
+**Derived read path.** The dashboard almost never reads `costs`:
 
 - `costs` — 5.8M-row detail table, month-partitioned (`CLOUDLENS_PARTITION_COSTS=1`).
 - `costs_rollup` (81,898) — pre-aggregated money.
 - `resource_presence` (2.80M) — per-resource identity and billed money.
+- `commitment_benefits` — sparse, exact benefit/resource usage for commitment coverage and
+  inventory; only rows with a benefit identity are retained.
+- `spot_rates` — daily cost and quantity by meter, unit, region, currency and pricing model.
 - `billing_rollup` (2.80M) → `billing_serving` (12,461) — the **grain split**. The rollup
   carries `resource_id` *and* `ResourceName`, so it barely collapses the detail table;
   `billing_serving` drops resource identity for the KPI / subscription / service
@@ -252,10 +255,10 @@ difference was load contamination, not code. Known concrete UI faults, all pre-e
 - `costs_fx_rollup` (82,570) — native-currency conversion, gated on `fx_rollup.ENABLED`
   and on a freshness check at read time.
 
-`Reader.agg` / `.res` / `.named` / `.bill` name the derived relation **when it can answer
-that connection exactly**, and `costs` otherwise. A converted currency or a filter outside
-the grain puts a query back on the detail table — that is usually why something is
-unexpectedly slow. **When you need a distinct dimension value, read `Reader.agg`, not
+`Reader.agg` / `.res` / `.named` / `.bill` / `.benefit` / `.spot` name the derived relation
+**when it can answer that connection exactly**, and `costs` otherwise. A converted currency or a
+filter outside the grain puts a query back on the detail table — that is usually why something
+is unexpectedly slow. **When you need a distinct dimension value, read `Reader.agg`, not
 `costs`** — that was the whole of the `/api/subscriptions` bug.
 
 Each derived module works out which filters it can serve **from its own grain**
@@ -288,8 +291,9 @@ a handler must go through it. Both defects fixed this session were partly this.
 
 **b. `/api/dashboard/executive` cold 6.5-9s.** Caches to 0.01s. Already established as
 irreducible by query tuning — five approaches were measured and rejected (shared dedup
-pass, forced parallel workers, and three others). The lever is warming, not tuning.
-`web/assets/cache-warming.js` exists uncommitted; confirm it covers this path.
+pass, forced parallel workers, and three others). The browser warmer covers this path after a
+source-generation change for URLs already viewed, but it cannot remove the first cold miss for a
+new session or deployment. The remaining levers are warm-start policy and database capacity.
 
 **c. `stash@{0}` — `app/env_tags.py`.** The Environment filter is always empty
 (`unavailable_dimensions: ["env"]`) because `env` is read from the `Tags` JSON per row,
@@ -317,12 +321,11 @@ being touched once) rather than in a rebuild pass over all history.
   - **Lazy-loading `chart.umd.min.js`** (206 KB, eager). Real saving, but risks visible
     chart pop-in, and the standing instruction was not to trade visual quality.
 
-**f. Other `FROM costs` callers.** `grep 'FROM costs'` across `app/` returns **56 hits**.
-Many are legitimately detail-only (tags, resources, raw export). Several are *not* obviously
-so and were not measured this session — `billing_commitments.py:252`
-(`SELECT DISTINCT "BillingCurrency" FROM costs`) and `commitments.py:102`
-(`GROUP BY 1,2,3` over the whole table) look like the same class of bug as the one fixed.
-**Benchmark the endpoints first; do not refactor on suspicion.**
+**f. Remaining `FROM costs` callers.** Many are legitimately detail-only (tags, resources, raw
+export). Commitment coverage/monthly totals and the currency census now use the exact rollup;
+benefit inventory and Spot comparisons use dedicated sparse/compact rollups. Those tables join
+the normal generation stamp and rebuild, so they cannot be read before they are current. Other
+detail callers still need endpoint-level measurements before refactoring.
 
 ---
 

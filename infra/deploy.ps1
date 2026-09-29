@@ -75,22 +75,19 @@ param(
     [ValidateRange(1, 1000000)]
     [int]$ModelCapacity = 30,
 
-    # Database sizing. Previously absent, so every deployment silently took the
-    # Bicep defaults (Standard_B1ms / 32GB / B1) regardless of the estate it was
-    # being asked to serve.
-    [string]$PostgresSku = 'Standard_B1ms',
+    # Reference capacity was measured against the multi-million-row estate. Override
+    # these values deliberately for smaller deployments or where a region lacks a SKU.
+    [string]$PostgresSku = 'Standard_E2ds_v5',
 
     [ValidateRange(32, 65536)]
-    [int]$PostgresStorageGb = 32,
+    [int]$PostgresStorageGb = 128,
 
     [ValidateSet('11', '12', '13', '14', '15', '16', '17', '18')]
     [string]$PostgresVersion = '16',
 
-    # Premium_LRS ties IOPS to capacity: 32GB buys 120 IOPS. PremiumV2_LRS
-    # provisions IOPS and throughput separately, which is both cheaper and
-    # faster for a working set that cannot be cached.
+    # PremiumV2_LRS provisions IOPS and throughput independently of capacity.
     [ValidateSet('Premium_LRS', 'PremiumV2_LRS')]
-    [string]$PostgresStorageType = 'Premium_LRS',
+    [string]$PostgresStorageType = 'PremiumV2_LRS',
 
     [ValidateRange(360, 80000)]
     [int]$PostgresIops = 3000,
@@ -103,11 +100,11 @@ param(
     # the app first starts. Passed through the template rather than set afterwards
     # with `az webapp config appsettings set`: appSettings is declared in the
     # Bicep, so a later deployment discards anything the CLI added.
-    [switch]$PartitionCosts,
+    [switch]$PartitionCosts = $true,
 
     [string]$PgWorkMem = '',
 
-    [string]$PgStatementTimeout = '',
+    [string]$PgStatementTimeout = '25s',
 
     # Off for a deployment whose data is loaded by other means: a boot with an
     # empty warehouse would otherwise ingest this subscription's own costs and
@@ -115,6 +112,8 @@ param(
     [bool]$AutoIngest = $true,
 
     [bool]$AutoRefresh = $true,
+
+    [bool]$SnapshotWarmingEnabled = $true,
 
     # Username/password sign-in alongside Entra, as production runs.
     [bool]$AuthAllowLocal = $false,
@@ -124,7 +123,7 @@ param(
 
     [string]$PgSchema = '',
 
-    [string]$AppServicePlanSku = 'B1',
+    [string]$AppServicePlanSku = 'B2',
 
     # Subscriptions the application should be able to read cost data from.
     # Defaults to the subscription being deployed into.
@@ -493,6 +492,7 @@ $templateParameters = @(
     "pgStatementTimeout=$PgStatementTimeout"
     "autoIngest=$($AutoIngest.ToString().ToLower())"
     "autoRefresh=$($AutoRefresh.ToString().ToLower())"
+    "snapshotWarmingEnabled=$($SnapshotWarmingEnabled.ToString().ToLower())"
     "authAllowLocal=$($AuthAllowLocal.ToString().ToLower())"
     "authUsers=$AuthUsers"
     "pgSchema=$PgSchema"

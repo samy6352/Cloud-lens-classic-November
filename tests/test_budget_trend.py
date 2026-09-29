@@ -6,8 +6,11 @@ headline it sits under: the *period* (Azure spans years but resets every grain) 
 *filter* (a tag-scoped budget must not be drawn over whole-subscription spend).
 """
 import sys
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -114,6 +117,27 @@ with wh.connect() as con:
                     records)
 
 t = wh.budget_trend("sub-a", "2026-08-01", "2026-08-31")
+calls = []
+
+
+class Connection:
+    def execute(self, sql, params):
+        calls.append((sql, params))
+        return SimpleNamespace(fetchall=lambda: [])
+
+
+@contextmanager
+def fake_connect(*, read_only=False, currency=None):
+    assert read_only
+    assert currency is None
+    yield Connection()
+
+
+with patch.object(wh, "connect", fake_connect):
+    indexed = wh.budget_trend("SUB-A", "2026-09-01", "2026-09-29")
+check("subscription trends use the indexed normalized id",
+      "error" not in indexed and 'lower("SubAccountId") = ?' in calls[0][0]
+      and calls[0][1][0] == "sub-a")
 check("the period is respected — July is not in an August budget",
       t["total"] == 135.0, f"got {t['total']}")
 check("and another subscription's spend is not either", 777.0 not in t["values"])

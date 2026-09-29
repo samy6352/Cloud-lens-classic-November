@@ -249,7 +249,8 @@ def _warehouse_inventory(scopes: list[str], days: int, currency: str | None) -> 
     # exclude a group; they must never make unlike currencies additive.
     try:
         with service.wh.reader(scopes) as reader:
-            rows = reader.rows('SELECT DISTINCT "BillingCurrency" AS currency FROM costs', 20)
+            rows = reader.rows(
+                f'SELECT DISTINCT "BillingCurrency" AS currency FROM {reader.agg}', 20)
         inventory["native_billing_currencies"] = sorted({
             str(row.get("currency") or "unknown").upper() for row in rows})
     except Exception:

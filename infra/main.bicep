@@ -67,11 +67,11 @@ param privateEndpointSubnetAddressPrefix string = '10.70.3.0/24'
 @description('Client IP allowed through the PostgreSQL firewall when networkIsolation is false. Ignored otherwise.')
 param developerClientIp string = ''
 
-@description('App Service plan SKU. B1 is the smallest tier that supports Always On and VNet integration.')
-param appServicePlanSku string = 'B1'
+@description('App Service plan SKU. B2 is the reference floor for the measured multi-million-row workload.')
+param appServicePlanSku string = 'B2'
 
-@description('PostgreSQL compute SKU.')
-param postgresSku string = 'Standard_B1ms'
+@description('PostgreSQL compute SKU. The memory-optimised E2ds_v5 is the measured reference for large estates.')
+param postgresSku string = 'Standard_E2ds_v5'
 
 @description('PostgreSQL major version. Central India offers 11-18.')
 param postgresVersion string = '16'
@@ -81,7 +81,7 @@ param postgresVersion string = '16'
   'Premium_LRS'
   'PremiumV2_LRS'
 ])
-param postgresStorageType string = 'Premium_LRS'
+param postgresStorageType string = 'PremiumV2_LRS'
 
 @description('Provisioned IOPS, PremiumV2_LRS only.')
 param postgresIops int = 3000
@@ -90,19 +90,22 @@ param postgresIops int = 3000
 param postgresThroughput int = 125
 
 @description('Create a new `costs` table partitioned by month. Must be correct before the application first starts; it cannot convert an existing table.')
-param partitionCosts bool = false
+param partitionCosts bool = true
 
 @description('Session work_mem for application connections. Empty keeps the server default.')
 param pgWorkMem string = ''
 
-@description('Session statement_timeout for application connections. Empty means no cap.')
-param pgStatementTimeout string = ''
+@description('Reader statement_timeout. The 25s default stays below the dashboard 30s client deadline; tune upward only after measuring legitimate query durations.')
+param pgStatementTimeout string = '25s'
 
 @description('Ingest cost data on first boot when the warehouse is empty.')
 param autoIngest bool = true
 
 @description('Run the daily refresh.')
 param autoRefresh bool = true
+
+@description('Warm recently used, private dashboard snapshots after a data generation changes. Bounded to three recent views per active browser.')
+param snapshotWarmingEnabled bool = true
 
 @description('Allow username/password sign-in alongside Entra.')
 param authAllowLocal bool = false
@@ -114,8 +117,8 @@ param authUsers string = ''
 @description('Schema the warehouse owns. Empty uses `public`.')
 param pgSchema string = ''
 
-@description('PostgreSQL storage in GB.')
-param postgresStorageGb int = 32
+@description('PostgreSQL storage in GB. 128 GB is the measured reference capacity for large estates.')
+param postgresStorageGb int = 128
 
 @description('Region for the AI Foundry account. Rarely the same as `location`: the regions with App Service quota and the regions offering a model on a pay-as-you-go SKU are different sets.')
 param aiLocation string = 'eastus2'
@@ -181,6 +184,7 @@ module stack 'modules/stack.bicep' = {
     pgStatementTimeout: pgStatementTimeout
     autoIngest: autoIngest
     autoRefresh: autoRefresh
+    snapshotWarmingEnabled: snapshotWarmingEnabled
     authAllowLocal: authAllowLocal
     authUsers: authUsers
     pgSchema: pgSchema

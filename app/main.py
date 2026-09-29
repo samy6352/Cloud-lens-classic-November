@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import secrets
+import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -974,8 +975,44 @@ class CacheHeaders(BaseHTTPMiddleware):
     """
 
     async def dispatch(self, request: Request, call_next):
+        started = time.perf_counter()
         response = await call_next(request)
         path = request.url.path
+        if path.startswith("/api/"):
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            route = request.scope.get("route")
+            route_path = getattr(route, "path", None)
+            if not isinstance(route_path, str) or not route_path.startswith("/api/"):
+                route_path = "<unmatched>"
+            timing_parts = [f"app;dur={elapsed_ms:.1f}"]
+            seen_timings = {"app"}
+            previous = response.headers.get("Server-Timing", "")
+            if previous:
+                for part in previous.split(","):
+                    value = part.strip()
+                    name = value.split(";", 1)[0]
+                    if value and name not in seen_timings:
+                        timing_parts.append(value)
+                        seen_timings.add(name)
+            phases = getattr(request.state, "overview_timings", {})
+            for name, duration in sorted(phases.items()):
+                metric = f"overview_{name}"
+                if (name in OVERVIEW_TIMING_PHASES and metric not in seen_timings
+                        and isinstance(duration, (int, float))):
+                    timing_parts.append(f"{metric};dur={max(0, duration):.1f}")
+                    seen_timings.add(metric)
+            response.headers["Server-Timing"] = ", ".join(timing_parts)
+            if elapsed_ms >= SLOW_API_LOG_MS:
+                phase_log = ",".join(
+                    f"{name}:{duration:.1f}" for name, duration in sorted(phases.items())
+                    if name in OVERVIEW_TIMING_PHASES and isinstance(duration, (int, float)))
+                if phase_log:
+                    log.warning(
+                        "slow API response method=%s route=%s status=%d app_ms=%.1f phases_ms=%s",
+                        request.method, route_path, response.status_code, elapsed_ms, phase_log)
+                else:
+                    log.warning("slow API response method=%s route=%s status=%d app_ms=%.1f",
+                                request.method, route_path, response.status_code, elapsed_ms)
         if path.startswith("/assets/") and response.status_code in {200, 206, 304}:
             response.headers.setdefault("Cache-Control", "no-cache")
         elif path.startswith("/api/"):
@@ -993,6 +1030,21 @@ class CacheHeaders(BaseHTTPMiddleware):
         response.headers.setdefault(
             "Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         return response
+
+
+SLOW_API_LOG_MS = 1000.0
+OVERVIEW_TIMING_PHASES = frozenset({
+    "warehouse_summary", "warehouse_month_totals", "subscriptions",
+    "forecast", "budgets", "mtd_cost_query", "last_cost_query",
+})
+
+
+def _overview_timing_header(timings: dict[str, float], failures: set[str]) -> str:
+    return ", ".join(
+        f'overview_{name};dur={max(0, timings[name]):.1f}'
+        + (';desc="error"' if name in failures else "")
+        for name in sorted(timings) if name in OVERVIEW_TIMING_PHASES
+    )
 
 
 app.add_middleware(CacheHeaders)
@@ -1671,6 +1723,41 @@ async def overview(request: Request, scope: str = "", currency: str = "") -> JSO
     picked = narrow([s for s in scope.split(",") if s.strip()], allowed)
 
     def shown(snapshot: dict) -> dict:
+        native_months = snapshot.get("month_to_date_by_currency") or []
+        native_last = snapshot.get("last_month_by_currency") or []
+        if currency and currency.upper() not in {"BILLED"} and (native_months or native_last):
+            # The header can convert each native bucket with its own source currency. Never
+            # run mixed native amounts through the single-source converter.
+            source = {
+                key: value for key, value in snapshot.items()
+                if key not in {"month_to_date_by_currency", "last_month_by_currency"}
+            }
+            out = fx.convert_money(source, currency)
+
+            def converted_total(rows: list[dict]) -> float | None:
+                converted = [
+                    fx.convert_amount(row["cost"], row["currency"], currency)
+                    for row in rows
+                ]
+                return (round(sum(converted), 2)
+                        if converted and all(value is not None for value in converted)
+                        else None)
+
+            month = converted_total(native_months)
+            last = converted_total(native_last)
+            out["month_to_date"], out["last_month"] = month, last
+            out["month_to_date_by_currency"] = []
+            out["last_month_by_currency"] = []
+            if month is not None or last is not None:
+                out["currency"] = currency.upper()
+                out["currency_note"] = None
+            else:
+                out["currency"] = None
+                out["currency_note"] = (
+                    f"No authoritative exchange rates are available to convert every "
+                    f"selected billing currency to {currency.upper()}."
+                )
+            return out
         # The snapshot's `currency` is what Azure billed in. Once the figures are converted that
         # label would be wrong, and a wrong currency label on a right number is worse than an
         # unconverted number — the header tiles are the first thing anyone reads.
@@ -1685,15 +1772,27 @@ async def overview(request: Request, scope: str = "", currency: str = "") -> JSO
 
     from . import cost
 
+    timings: dict[str, float] = {}
+    failed_phases: set[str] = set()
+    request.state.overview_timings = timings
+    request.state.overview_failures = failed_phases
+
+    def timed_response(response: JSONResponse) -> JSONResponse:
+        phases = _overview_timing_header(timings, failed_phases)
+        if phases:
+            response.headers["Server-Timing"] = phases
+        return response
+
     try:
         async with as_user(user):
-            snapshot = await cost.overview(scope=picked)
+            snapshot = await cost.overview(
+                scope=picked, timings=timings, failed_phases=failed_phases)
         snapshot["status"] = "ok"
-        return JSONResponse(shown(snapshot))
+        return timed_response(JSONResponse(shown(snapshot)))
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
-        return JSONResponse({"status": "error", "detail": str(exc)[:200]})
+        return timed_response(JSONResponse({"status": "error", "detail": str(exc)[:200]}))
 
 
 @app.post("/api/ask")
@@ -4383,17 +4482,26 @@ def _budget_tags(node: Any) -> list[tuple[str, list[str]]]:
     return exact_tag_filter(node) or []
 
 
-async def _attach_budget_trends(payload: dict, currency: str = "") -> None:
-    """Give every budget the daily shape behind its single number.
-
-    The warehouse and Azure are two different sources for the same money, and they will not
-    agree to the penny: the warehouse holds whatever the last refresh loaded, Azure's budget
-    figure is live and lags usage by up to a day. That is fine and expected — but a chart whose
-    total visibly contradicts the headline it sits under is not, so each trend carries the
-    warehouse total and the UI says so when the two have genuinely diverged rather than quietly
-    drawing over the difference.
-    """
+def _prepare_budget_filter(budget: dict) -> tuple[list[tuple[str, list[str]]] | None, bool]:
     from .budgets import exact_tag_filter
+
+    raw_filter = budget.get("filter_raw")
+    tags = exact_tag_filter(raw_filter)
+    exact = tags is not None and not (budget.get("filter") and not raw_filter)
+    budget["filter_exact"] = exact
+    budget["tag_filter"] = [[key, values] for key, values in tags or []] if exact else []
+    if exact:
+        budget.pop("trend_note", None)
+    else:
+        budget["trend_note"] = (
+            "The budget's full filter cannot be reproduced in this view. "
+            "Use Azure Portal for its exact scope; no approximate trend is shown."
+        )
+    return tags, exact
+
+
+async def _attach_budget_trends(payload: dict, currency: str = "") -> None:
+    """Build every chart only for callers that explicitly request the full trend set."""
     from .warehouse import warehouse
 
     budgets = payload.get("budgets") or []
@@ -4401,23 +4509,10 @@ async def _attach_budget_trends(payload: dict, currency: str = "") -> None:
         return
 
     def build(b: dict) -> dict:
-        start, end = _budget_period(b)
-        raw_filter = b.get("filter_raw")
-        tags = exact_tag_filter(raw_filter)
-        exact = tags is not None and not (b.get("filter") and not raw_filter)
-        # Handed to the browser so a budget can open the Tags tab on its own filter — the
-        # return leg of the journey that created it. Pairs rather than the ARM shape, because
-        # the UI should not have to learn Azure's filter grammar to follow a link.
-        b["filter_exact"] = exact
-        b["tag_filter"] = [[k, v] for k, v in tags or []] if exact else []
-        # A dimension filter we cannot translate means the line would be drawn over more spend
-        # than the budget actually watches. Say so rather than draw it.
+        tags, exact = _prepare_budget_filter(b)
         if not exact:
-            b["trend_note"] = (
-                "The budget's full filter cannot be reproduced in this view. "
-                "Use Azure Portal for its exact scope; no approximate trend is shown."
-            )
             return {"labels": [], "filtered_exactly": False}
+        start, end = _budget_period(b)
         trend = warehouse.budget_trend(
             b.get("subscription_id") or "", start, end,
             tags=tags or None, currency=currency or None)
@@ -4436,9 +4531,82 @@ async def _attach_budget_trends(payload: dict, currency: str = "") -> None:
         b["trend"] = t if len(t.get("labels") or []) > 1 else None
 
 
+@app.get("/api/budgets/trend")
+async def get_budget_trend(request: Request, subscription_id: str, name: str,
+                           currency: str = "") -> JSONResponse:
+    """Load one budget's warehouse trend after its card is opened."""
+    from . import demo_mode
+
+    if demo_mode.enabled():
+        return JSONResponse({
+            "trend": None,
+            "filter_exact": False,
+            "tag_filter": [],
+            "trend_note": demo_mode.budget_note(),
+            "demo_mode": True,
+        })
+
+    from . import cost
+    from . import currency as fx
+
+    user = current_user(request)
+    allowed = await permitted(user)
+    selected = narrow([subscription_id], allowed)
+    if not selected:
+        raise HTTPException(403, "Choose a subscription in your permitted scope.")
+
+    async with as_user(user):
+        found = await cost.budgets(selected)
+    if found.get("partial"):
+        raise HTTPException(503, "Could not confirm the budget on this subscription.")
+
+    budget = next((item for item in found.get("budgets", []) if item.get("name") == name), None)
+    if budget is None:
+        raise HTTPException(404, "That budget was not found on this subscription.")
+
+    converted = fx.convert_money({"budgets": [budget]}, currency)
+    budget = converted.get("budgets", [budget])[0]
+    tags, exact = _prepare_budget_filter(budget)
+    if not exact:
+        return JSONResponse({
+            "trend": None,
+            "filter_exact": False,
+            "tag_filter": [],
+            "trend_note": budget["trend_note"],
+        })
+
+    from .warehouse import warehouse
+
+    start, end = _budget_period(budget)
+    trend = await offload(
+        lambda: warehouse.budget_trend(
+            selected[0], start, end, tags=tags or None, currency=currency or None))
+    if trend.get("error"):
+        return JSONResponse({
+            "trend": None,
+            "filter_exact": True,
+            "tag_filter": budget["tag_filter"],
+            "trend_note": "Warehouse trend data is temporarily unavailable; Azure-reported spend is unchanged.",
+        })
+    if len(trend.get("labels") or []) <= 1:
+        return JSONResponse({
+            "trend": None,
+            "filter_exact": True,
+            "tag_filter": budget["tag_filter"],
+            "trend_note": "No comparable trend data is available for this budget period.",
+        })
+    trend["filtered_exactly"] = True
+    return JSONResponse({
+        "trend": trend,
+        "filter_exact": True,
+        "tag_filter": budget["tag_filter"],
+        "trend_note": None,
+    })
+
+
 @app.get("/api/budgets")
 async def list_budgets(request: Request, scope: str = "", currency: str = "",
-                       refresh: bool = False) -> JSONResponse:
+                       refresh: bool = False, trends: bool = False) -> JSONResponse:
     """Budgets already defined on the subscriptions in scope.
 
     Read live rather than from the warehouse: budgets are not in a cost export, and a stale
@@ -4448,6 +4616,11 @@ async def list_budgets(request: Request, scope: str = "", currency: str = "",
     them would leave a rupee figure being measured against a dollar threshold — and the meter
     beside it would draw a percentage that is simply false.
     """
+    from . import demo_mode
+
+    if demo_mode.enabled():
+        return JSONResponse(demo_mode.budgets_payload())
+
     from . import cost
     from . import currency as fx
 
@@ -4462,7 +4635,10 @@ async def list_budgets(request: Request, scope: str = "", currency: str = "",
         if out is not found:
             for b in out.get("budgets", []):
                 b["currency"] = currency.upper()
-        await _attach_budget_trends(out, currency)
+        for budget in out.get("budgets", []):
+            _prepare_budget_filter(budget)
+        if trends:
+            await _attach_budget_trends(out, currency)
         return JSONResponse(out)
     except HTTPException:
         raise
@@ -4483,6 +4659,11 @@ async def create_budget(body: BudgetRequest, request: Request) -> JSONResponse:
     managed identity, which is generally *more* privileged than the person driving it, so that
     path is restricted to admins rather than quietly lending out the app's access.
     """
+    from . import demo_mode
+
+    if demo_mode.enabled():
+        raise HTTPException(409, demo_mode.budget_note())
+
     from . import budgets as budget_api
 
     user = current_user(request)

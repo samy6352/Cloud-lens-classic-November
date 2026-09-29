@@ -36,12 +36,14 @@ import httpx
 from . import (
     billing_rollup,
     billing_serving,
+    commitment_benefits,
     derived,
     environment,
     fx_rollup,
     presence,
     rollup,
     schema_v2,
+    spot_rates,
     store,
 )
 from .sqldialect import SHIM_SCHEMA, strip_literals
@@ -52,7 +54,8 @@ log = logging.getLogger("cloudlens.warehouse")
 # rebuild, the boot-time `ensure`, the column check, and the generation stamp's
 # roster together -- the four had drifted apart once, and a table that was rebuilt
 # by none of them but trusted by the reader served an empty relation as truth.
-DERIVED_MODULES = (rollup, presence, billing_rollup, billing_serving)
+DERIVED_MODULES = (
+    rollup, presence, billing_rollup, billing_serving, commitment_benefits, spot_rates)
 if fx_rollup.ENABLED:
     DERIVED_MODULES += (fx_rollup,)
 
@@ -73,6 +76,18 @@ SUBMIT_GAP = 5.0
 # the heaviest real query on the test estate is milliseconds -- and short enough that a runaway
 # join gives a pooled connection back rather than holding it until someone notices.
 QUERY_TIMEOUT_MS = int(os.getenv("COST_QUERY_TIMEOUT_MS", "30000"))
+
+
+def _set_model_query_timeout(con: Any) -> None:
+    """Apply the model-query budget without raising the session's stricter read cap."""
+    con.execute(
+        "SELECT set_config('statement_timeout', "
+        "(EXTRACT(EPOCH FROM LEAST("
+        "NULLIF(current_setting('statement_timeout'), '0')::interval, "
+        "make_interval(secs => ? / 1000.0))) * 1000)::bigint::text, true)",
+        [QUERY_TIMEOUT_MS],
+    )
+
 
 # The role a model-authored query is executed as.
 #
@@ -451,6 +466,7 @@ class Reader:
 
     def __init__(self, con: Any, aggregate: str = "costs", counted: str = "costs",
                  named: str = "costs", billing: str = "costs", *,
+                 benefit: str = "costs", spot: str = "costs",
                  bill_stored: bool = False, bill_serving: str | None = None,
                  bill_indexed: bool = False, res_ordered: bool = False) -> None:
         self._con = con
@@ -462,6 +478,8 @@ class Reader:
         # detail table there is no temp view to fall back to, so this carries the
         # equivalent computation over `costs` as a parenthesised subquery instead.
         self.bill = billing
+        self.benefit = benefit
+        self.spot = spot
         self.bill_stored = bill_stored
         self.bill_serving = bill_serving
         self.bill_indexed = bill_indexed
@@ -595,7 +613,8 @@ class Warehouse:
             }
         else:
             self.state = (
-                {"status": "ready", **summary} if summary["rows"]
+                {"status": "ready", **summary}
+                if summary["rows"] or summary.get("summary_pending")
                 else {"status": "empty", "detail": "no data ingested yet"}
             )
 
@@ -821,7 +840,8 @@ class Warehouse:
     def connect(self, read_only: bool = False,
                 scope: list[str] | None = None,
                 currency: str | None = None,
-                filters: dict[str, list[str]] | None = None) -> Any:
+                filters: dict[str, list[str]] | None = None,
+                *, include_commitments: bool = False) -> Any:
         """A pooled PostgreSQL session, optionally restricted to a set of subscriptions.
 
         Scope is enforced by shadowing `costs` with a temp view holding only the selected
@@ -842,6 +862,9 @@ class Warehouse:
         would otherwise have to learn about exchange rates. They ask for money; this decides
         which money.
 
+        `include_commitments` adds scope-matched benefit and spot summaries only for the
+        commitment workflow, avoiding extra catalog checks and temp views for ordinary reads.
+
         `read_only` is the caller's statement of intent and nothing more. PostgreSQL sessions
         are independent and the server owns concurrency, so a reader needs no special handle
         while a write is in flight; the parameter is kept because it documents which call sites
@@ -853,7 +876,9 @@ class Warehouse:
         """
         con = self._store.connect()
         try:
-            return self._prepare_connection(con, read_only, scope, currency, filters)
+            return self._prepare_connection(
+                con, read_only, scope, currency, filters,
+                include_commitments=include_commitments)
         except BaseException:
             try:
                 con.close()
@@ -863,7 +888,10 @@ class Warehouse:
 
     def _prepare_connection(self, con: Any, read_only: bool,
                             scope: list[str] | None, currency: str | None,
-                            filters: dict[str, list[str]] | None) -> Any:
+                            filters: dict[str, list[str]] | None, *,
+                            include_commitments: bool = False) -> Any:
+        if include_commitments and not read_only:
+            raise ValueError("Commitment summaries require a read-only warehouse connection.")
         # Before the early exit below, because an unscoped reader is still a reader: it
         # runs the same dashboard queries against the same tables and can be abandoned the
         # same way. See `PostgresStore.statement_timeout` for why the bound has to be the
@@ -883,6 +911,9 @@ class Warehouse:
 
         period_filter = reporting.view_predicate() if read_only else ""
         if not scope and rate is None and not filters and not period_filter:
+            if include_commitments:
+                self._shadow_auxiliary_rollup(con, "", None, None, commitment_benefits)
+                self._shadow_auxiliary_rollup(con, "", None, None, spot_rates)
             return con
 
         select = self._columns_sql(rate, target)
@@ -943,6 +974,9 @@ class Warehouse:
         con.presence_stored = self._shadow_presence(con, where, rate, target, filters)
         con.bill_stored = self._shadow_billing_rollup(con, where, rate, filters)
         con.bill_serving = self._shadow_billing_serving(con, where, rate, filters)
+        if include_commitments:
+            self._shadow_auxiliary_rollup(con, where, rate, filters, commitment_benefits)
+            self._shadow_auxiliary_rollup(con, where, rate, filters, spot_rates)
         return con
 
     def _shadow_billing_rollup(self, con: Any, where: str, rate: float | None,
@@ -986,6 +1020,18 @@ class Warehouse:
                         f'FROM "{self._rollup_schema}".{billing_serving.TABLE} {where}')
             return billing_serving.TABLE
         return None
+
+    def _shadow_auxiliary_rollup(self, con: Any, where: str, rate: float | None,
+                                 filters: dict[str, list[str]] | None, module: Any) -> str:
+        """Expose an auxiliary summary only when its grain exactly fits the reader."""
+        if (rate is None and module.serves_filters(filters)
+                and self._rollup_fresh(con, module.TABLE)):
+            where = environment.stored_where(where)
+            con.execute(f'CREATE TEMP VIEW {module.TABLE} AS SELECT * '
+                        f'FROM "{self._rollup_schema}".{module.TABLE} {where}')
+        else:
+            con.execute(f"CREATE TEMP VIEW {module.TABLE} AS {module.select_sql('costs')}")
+        return module.TABLE
 
     def _shadow_presence(self, con: Any, where: str, rate: float | None, target: str,
                          filters: dict[str, list[str]] | None) -> bool:
@@ -1096,7 +1142,8 @@ class Warehouse:
     def reader(self, scope: list[str] | None = None,
                currency: str | None = None,
                filters: dict[str, list[str]] | None = None,
-               budget_ms: int | None = None) -> Iterator[Reader]:
+               budget_ms: int | None = None,
+               *, include_commitments: bool = False) -> Iterator[Reader]:
         """One read-only connection reused across a burst of internal queries.
 
         Opening a connection is the expensive part — and under a scope it also rebuilds the
@@ -1112,6 +1159,9 @@ class Warehouse:
         connection exactly, and `costs` otherwise, so a caller writes one query and
         gets the fast path when the fast path is correct.
 
+        Commitment views opt into two additional, scope-matched relations for sparse benefit
+        usage and compact meter rates; all other readers leave them untouched.
+
         `budget_ms` is for a caller that would rather fail early than hold a connection.
         The pool is small, so a query that is going to exceed the server's bound anyway
         spends that whole time occupying a slot every other request is queueing for --
@@ -1120,7 +1170,9 @@ class Warehouse:
         caller cannot award itself more time than the server allows, and `NULLIF` treats
         an unlimited server bound as no competitor rather than as zero.
         """
-        con = self.connect(read_only=True, scope=scope, currency=currency, filters=filters)
+        connect_options = {"include_commitments": True} if include_commitments else {}
+        con = self.connect(
+            read_only=True, scope=scope, currency=currency, filters=filters, **connect_options)
         try:
             if budget_ms and budget_ms > 0:
                 con.execute(
@@ -1142,6 +1194,8 @@ class Warehouse:
                     [module.TABLE for module in DERIVED_MODULES]) as indexed:
                 yield Reader(
                     con, aggregate, counted, named, billing,
+                    benefit=commitment_benefits.TABLE if include_commitments else "costs",
+                    spot=spot_rates.TABLE if include_commitments else "costs",
                     bill_stored=con.bill_stored, bill_serving=con.bill_serving,
                     bill_indexed=billing_rollup.TABLE in indexed,
                     res_ordered=presence.TABLE in indexed)
@@ -2530,7 +2584,7 @@ class Warehouse:
         both `Contact` and `contact` — but treats them as one when filtering a budget, so
         matching case-sensitively here would draw an empty chart under a non-zero total.
         """
-        where = ['"SubAccountId" = ?', '"ChargePeriodStart" BETWEEN ? AND ?']
+        where = ['lower("SubAccountId") = ?', '"ChargePeriodStart" BETWEEN ? AND ?']
         params: list[Any] = [canonical_sub_id(sub_id), start, end]
 
         for key, values in tags or []:
@@ -2598,16 +2652,31 @@ class Warehouse:
         page -- so the detail table was being scanned in full to answer four
         numbers that the rollup holds pre-computed.
         """
+        summary_pending = False
         with self.reader(scope) as reader:
-            row = reader.rows(
-                f'SELECT {rollup.charges_sql(reader.agg)} AS rows, '
-                f'min("ChargePeriodStart") AS lo, max("ChargePeriodStart") AS hi, '
-                f'count(DISTINCT "SubAccountId") AS subs FROM {reader.agg}')[0]
-            # Totals are only meaningful within a single currency, so never pre-sum across them.
-            by_currency = reader.rows(
-                'SELECT coalesce(nullif("BillingCurrency", \'\'), \'unknown\') AS currency, '
-                f'sum("BilledCost") AS cost FROM {reader.agg} GROUP BY 1 ORDER BY 2 DESC',
-                None)
+            if not self._rollup_fresh(reader._con, rollup.TABLE):
+                present = reader.rows(
+                    "SELECT EXISTS (SELECT 1 FROM costs) AS present", 1)
+                if present and present[0]["present"]:
+                    # A generation rebuild is allowed to lag startup. Do not replace it with
+                    # a multi-million-row count/group scan on the app's import path.
+                    summary_pending = True
+                    log.info("warehouse summary deferred until derived data is current")
+                    row = {"rows": None, "lo": None, "hi": None, "subs": None}
+                    by_currency = []
+                else:
+                    row = {"rows": 0, "lo": None, "hi": None, "subs": 0}
+                    by_currency = []
+            else:
+                row = reader.rows(
+                    f'SELECT {rollup.charges_sql(reader.agg)} AS rows, '
+                    f'min("ChargePeriodStart") AS lo, max("ChargePeriodStart") AS hi, '
+                    f'count(DISTINCT "SubAccountId") AS subs FROM {reader.agg}')[0]
+                # Totals are only meaningful within a single currency, so never pre-sum across them.
+                by_currency = reader.rows(
+                    'SELECT coalesce(nullif("BillingCurrency", \'\'), \'unknown\') AS currency, '
+                    f'sum("BilledCost") AS cost FROM {reader.agg} GROUP BY 1 ORDER BY 2 DESC',
+                    None)
 
         # Its own read, because `Reader` passes no parameters and this key is bound.
         # A single indexed row against `meta`, so the extra connection costs nothing
@@ -2623,17 +2692,17 @@ class Warehouse:
         reconciliation = [{"subscription_id": sid, **period}
                           for sid, period in sorted(affected.items())
                           if allowed is None or sid in allowed]
-        return {
-            "rows": row["rows"] or 0,
+        result = {
+            "rows": None if summary_pending else row["rows"] or 0,
             "from": str(row["lo"]) if row["lo"] else None,
             "to": str(row["hi"]) if row["hi"] else None,
-            "subscriptions": row["subs"] or 0,
+            "subscriptions": None if summary_pending else row["subs"] or 0,
             # Left as None when mixed: a single cross-currency total would be a meaningless number.
             "total_cost": totals[0]["cost"] if len(totals) == 1 else None,
             "total_by_currency": totals,
             "currency": known[0]["currency"] if len(known) == 1 and not mixed else None,
             "currencies": [t["currency"] for t in known],
-            "mixed_currency": mixed,
+            "mixed_currency": None if summary_pending else mixed,
             "reconciliation_required": bool(reconciliation),
             "reconciliation": reconciliation,
             "reconciliation_note": (
@@ -2641,6 +2710,9 @@ class Warehouse:
                 "Reingest the listed ranges from authoritative FOCUS reports to reconcile "
                 "possible overlapping imports." if reconciliation else None),
         }
+        if summary_pending:
+            result["summary_pending"] = True
+        return result
 
     def _schema_alternation(self) -> str:
         """Every schema name on this server, as a regex alternation, cached.
@@ -2670,7 +2742,8 @@ class Warehouse:
                 re.escape(n) for n in sorted(names, key=len, reverse=True))
         return self._schema_names
 
-    def query(self, sql: str, limit: int = 200, scope: list[str] | None = None) -> dict[str, Any]:
+    def query(self, sql: str, limit: int = 200,
+              scope: list[str] | None = None) -> dict[str, Any]:
         """Run a read-only SELECT against the warehouse, optionally scoped to subscriptions.
 
         Three defences, because this is the one path that runs SQL the model wrote.
@@ -2810,7 +2883,7 @@ class Warehouse:
                 # join costs the same as a deliberate one, and with PG_POOL_SIZE connections
                 # the app stops answering. LOCAL, like the search path, so it lasts exactly as
                 # long as this statement.
-                con.execute(f"SET LOCAL statement_timeout = {QUERY_TIMEOUT_MS}")
+                _set_model_query_timeout(con)
                 # Last, so everything above is done with the application's own rights and
                 # only the model's statement runs restricted. LOCAL, so the ROLLBACK below
                 # gives the session back to the pool as itself.

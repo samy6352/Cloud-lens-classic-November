@@ -63,8 +63,9 @@ class Commitments:
         from . import reporting
 
         days = reporting.period_days(days)
-        with self.wh.reader(scope, currency=currency) as r:
-            hi = r.rows('SELECT max("ChargePeriodStart") AS hi FROM costs')
+        with self.wh.reader(scope, currency=currency, include_commitments=True) as r:
+            agg = r.agg
+            hi = r.rows(f'SELECT max("ChargePeriodStart") AS hi FROM {agg}')
             hi = hi[0]["hi"] if hi and hi[0]["hi"] else None
             if not hi:
                 return {"empty": True, "days": days}
@@ -75,8 +76,8 @@ class Commitments:
             split = r.rows(
                 'SELECT coalesce("PricingModel", \'\') AS model, '
                 '"BillingCurrency" AS currency, '
-                'sum("BilledCost") AS cost, count(DISTINCT "ResourceId") AS resources '
-                f"FROM costs WHERE {period} GROUP BY 1, 2", None)
+                'sum("BilledCost") AS cost '
+                f"FROM {agg} WHERE {period} GROUP BY 1, 2", None)
 
             # Compute is where commitments actually apply, so the headline percentage is about
             # compute rather than total spend — a storage-heavy estate would otherwise look
@@ -84,7 +85,7 @@ class Commitments:
             compute = r.rows(
                 'SELECT coalesce("PricingModel", \'\') AS model, '
                 '"BillingCurrency" AS currency, sum("BilledCost") AS cost '
-                "FROM costs WHERE " + period + " AND ("
+                f"FROM {agg} WHERE " + period + " AND ("
                 '"ServiceFamily" = \'Compute\' OR "ServiceName" ILIKE \'%virtual machine%\''
                 ") GROUP BY 1, 2", None)
 
@@ -92,14 +93,14 @@ class Commitments:
                 'SELECT "BenefitName" AS name, coalesce("PricingModel", \'\') AS model, '
                 '"BillingCurrency" AS currency, sum("BilledCost") AS cost, '
                 'count(DISTINCT "ResourceId") AS resources '
-                f'FROM costs WHERE {period} AND "BenefitName" IS NOT NULL '
+                f'FROM {r.benefit} WHERE {period} AND "BenefitName" IS NOT NULL '
                 "AND \"BenefitName\" <> '' GROUP BY 1, 2, 3 ORDER BY cost DESC", None)
 
             monthly = r.rows(
                 'SELECT strftime("ChargePeriodStart", \'%Y-%m\') AS month, '
                 'coalesce("PricingModel", \'\') AS model, '
                 '"BillingCurrency" AS currency, '
-                'sum("BilledCost") AS cost FROM costs GROUP BY 1, 2, 3 ORDER BY 1', None)
+                f'sum("BilledCost") AS cost FROM {agg} GROUP BY 1, 2, 3 ORDER BY 1', None)
 
         def fold(rows: list[dict]) -> tuple[dict[str, float], float]:
             out: dict[str, float] = {}
@@ -224,8 +225,8 @@ class Commitments:
         from . import reporting
 
         days = reporting.period_days(days)
-        with self.wh.reader(scope, currency=currency) as r:
-            hi = r.rows('SELECT max("ChargePeriodStart") AS hi FROM costs')
+        with self.wh.reader(scope, currency=currency, include_commitments=True) as r:
+            hi = r.rows(f'SELECT max("ChargePeriodStart") AS hi FROM {r.agg}')
             hi = hi[0]["hi"] if hi and hi[0]["hi"] else None
             if not hi:
                 return {"empty": True, "days": days, "commitments": []}
@@ -241,7 +242,7 @@ class Commitments:
                 'count(DISTINCT "SubAccountId") AS subscriptions, '
                 'min("ChargePeriodStart") AS first_seen, '
                 'max("ChargePeriodStart") AS last_seen '
-                f'FROM costs WHERE {period} '
+                f'FROM {r.benefit} WHERE {period} '
                 'AND coalesce("BenefitId", "BenefitName") IS NOT NULL '
                 'AND coalesce("BenefitId", "BenefitName") <> \'\' '
                 "GROUP BY 1, 2, 3, 4 ORDER BY cost DESC", None)
@@ -252,7 +253,7 @@ class Commitments:
             services = r.rows(
                 'SELECT coalesce("BenefitId", "BenefitName") AS id, "ServiceName" AS service, '
                 'sum("BilledCost") AS cost '
-                f'FROM costs WHERE {period} '
+                f'FROM {r.benefit} WHERE {period} '
                 'AND coalesce("BenefitId", "BenefitName") IS NOT NULL '
                 'AND coalesce("BenefitId", "BenefitName") <> \'\' '
                 "GROUP BY 1, 2 ORDER BY cost DESC", None)
@@ -266,7 +267,7 @@ class Commitments:
                 'coalesce("ResourceName", "ResourceId") AS name, '
                 'coalesce("ResourceGroup", \'—\') AS grp, '
                 'sum("BilledCost") AS cost '
-                f'FROM costs WHERE {period} '
+                f'FROM {r.benefit} WHERE {period} '
                 'AND coalesce("BenefitId", "BenefitName") IS NOT NULL '
                 'AND coalesce("BenefitId", "BenefitName") <> \'\' '
                 'AND "ResourceId" IS NOT NULL '
@@ -380,8 +381,8 @@ class Commitments:
         from .currency import currency_code
 
         days = reporting.period_days(days)
-        with self.wh.reader(scope, currency=currency) as r:
-            edge = r.rows('SELECT max("ChargePeriodStart") AS hi FROM costs', 1)
+        with self.wh.reader(scope, currency=currency, include_commitments=True) as r:
+            edge = r.rows(f'SELECT max("ChargePeriodStart") AS hi FROM {r.agg}', 1)
             hi = edge[0]["hi"] if edge else None
             if not hi:
                 return {"empty": True, "days": days, "reason": "No billing data is available."}
@@ -393,7 +394,7 @@ class Commitments:
                 'lower(trim(coalesce("RegionName", \'\'))) AS region, '
                 'lower(trim(coalesce("UnitOfMeasure", \'\'))) AS unit, '
                 'sum("BilledCost") AS cost, sum("PricingQuantity") AS qty '
-                f'FROM costs WHERE "PricingQuantity" > 0 AND {period} '
+                f'FROM {r.spot} WHERE "PricingQuantity" > 0 AND {period} '
                 "GROUP BY 1, 2, 3, 4, 5, 6", None)
 
         spot_rows = [x for x in rows if _bucket(x["model"]) == "spot"]

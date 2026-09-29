@@ -476,6 +476,7 @@ def test_a_runaway_query_is_stopped_rather_than_holding_a_connection(wh, monkeyp
     from app import warehouse as W
 
     monkeypatch.setattr(W, "QUERY_TIMEOUT_MS", 250)
+    monkeypatch.setattr(wh._store, "statement_timeout", "25ms")
     with pytest.raises(psycopg.errors.QueryCanceled):
         wh.query("SELECT count(*) FROM generate_series(1, 200000000)")
 

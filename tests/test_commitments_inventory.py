@@ -49,6 +49,9 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 class FakeReader:
     """Answers the four queries inventory() runs, chosen by what the SQL asks for."""
 
+    agg = "costs"
+    benefit = "costs"
+
     def __init__(self, hi, rows, services, resources=()):
         self.hi, self._rows, self._services, self._resources = hi, rows, services, resources
 
@@ -74,7 +77,7 @@ class FakeWarehouse:
     def __init__(self, reader):
         self._reader = reader
 
-    def reader(self, scope, currency=None):
+    def reader(self, scope, currency=None, include_commitments=False):
         return self._reader
 
 

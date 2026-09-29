@@ -57,6 +57,7 @@ assert.match(budgetCard({...base,current_spend:0},0), /Spent <strong>USD 0/);
 assert.match(budgetCard({...base,currency:null},0), /currency unknown/);
 assert.doesNotMatch(budgetCard(rows[3],0), /data-tagsfor/);
 assert.doesNotMatch(budgetCard({...base,filtered_exactly:false},0), /data-tagsfor/);
+assert.match(budgetCard({...base,trend:null,trend_note:null},0,{lazyTrend:true}),/class="budget-chart"/);
 const unsupported = budgetCard({...base,filter_exact:false,tag_filter:[],trend:null,
   trend_note:"Unsupported OR filter; review Azure scope."},0,{compact:true});
 assert.doesNotMatch(unsupported,/data-tagsfor|class="budget-chart"/);
@@ -93,7 +94,7 @@ const list = element({
 const root=element({querySelectorAll(selector){
   return selector==="[data-bstatus]"?buttons:selector==="[data-jump-budget]"?jumps:[];
 }});
-let rootMarkup="", gets=[], tagCalls=[], payload={budgets:rows}, token=1;
+let rootMarkup="", gets=[], tagCalls=[], lazyTrendDraws=0, payload={budgets:rows}, token=1;
 const ctx = {
   $:id=>elements[id], get loadToken(){return token;}, budgetCard, esc, money,
   kpiRow:items=>items.map(x=>`${x.label}: ${x.value} ${x.sub}`).join("\n"),
@@ -101,8 +102,15 @@ const ctx = {
   showTagsFor:(...args)=>tagCalls.push(args), drawChart:(host,config)=>charts.push(config),
   // The chart renderer moved to its own leaf module when Hourly Billing started drawing budgets
   // too. Wired to the real one rather than a stub, so this still checks the chart it produces.
-  drawBudgetChart:(host,b)=>drawBudgetTrend(host,b,{drawChart:(h,c)=>charts.push(c),money}),
-  get:async url=>{ gets.push(url); return payload; },
+  drawBudgetChart:(host,b)=>drawBudgetTrend(host,b,{drawChart:(h,c)=>{
+    charts.push(c);
+    if(b.name==="Application A Lazy") lazyTrendDraws++;
+  },money}),
+  get:async url=>{
+    gets.push(url);
+    if(url.startsWith("/api/budgets/trend")) return {trend,filter_exact:true,tag_filter:[["App",["A"]]]};
+    return payload;
+  },
   setContent(host, html){
     rootMarkup=html; elements={tabBody:root,budgetList:list};
     for(const id of ["budgetRefresh","budgetFind","budgetReset","budgetMatchCount","budgetPortfolio"]) {
@@ -178,6 +186,24 @@ payload={budgets:[]};
 await elements.budgetRefresh.onclick();
 assert.match(rootMarkup,/<h3>No budgets in scope/);
 assert.match(gets.at(-1), /[?&]refresh=true$/,"retry also bypasses Azure cache");
+const lazyBudget={...base,name:"Application A Lazy",status:"near",percent_used:90,
+  trend:null,trend_note:null};
+payload={budgets:[lazyBudget]};
+await tabs.renderBudgets(1);
+assert.equal(gets.filter(url=>url.startsWith("/api/budgets/trend")).length,0,
+  "collapsed cards do not request their chart data");
+listDetails[0].open=true;
+await listDetails[0].ontoggle();
+assert.equal(gets.filter(url=>url.startsWith("/api/budgets/trend")).length,1,
+  "opening a card fetches its trend");
+assert.match(gets.at(-1),/subscription_id=one/);
+assert.match(gets.at(-1),/name=Application\+A\+Lazy/);
+assert.equal(lazyTrendDraws,1);
+payload={budgets:[],demo_mode:true,note:"Budgets are not part of the PostgreSQL demo data."};
+await tabs.renderBudgets(1);
+assert.match(rootMarkup,/No budgets in demo mode/);
+assert.match(rootMarkup,/PostgreSQL demo data/);
+assert.doesNotMatch(rootMarkup,/id="budgetRefresh"|Create a budget/);
 const previous=rootMarkup;
 token=2;
 await tabs.renderBudgets(1);

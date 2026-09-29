@@ -203,7 +203,7 @@ The script validates containment and non-overlapping subnets before making Azure
 | Application Insights | `appi-cloudlens` | traces and metrics, local auth disabled |
 | Storage account | `st<20-random-hex-characters>` | deployment-owned cost exports and Parquet archive |
 | PostgreSQL Flexible Server | `cloudlens-pg-<suffix>` | the cost warehouse |
-| App Service plan | `plan-cloudlens` | Linux B1 |
+| App Service plan | `plan-cloudlens` | Linux B2 |
 | Web app | `cloudlens-<suffix>` | Python 3.13, uvicorn |
 | AI Foundry account + project | `aif-cloudlens-<suffix>` | the chat agent, which the app will not start without |
 | Model deployment | `gpt-4.1-mini` | the model the agent runs on |
@@ -211,6 +211,25 @@ The script validates containment and non-overlapping subnets before making Azure
 
 The five-character suffix on the default web app and PostgreSQL names is derived from the
 resource group ID. Export storage uses its separate, persisted random name instead.
+
+## Capacity for large estates
+
+New deployments default to the measured reference profile for multi-million-row estates:
+Linux App Service B2, PostgreSQL `Standard_E2ds_v5`, 128 GB `PremiumV2_LRS` storage with
+3,000 IOPS and 125 MB/s throughput, and monthly partitioning for new cost tables. This is a
+capacity baseline, not a latency guarantee; customer data shape, region, concurrency and
+retention still need representative load testing. The profile costs materially more than the
+former B1/B1ms/32 GB demo defaults. Check regional availability and pricing before deployment;
+use `-PostgresSku`, `-PostgresStorageGb`, `-PostgresStorageType`, `-PostgresIops`,
+`-PostgresThroughput`, `-AppServicePlanSku` and `-PartitionCosts:$false` only when the smaller
+workload and its performance trade-offs are understood. Reader queries default to a 25-second
+server-side timeout, below the browser's 30-second request deadline; override
+`-PgStatementTimeout` only after measuring a legitimate slow query. Existing `costs` tables are
+never converted to partitions by a redeployment.
+
+Generation-triggered dashboard snapshot warming is enabled by default. It warms at most three
+recent private views per active browser after a new data generation, and can be disabled with
+`-SnapshotWarmingEnabled:$false` where its bounded background refresh is not desired.
 
 ## The two network shapes
 
@@ -688,15 +707,15 @@ gets queried; under-reporting does not. Guarding it instead: canonicalisation at
 
 ## Running costs
 
-Roughly, for the default SKUs in `centralindia`:
+The previous B1/B1ms demo estimate below is retired; it does not price the large-estate
+defaults. Check the Azure Pricing Calculator for the selected region before deployment:
 
 | | |
 |---|---|
-| App Service B1 | ~$13/month |
-| PostgreSQL B1ms + 32 GB | ~$15/month |
-| AI Foundry | usage-driven; a few dollars a month at normal use |
+| App Service B2 | regional price; billed while the plan is provisioned |
+| PostgreSQL E2ds_v5 + 128 GB PremiumV2 (3,000 IOPS / 125 MB/s) | regional compute, storage, IOPS and throughput charges |
+| AI Foundry | usage-driven |
 | Storage, Log Analytics, App Insights | a few dollars, usage-driven |
 
-Both compute SKUs are the smallest that support what the app needs — Always On for App
-Service, enough burst credit for ingest on PostgreSQL. Scale PostgreSQL first if ingest is
-slow; dashboard reads come from indexed monthly aggregates and stay fast well past that point.
+The actual total depends on region, uptime, backups, data retention and telemetry volume.
+Do not use the old B1/B1ms estimate to approve a customer deployment.

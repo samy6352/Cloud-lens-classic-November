@@ -5,6 +5,7 @@ import { railIcon } from "./icons.js";
 import { revealOverviewTarget, subscriptionDrillIds } from "./dashboard-drilldowns.js";
 import { budgetReadIssue, matchingTagBudgets } from "./budget-context.js";
 import { currencyAmountList, nativeAmount, nativeRowTotal } from "./dashboard-currencies.js";
+import { loadBudgetTrend as loadBudgetTrendChart } from "./budget-chart.js";
 
 /** Select existing cost signals without treating missing values as zero or changing source order. */
 export function overviewHighlights(data) {
@@ -1444,13 +1445,14 @@ async function loadUptimeBudget(token, tagKey, tagValue, hasValue = Boolean(tagV
     return;
   }
 
-  let rows;
+  let rows, demoMode = false;
   try {
     // Cached per scope and period like every other read on the tab, so switching between values
     // of the same key does not re-run a multi-second Azure call each time.
     const d = await cached(key("uptime-budgets"), () =>
       get(`/api/budgets${qs()}`, { timeout: 45000 }));
     rows = d?.budgets || [];
+    demoMode = d?.demo_mode === true;
   } catch {
     // Silent by design. A budget is context here, not the subject of the tab, and an error
     // banner over the meter table would be a worse answer than no panel at all.
@@ -1458,6 +1460,10 @@ async function loadUptimeBudget(token, tagKey, tagValue, hasValue = Boolean(tagV
     return;
   }
   if (token !== ctx.loadToken) return;
+  if (demoMode) {
+    host.innerHTML = '<p class="muted note">Budgets are not included in the PostgreSQL demo data; no Azure budget was requested.</p>';
+    return;
+  }
 
   const matches = uptimeBudgetMatches(rows, tagKey, tagValue, hasValue);
   if (!matches.length) {
@@ -1475,7 +1481,7 @@ async function loadUptimeBudget(token, tagKey, tagValue, hasValue = Boolean(tagV
     <p class="muted note">Azure budgets track every cost carrying this tag. The meters above are
       only the hour-priced ones, so the budget covers more spend than the figures on this tab.</p>
     <div class="budget-list">${matches.map((m, i) => `
-      ${budgetCard(m.budget, i)}
+      ${budgetCard(m.budget, i, { lazyTrend: true })}
       ${m.extra.length || m.partial ? `<p class="muted note uptime-budget-scope">${
         m.extra.length
           ? `Also filtered on ${esc(m.extra.map(e => `${e.key} = ${e.values.join(", ")}`).join("; "))
@@ -1490,7 +1496,12 @@ async function loadUptimeBudget(token, tagKey, tagValue, hasValue = Boolean(tagV
   // host at all, and counting elements would then draw the wrong budget's line.
   for (const chart of host.querySelectorAll(".budget-chart[data-chart]")) {
     const m = matches[Number(chart.dataset.chart)];
-    if (m) drawBudgetChart(chart, m.budget);
+    if (m) whenNear(chart, async () => async () => {
+      await loadBudgetTrendChart(chart, m.budget, {
+        get, currency: ctx.readStore?.("costCurrency", "") || "", drawBudgetChart, esc,
+        isCurrent: () => token === ctx.loadToken && chart.isConnected,
+      });
+    });
   }
   for (const btn of host.querySelectorAll("[data-tagsfor]")) {
     btn.onclick = () => {
@@ -2338,26 +2349,37 @@ function wireTagValues() {
     }
     if (!current()) return;
     tagBudgetPendingPaint = false;
-    const issue = budgetReadIssue(data);
+    const demoMode = data?.demo_mode === true;
+    const issue = demoMode ? "" : budgetReadIssue(data);
     const rows = Array.isArray(data?.budgets) ? data.budgets : [];
     const matches = matchingTagBudgets(rows, selected, mode);
     const unavailable = rows.some(b => b?.filter_exact === false || b?.filtered_exactly === false);
     host.innerHTML = `<section class="card tag-matched-budgets">
-      <div class="tagpick-head"><h3>Related budgets${matches.length ? ` · ${matches.length}` : ""}</h3>
-        <button type="button" class="linkish" id="tagBudgetRefresh">Refresh budgets</button></div>
+      <div class="tagpick-head"><h3>${demoMode ? "Budgets not available in demo mode"
+        : `Related budgets${matches.length ? ` · ${matches.length}` : ""}`}</h3>
+        ${demoMode ? "" : '<button type="button" class="linkish" id="tagBudgetRefresh">Refresh budgets</button>'}</div>
+      ${demoMode ? `<p class="muted note">${esc(data.note
+        || "Budgets are not part of the PostgreSQL demo data; no Azure budget was requested.")}</p>` : ""}
       ${issue ? `<p class="banner warn" role="status">${esc(issue)} Results may be incomplete.</p>` : ""}
-      ${matches.length ? `<p class="muted note">Budgets use their own period, subscription and full tag filter.
+      ${demoMode ? "" : matches.length ? `<p class="muted note">Budgets use their own period, subscription and full tag filter.
         Their figures can differ from the resource selection; overlapping budgets are not added together.</p>
         <div class="budget-list">${matches.map((match, index) =>
           budgetCard(match.budget, index, { snapshotChart: true, chartAside: true })).join("")}</div>`
         : `<p class="muted note">${issue ? "Matching budgets could not be confirmed."
           : "No budgets match the selected tags and values."}</p>`}
-      ${unavailable ? '<p class="muted note">Some budget filters cannot be matched locally. Open Budgets to review their scope.</p>' : ""}
+      ${!demoMode && unavailable ? '<p class="muted note">Some budget filters cannot be matched locally. Open Budgets to review their scope.</p>' : ""}
     </section>`;
-    $("tagBudgetRefresh").onclick = () => loadTagBudgets(true);
-    for (const chart of host.querySelectorAll("[data-chart]")) {
+    const refreshButton = $("tagBudgetRefresh");
+    if (refreshButton) refreshButton.onclick = () => loadTagBudgets(true);
+    for (const chart of demoMode ? [] : host.querySelectorAll("[data-chart]")) {
       const budget = matches[Number(chart.dataset.chart)]?.budget;
-      if (budget) whenNear(chart, () => () => drawBudgetChart(chart, budget, { snapshot: true, compact: true }));
+      if (budget) whenNear(chart, async () => async () => {
+        await loadBudgetTrendChart(chart, budget, {
+          get, currency: ctx.readStore?.("costCurrency", "") || "", drawBudgetChart, esc,
+          options: { snapshot: true, compact: true },
+          isCurrent: () => chart.isConnected,
+        });
+      });
     }
     for (const button of host.querySelectorAll("[data-tagsfor]")) {
       const budget = matches[Number(button.dataset.tagsfor)]?.budget;
@@ -2737,6 +2759,11 @@ async function loadSubBudgets(sub, highlight) {
 }
 
 function subBudgetsMarkup(data, highlight) {
+  if (data.demo_mode) {
+    return `<h4>Subscription budgets</h4>
+      <p class="muted note">${esc(data.note
+        || "Budgets are not included in the PostgreSQL demo data; no Azure budget was requested.")}</p>`;
+  }
   const rows = (data.budgets || []).filter((b) => b.name);
   if (!rows.length) {
     return `<h4>Subscription budgets</h4>

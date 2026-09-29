@@ -1,6 +1,7 @@
 /** Lazy monitor views. Dependencies are supplied by the shell; no reverse imports. */
 import { budgetReadIssue } from "./budget-context.js";
 import { currencyAmountList, nativeAmount } from "./dashboard-currencies.js";
+import { loadBudgetTrend as loadBudgetTrendChart } from "./budget-chart.js";
 export { budgetReadIssue } from "./budget-context.js";
 
 export function budgetStatus(b) {
@@ -623,6 +624,7 @@ async function renderBudgets(token, refresh = false) {
 
   const rows = Array.isArray(d?.budgets) ? d.budgets : [];
   const issue = budgetReadIssue(d);
+  const demoMode = d?.demo_mode === true;
   const budgetHelp = `<details class="view-help" data-state-key="budgets-about">
     <summary>About this view</summary>
     <p>Budgets track spending against a limit and support Azure notifications before invoicing.
@@ -631,7 +633,8 @@ async function renderBudgets(token, refresh = false) {
       date range. Budgets may overlap or use different currencies, so limits and spend are not
       combined into an estate total.</p>
   </details>`;
-  const refreshButton = '<button type="button" class="linkish" id="budgetRefresh">Refresh budgets</button>';
+  const refreshButton = demoMode ? ""
+    : '<button type="button" class="linkish" id="budgetRefresh">Refresh budgets</button>';
   const wireRefresh = () => {
     const button = $("budgetRefresh");
     if (button) button.onclick = async () => {
@@ -644,12 +647,14 @@ async function renderBudgets(token, refresh = false) {
   if (!rows.length) {
     setContent($("tabBody"), `
       <section class="card">
-        <div class="tagpick-head"><h3>${issue ? "Budget data incomplete" : "No budgets in scope"}</h3>${refreshButton}</div>
+        <div class="tagpick-head"><h3>${demoMode ? "No budgets in demo mode"
+          : issue ? "Budget data incomplete" : "No budgets in scope"}</h3>${refreshButton}</div>
+        ${demoMode ? `<p class="muted note">${esc(d.note
+          || "Budgets are not included in the PostgreSQL demo data. No Azure budget was requested.")}</p>` : ""}
         ${issue ? `<div class="banner warn" role="status">${esc(issue)} Retry the read; an empty result does not confirm that no budgets exist.</div>` : ""}
-        <p class="muted">Create a budget from your selection in
+        ${demoMode ? "" : `<p class="muted">Create a budget from your selection in
           <button type="button" class="linkish" data-goto="tags">Cost by Application /
-          Tags</button>.</p>
-        ${budgetHelp}
+          Tags</button>.</p>${budgetHelp}`}
       </section>`);
     wireBudgetLinks();
     wireRefresh();
@@ -831,15 +836,20 @@ function paintBudgetList(rows) {
     const draw = () => {
       const chart = detail.querySelector(".budget-chart");
       if (chart && !chart.dataset.drawn) {
-        drawBudgetChart(chart, b);
         chart.dataset.drawn = "true";
+        return loadBudgetTrendChart(chart, b, {
+          get, currency: readStore("costCurrency", ""), drawBudgetChart, esc,
+          options: { compact: true }, isCurrent: () => detail.isConnected,
+        }).then(loaded => {
+          if (!loaded && detail.isConnected) delete chart.dataset.drawn;
+        });
       }
     };
     detail.ontoggle = () => {
       if (!detail.isConnected) return;
       if (detail.open) {
         budgetExpanded.add(budgetIdentity(b));
-        draw();
+        return draw();
       } else budgetExpanded.delete(budgetIdentity(b));
     };
     if (detail.open) draw();

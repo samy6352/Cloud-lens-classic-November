@@ -139,6 +139,10 @@ def test_mixed_resource_shutdown_preserves_monthly_currency_buckets(monkeypatch,
 
 def test_historical_unknown_currency_is_not_assigned_to_current_usd():
     class Reader:
+        agg = "costs"
+        benefit = "costs"
+        spot = "costs"
+
         def rows(self, sql, limit=None):
             if 'max("ChargePeriodStart")' in sql:
                 return [{"hi": "2026-09-14"}]

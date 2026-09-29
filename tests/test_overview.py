@@ -21,6 +21,8 @@ from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
 
 import os
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 os.environ.setdefault("AUTH_DISABLED", "true")
 
@@ -190,7 +192,7 @@ from app.warehouse import warehouse  # noqa: E402
 def _overview_with(coverage_to, live_mtd=1234.0):
     """Run the real overview() with the warehouse claiming a given coverage end date."""
     real_summary = warehouse.summary
-    real_query = warehouse.query
+    real_reader = warehouse.reader
     real_summary_fn = cost_mod.list_subscriptions
     real_fc, real_bud = cost_mod._forecast_by_subscription, cost_mod.budgets
     real_cs = cost_mod.cost_summary
@@ -202,7 +204,14 @@ def _overview_with(coverage_to, live_mtd=1234.0):
     }
     # If it asks the warehouse for the month, it gets a zero -- exactly what the live data does
     # for a month it has no rows in. A correct implementation must not report that as the answer.
-    warehouse.query = lambda *a, **k: {"rows": [{"mtd": 0.0, "prev": 0.0}]}
+    @contextmanager
+    def reader(scope=None):
+        yield SimpleNamespace(
+            agg="costs_rollup",
+            rows=lambda *_: [{"currency": "USD", "mtd": 0.0, "prev": 0.0}],
+        )
+
+    warehouse.reader = reader
 
     async def subs():
         return {"subscriptions": []}
@@ -223,7 +232,7 @@ def _overview_with(coverage_to, live_mtd=1234.0):
     try:
         return asyncio.run(cost_mod.overview(None))
     finally:
-        warehouse.summary, warehouse.query = real_summary, real_query
+        warehouse.summary, warehouse.reader = real_summary, real_reader
         cost_mod.list_subscriptions = real_summary_fn
         cost_mod._forecast_by_subscription, cost_mod.budgets = real_fc, real_bud
         cost_mod.cost_summary = real_cs

@@ -89,19 +89,22 @@ param postgresIops int = 3000
 param postgresThroughput int = 125
 
 @description('Create a new `costs` table partitioned by month. Read once at import; it cannot convert a table that already exists, so it must be correct before the application first starts.')
-param partitionCosts bool = false
+param partitionCosts bool = true
 
 @description('Session work_mem for application connections. Empty keeps the server default. Applies per sort node and per pooled connection, so size it against the server, not the query.')
 param pgWorkMem string = ''
 
-@description('Session statement_timeout for application connections. Empty means no cap, which lets one slow query hold a pool slot indefinitely.')
-param pgStatementTimeout string = ''
+@description('Reader statement_timeout. Keep below the dashboard client deadline so abandoned reads return their pool slot promptly.')
+param pgStatementTimeout string = '25s'
 
 @description('Let the application ingest cost data on first boot when the warehouse is empty. False for a deployment whose data is loaded by other means, so a boot cannot mix its own subscription into a restored estate.')
 param autoIngest bool = true
 
 @description('Run the daily refresh. False pins the warehouse to exactly what was loaded.')
 param autoRefresh bool = true
+
+@description('Warm recently used, private dashboard snapshots after a data generation changes.')
+param snapshotWarmingEnabled bool = true
 
 @description('Allow username/password sign-in alongside Entra. Production runs with this enabled.')
 param authAllowLocal bool = false
@@ -688,6 +691,10 @@ resource webApp 'Microsoft.Web/sites@2023-12-01' = {
         {
           name: 'SNAPSHOT_CACHE_ENABLED'
           value: 'true'
+        }
+        {
+          name: 'SNAPSHOT_WARMING_ENABLED'
+          value: snapshotWarmingEnabled ? 'true' : 'false'
         }
         {
           name: 'WEBSITE_WARMUP_PATH'

@@ -182,7 +182,8 @@ def test_fallback_and_recovery(fx_warehouse, monkeypatch, reason):
                 jobs.invalidate_rollup(con)
             else:
                 con.execute("UPDATE meta SET value=? WHERE key=?",
-                            ["costs_rollup,resource_presence,billing_rollup,billing_serving",
+                            ["costs_rollup,resource_presence,billing_rollup,billing_serving,"
+                             "commitment_benefits,spot_rates",
                              jobs.ROLLUP_TABLES_KEY])
     with fx_warehouse.reader(currency="INR") as reader:
         _compare(reader)

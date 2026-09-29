@@ -45,6 +45,19 @@ function global:az {
             Write-Host 'EXISTING_STORAGE_PRESERVED_IN_PREVIEW'
             return
         }
+        if ($scenario -eq 'capacity-preview') {
+            foreach ($setting in @(
+                'appServicePlanSku=B2', 'postgresSku=Standard_E2ds_v5',
+                'postgresStorageGb=128', 'postgresStorageType=PremiumV2_LRS',
+                'postgresIops=3000', 'postgresThroughput=125',
+                'partitionCosts=true', 'snapshotWarmingEnabled=true',
+                'pgStatementTimeout=25s'
+            )) {
+                if (-not $call.Contains($setting)) { throw "Missing reference profile setting: $setting" }
+            }
+            Write-Host 'REFERENCE_CAPACITY_DEFAULTS_OK'
+            return
+        }
         $global:LASTEXITCODE = 7
         return
     }
@@ -169,6 +182,11 @@ class DeploymentFailures(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("EXISTING_STORAGE_PRESERVED_IN_PREVIEW", result.stdout)
         self.assertIn("Preview only. Re-run", result.stdout)
+
+    def test_new_deploy_defaults_match_measured_scale_profile(self):
+        result = self.run_deploy("capacity-preview", "-WhatIf -SkipEntra")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("REFERENCE_CAPACITY_DEFAULTS_OK", result.stdout)
 
     def test_failed_role_grant_stops_deployment(self):
         result = self.run_deploy("role-failure", "-SkipCode -SkipEntra")

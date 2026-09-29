@@ -8,7 +8,7 @@ a columnar scan of the whole table costs milliseconds. PostgreSQL is a row
 store, so summing one column means reading every row in full -- 25 columns of
 resource ids and meter descriptions, to add up one float.
 
-Measured on the deployed B1ms, monthly trend over 2M rows:
+Measured on the original B1ms baseline, monthly trend over 2M rows:
 
     from the detail table    11,300 ms
     from this rollup             33 ms      <- 32 ms of which is network

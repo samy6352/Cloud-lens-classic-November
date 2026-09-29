@@ -17,6 +17,58 @@
  */
 const GRAIN_WORD = { Monthly: "month", Quarterly: "quarter", Annually: "year" };
 
+export async function loadBudgetTrend(host, budget, {
+  get, currency = "", drawBudgetChart, esc, options = {}, isCurrent = () => true,
+}) {
+  if (!host) return false;
+  const draw = () => drawBudgetChart(host, budget, options);
+  if (budget.trend || budget.filter_exact === false || budget.trend_note) {
+    draw();
+    return true;
+  }
+
+  if (options.snapshot) draw();
+  else host.innerHTML = '<p class="muted note">Loading budget trend…</p>';
+
+  if (!budget._trendPending) {
+    const subscription = budget.subscription_id || budget.subscription;
+    if (!subscription || !budget.name) {
+      host.innerHTML = '<p class="muted note">Budget identity is unavailable; the trend cannot be loaded.</p>';
+      return false;
+    }
+    const query = new URLSearchParams({ subscription_id: subscription, name: budget.name });
+    if (currency) query.set("currency", currency);
+    budget._trendPending = get(`/api/budgets/trend?${query}`, { timeout: 180000 })
+      .then(result => {
+        Object.assign(budget, result);
+        if (!budget.trend && !budget.trend_note) {
+          budget.trend_note = "No comparable trend data is available for this budget period.";
+        }
+      })
+      .catch(error => {
+        budget._trendError = error?.message || String(error);
+      })
+      .finally(() => {
+        budget._trendPending = null;
+      });
+  }
+
+  await budget._trendPending;
+  if (!isCurrent()) return false;
+  if (budget._trendError) {
+    host.innerHTML = `<p class="bad">Could not load budget trend: ${esc(budget._trendError)}</p>`;
+    delete budget._trendError;
+    return false;
+  } else if (budget.trend) {
+    draw();
+  } else if (options.snapshot) {
+    draw();
+  } else {
+    host.innerHTML = `<p class="muted note">${esc(budget.trend_note)}</p>`;
+  }
+  return true;
+}
+
 export function drawBudgetChart(host, b, { drawChart, money, snapshot = false, compact = false }) {
   const t = b.trend;
   if (!host) return;

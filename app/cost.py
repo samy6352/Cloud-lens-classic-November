@@ -1101,6 +1101,11 @@ async def budgets(subscription_ids: list[str] | None = None, *, refresh: bool = 
     opens this with is "am I over?" — which needs the percentage, the headroom left, and what
     the budget actually watches, all of which the raw ARM shape leaves to the caller.
     """
+    from . import demo_mode
+
+    if demo_mode.enabled():
+        return demo_mode.budgets_payload()
+
     subs = await _resolve(subscription_ids)
 
     async def one(sub: dict) -> list[dict]:
@@ -1240,7 +1245,9 @@ async def top_resources(subscription_ids: list[str] | None = None, months_back: 
     return result
 
 
-async def overview(scope: list[str] | None = None) -> dict[str, Any]:
+async def overview(scope: list[str] | None = None, *,
+                   timings: dict[str, float] | None = None,
+                   failed_phases: set[str] | None = None) -> dict[str, Any]:
     """A small at-a-glance summary for the header strip.
 
     Historical totals come from the warehouse when it has data — instant, and immune to the
@@ -1248,16 +1255,44 @@ async def overview(scope: list[str] | None = None) -> dict[str, Any]:
     kept per-subscription so that narrowing the scope is a re-aggregation in memory rather than
     another round of slow API calls.
     """
+    from .currency import currency_code
     from .warehouse import warehouse
+
+    async def measured(name: str, operation):
+        started = time.perf_counter()
+        try:
+            return await operation
+        except Exception:
+            if failed_phases is not None:
+                failed_phases.add(name)
+            raise
+        finally:
+            duration = round((time.perf_counter() - started) * 1000, 1)
+            if timings is not None:
+                timings[name] = duration
+            if duration >= 500:
+                outcome = "error" if failed_phases is not None and name in failed_phases else "ok"
+                log.warning("slow overview phase=%s duration_ms=%.1f outcome=%s",
+                            name, duration, outcome)
 
     mtd = last = None
     currency = None
     stale_note = None
+    currency_note = None
+    month_to_date_by_currency: list[dict[str, Any]] = []
+    last_month_by_currency: list[dict[str, Any]] = []
+    warehouse_mtd_answered = False
+    warehouse_last_answered = False
     # Both warehouse reads on a worker thread. psycopg is synchronous and this is the path the
     # header tiles take on every dashboard load, so running them inline puts a database round
     # trip on the event loop for every visitor.
-    stored = await asyncio.to_thread(warehouse.summary)
+    stored = await measured("warehouse_summary", asyncio.to_thread(warehouse.summary))
     wanted = {s.lower() for s in scope} if scope else None
+    if stored.get("summary_pending"):
+        stale_note = "Local cost summaries are rebuilding; warehouse totals are temporarily unavailable."
+        currency_note = stale_note
+        warehouse_mtd_answered = True
+        warehouse_last_answered = True
 
     today = datetime.now(UTC).date()
     this_start = today.replace(day=1)
@@ -1283,21 +1318,79 @@ async def overview(scope: list[str] | None = None) -> dict[str, Any]:
     if stored["rows"] and covers_mtd:
         try:
             # Dates are computed here, never user input, so interpolation is safe.
-            sql = (
-                'SELECT '
-                f'  sum(CASE WHEN "ChargePeriodStart" >= DATE \'{this_start}\' '
-                '       THEN "BilledCost" ELSE 0 END) AS mtd, '
-                f'  sum(CASE WHEN "ChargePeriodStart" BETWEEN DATE \'{prev_start}\' '
-                f'       AND DATE \'{prev_end}\' THEN "BilledCost" ELSE 0 END) AS prev '
-                'FROM costs'
-            )
-            rows = (await asyncio.to_thread(warehouse.query, sql, scope=scope))["rows"]
+            def month_totals() -> tuple[str, list[dict]]:
+                with warehouse.reader(scope, budget_ms=5000) as reader:
+                    # Never turn a stale/missing aggregate into a multi-million-row scan
+                    # for a page-header tile. The reader can still answer from raw rows for
+                    # small warehouses; large estates wait for the rollup instead.
+                    if reader.agg == "costs" and stored["rows"] > 100_000:
+                        return reader.agg, []
+                    sql = (
+                        'SELECT "BillingCurrency" AS currency, '
+                        f'  sum(CASE WHEN "ChargePeriodStart" >= DATE \'{this_start}\' '
+                        '       THEN "BilledCost" ELSE 0 END) AS mtd, '
+                        f'  sum(CASE WHEN "ChargePeriodStart" BETWEEN DATE \'{prev_start}\' '
+                        f'       AND DATE \'{prev_end}\' THEN "BilledCost" ELSE 0 END) AS prev '
+                        f'FROM {reader.agg} GROUP BY 1'
+                    )
+                    return reader.agg, reader.rows(sql, None)
+
+            source, rows = (await measured(
+                "warehouse_month_totals",
+                asyncio.to_thread(month_totals),
+            ))
+            warehouse_mtd_answered = True
+            warehouse_last_answered = covers_last
+            if source == "costs":
+                currency_note = (
+                    "The warehouse monthly summary is not current; totals are temporarily "
+                    "unavailable rather than scanning all raw charges."
+                )
+            elif not rows:
+                currency_note = "No complete monthly warehouse totals are available."
             if rows:
-                mtd = round(rows[0]["mtd"] or 0, 2)
-                last = round(rows[0]["prev"] or 0, 2) if covers_last else None
-                currency = stored["currency"]
+                totals: dict[str, dict[str, float]] = {}
+                for row in rows:
+                    code = currency_code(row.get("currency")) or "UNKNOWN"
+                    totals[code] = {
+                        "mtd": round(row["mtd"] or 0, 2),
+                        "last": round(row["prev"] or 0, 2),
+                    }
+                month_to_date_by_currency = [
+                    {"currency": code, "cost": values["mtd"]}
+                    for code, values in sorted(totals.items())
+                ]
+                last_month_by_currency = [
+                    {"currency": code, "cost": values["last"]}
+                    for code, values in sorted(totals.items())
+                ] if covers_last else []
+                if len(totals) == 1:
+                    code, values = next(iter(totals.items()))
+                    if code != "UNKNOWN":
+                        mtd = values["mtd"]
+                        last = values["last"] if covers_last else None
+                        currency = code
+                else:
+                    currency = None
+                    codes = ", ".join(sorted(totals))
+                    currency_note = (
+                        "As billed, the selected subscriptions span multiple currencies "
+                        f"({codes}); no combined total is shown."
+                    )
+                if "UNKNOWN" in totals:
+                    currency_note = (
+                        "Some warehouse charges have no billing currency; a single total "
+                        "cannot be shown safely."
+                    )
         except Exception as exc:  # noqa: BLE001 - fall through to the live API
             log.warning("warehouse overview failed: %s", exc)
+            if stored["rows"]:
+                warehouse_mtd_answered = True
+                warehouse_last_answered = covers_last
+                currency_note = (
+                    "Local monthly totals are temporarily unavailable; no cross-currency "
+                    "total is shown."
+                )
     elif stored["rows"]:
         # Worth saying which, because the two have different fixes: refresh the data, or wait
         # for Azure to write the first days of the month.
@@ -1307,14 +1400,16 @@ async def overview(scope: list[str] | None = None) -> dict[str, Any]:
                  stored["to"], this_start)
 
     tasks: dict[str, Any] = {
-        "subs": list_subscriptions(),
-        "fc": _forecast_by_subscription(scope),
-        "buds": budgets(scope),
+        "subs": measured("subscriptions", list_subscriptions()),
+        "fc": measured("forecast", _forecast_by_subscription(scope)),
+        "buds": measured("budgets", budgets(scope)),
     }
-    if mtd is None:
-        tasks["mtd"] = cost_summary(scope, months_back=0, group_by="None")
-    if last is None:
-        tasks["last"] = cost_summary(scope, months_back=1, group_by="None")
+    if mtd is None and not warehouse_mtd_answered:
+        tasks["mtd"] = measured(
+            "mtd_cost_query", cost_summary(scope, months_back=0, group_by="None"))
+    if last is None and not warehouse_last_answered:
+        tasks["last"] = measured(
+            "last_cost_query", cost_summary(scope, months_back=1, group_by="None"))
 
     keys = list(tasks)
     done = await asyncio.gather(*(tasks[k] for k in keys), return_exceptions=True)
@@ -1344,7 +1439,10 @@ async def overview(scope: list[str] | None = None) -> dict[str, Any]:
     budget_status = "unavailable"
     budget_note = "Budget information is unavailable for the selected scope; retry or check Azure access."
     buds = got.get("buds")
-    if isinstance(buds, dict) and isinstance(buds.get("budgets"), list):
+    if isinstance(buds, dict) and buds.get("demo_mode"):
+        budget_status = "demo"
+        budget_note = buds.get("note") or "Budgets are disabled in demo mode."
+    elif isinstance(buds, dict) and isinstance(buds.get("budgets"), list):
         rows = buds["budgets"]
         tracked = [
             b for b in rows if isinstance(b, dict) and isinstance(b.get("name"), str)
@@ -1383,9 +1481,13 @@ async def overview(scope: list[str] | None = None) -> dict[str, Any]:
 
     return {
         "subscriptions": len(in_scope) or stored["subscriptions"],
-        "currency": currency or "USD",
+        "currency": (currency or (
+            "USD" if not stored.get("mixed_currency") and not currency_note else None)),
         "month_to_date": mtd,
         "last_month": last,
+        "month_to_date_by_currency": month_to_date_by_currency,
+        "last_month_by_currency": last_month_by_currency,
+        "currency_note": currency_note,
         "forecast_30d": value(got.get("fc"), "projected_total"),
         "budget": {"name": worst["name"], "percent_used": worst["percent_used"],
                    "status": worst.get("status"),

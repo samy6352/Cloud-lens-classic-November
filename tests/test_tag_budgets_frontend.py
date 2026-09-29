@@ -87,7 +87,7 @@ ctx.budgetCard=(b,index,options)=>{
   return `<article>${escape(b.name)}<div class="budget-chart" data-chart="${index}"></div>
     <button data-tagsfor="${index}">See what is in it</button></article>`;
 };
-ctx.whenNear=(host,prepare)=>prepare()();
+ctx.whenNear=(host,prepare)=>Promise.resolve(prepare()).then(commit=>commit());
 ctx.drawBudgetChart=(host,b,options)=>budgetDraws.push({name:b.name,snapshot:options.snapshot,compact:options.compact});
 const tagJumps=[];
 ctx.showTagsFor=(...args)=>tagJumps.push(args);
@@ -158,6 +158,21 @@ const reads=budgetRequests.length;
 host.isConnected=true; ctx.loadToken=1; budgetTabs.resume(1,"tags"); await settled();
 assert.match(host.innerHTML,/Resumed budget/);
 assert.equal(budgetRequests.length,reads,"return uses the completed cached read");
+""")
+
+
+def test_demo_mode_shows_no_fake_budgets_and_does_not_offer_live_refresh():
+    run_node(BUDGET_HARNESS + r"""
+payload=sample();
+budgetPayload={budgets:[],demo_mode:true,
+  note:"Budgets are not part of the PostgreSQL demo data."};
+await budgetTabs.renderTags(1);
+click("data-tag","Environment",$("tagChips"));
+click("data-vv","prod",$("tagValueGroups"));
+await settled();
+assert.match($("tagBudgets").innerHTML,/Budgets not available in demo mode/);
+assert.match($("tagBudgets").innerHTML,/PostgreSQL demo data/);
+assert.doesNotMatch($("tagBudgets").innerHTML,/Refresh budgets|budget-chart/);
 """)
 
 

@@ -155,6 +155,49 @@ def test_compact_billing_keeps_the_actual_shadow_branch(loaded, monkeypatch):
         assert reader.bill_serving is None
 
 
+def test_commitment_summaries_are_fresh_and_scope_matched(loaded):
+    from app import commitment_benefits, spot_rates
+    from app.warehouse import COLUMNS, NUMERIC, insert_rows
+
+    def row(subscription, *, benefit=False):
+        values = {
+            "ChargePeriodStart": "2026-09-14",
+            "SubAccountId": subscription,
+            "BillingCurrency": "USD",
+            "BilledCost": 5.0,
+            "ResourceId": f"/subscriptions/{subscription}/resourceGroups/rg/providers/"
+                          "Microsoft.Compute/virtualMachines/vm",
+            "ResourceName": "vm",
+            "ResourceGroup": "rg",
+            "RegionName": "eastus",
+            "ServiceName": "Virtual Machines",
+            "ServiceFamily": "Compute",
+            "ChargeCategory": "Usage",
+            "PricingModel": "Reservation" if benefit else "Spot",
+            "BenefitId": "benefit-a" if benefit else None,
+            "BenefitName": "Plan A" if benefit else None,
+            "MeterName": "D2",
+            "UnitOfMeasure": "Hour",
+            "PricingQuantity": 10.0,
+        }
+        return [values.get(name, 0.0 if name in NUMERIC else None) for name in COLUMNS]
+
+    with loaded.connect() as con:
+        insert_rows(con, [row("sub-a", benefit=True), row("sub-b")])
+    loaded.refresh_rollup(strict=True)
+
+    with loaded.reader(scope=["sub-a"], include_commitments=True) as reader:
+        assert reader.benefit == commitment_benefits.TABLE
+        assert reader.spot == spot_rates.TABLE
+        benefits = reader.rows(
+            f'SELECT DISTINCT "SubAccountId", "BenefitId" FROM {reader.benefit}')
+        spots = reader.rows(
+            f'SELECT DISTINCT "SubAccountId", "MeterName" FROM {reader.spot}')
+
+    assert benefits == [{"SubAccountId": "sub-a", "BenefitId": "benefit-a"}]
+    assert spots == [{"SubAccountId": "sub-a", "MeterName": "D2"}]
+
+
 def test_a_converted_currency_is_not_answered_from_the_rollup_table(loaded):
     """The grain has no PricingCurrency or exchange rate, so conversion must derive.
 

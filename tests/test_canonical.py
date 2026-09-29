@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import secrets
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -216,7 +217,8 @@ def _main_stack(monkeypatch, value):
                 node.decorator_list = []
                 selected.append(node)
         elif isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id in {"PUBLIC_PATHS", "PUBLIC_PREFIXES"}
+            isinstance(target, ast.Name)
+            and target.id in {"PUBLIC_PATHS", "PUBLIC_PREFIXES", "SLOW_API_LOG_MS"}
             for target in node.targets
         ):
             selected.append(node)
@@ -230,6 +232,7 @@ def _main_stack(monkeypatch, value):
         "BaseHTTPMiddleware": BaseHTTPMiddleware, "Request": Request, "Response": Response,
         "JSONResponse": JSONResponse, "RedirectResponse": RedirectResponse, "quote": quote,
         "auth_service": lambda: auth, "COOKIE": "cloudlens_session", "secrets": secrets,
+        "time": time,
         "entra_email": lambda value: "", "log": logging.getLogger("test.canonical"),
         "_content_security_policy": lambda: "default-src 'self'",
         "read_only_mode": read_only_mode,

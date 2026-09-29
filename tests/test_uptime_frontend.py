@@ -95,7 +95,8 @@ const tabs=createTabs({
   cached:async(_,load)=>load(),key:id=>id,get:async()=>data,qs:()=>"?days=30",
   esc:v=>String(v??""),money:(v,c,dp)=>`${c} ${Number(v).toFixed(dp??2)}`,
   moneyHtml:(v,c)=>`${c} ${v}`,kpiRow:()=>"",table:()=>"",bar:()=>"",drawChart:()=>{},
-  whenNear:()=>{},wireTables:()=>{},title:()=>"",portalLinkMarkup:()=>"",
+  whenNear:()=>{},
+  wireTables:()=>{},title:()=>"",portalLinkMarkup:()=>"",
 });
 
 await tabs.renderUptime(1);
@@ -146,7 +147,8 @@ const tabs=createTabs({
   cached:async(_,load)=>load(),key:id=>id,get:async()=>data,qs:()=>"?days=30",
   esc:v=>String(v??""),money:(v,c,dp)=>`${c} ${Number(v).toFixed(dp??2)}`,
   moneyHtml:(v,c)=>`${c} ${v}`,kpiRow:()=>"",table:()=>"",bar:()=>"",drawChart:()=>{},
-  whenNear:()=>{},wireTables:()=>{},title:()=>"",portalLinkMarkup:()=>"",
+  whenNear:()=>{},
+  wireTables:()=>{},title:()=>"",portalLinkMarkup:()=>"",
 });
 await tabs.renderUptime(1);
 // "Tag key" alone means nothing to someone who was sent here to find one application's cost.
@@ -232,7 +234,7 @@ const data={currency:"USD",dates:["2026-09-01","2026-09-02"],daily:{},schedules:
      cost:9,hours:9,schedule_status:"not_assessed",keys:["Application"],v:[0]},
     {id:"b",name:"b",service:"VM",meter:"m",resource_group:"rg",region:"eastus",
      cost:4,hours:4,schedule_status:"not_assessed",keys:["Application"],v:[1]}]};
-const budgets={budgets:[{name:"payments-monthly",subscription:"Prod",amount:500,
+let budgets={budgets:[{name:"payments-monthly",subscription:"Prod",amount:500,
   current_spend:250,percent_used:50,status:"ok",currency:"USD",time_grain:"Monthly",
   filter:"Application = payments",filter_exact:true,tag_filter:[["Application",["payments"]]],
   trend:{labels:["2026-09-01","2026-09-02"],cumulative:[10,20],total:20}}]};
@@ -247,7 +249,8 @@ const tabs=createTabs({
   moneyHtml:(v,c)=>`${c} ${v}`,kpiRow:()=>"",table:()=>"",bar:()=>"",drawChart:()=>{},
   budgetCard:b=>`<article class="budget">${b.name}<div class="budget-chart" data-chart="0"></div></article>`,
   drawBudgetChart:()=>{drawn+=1;},budgetPortalUrl:()=>"#",showTagsFor:()=>{},
-  whenNear:()=>{},wireTables:()=>{},title:()=>"",portalLinkMarkup:()=>"",
+  whenNear:(host,prepare)=>Promise.resolve(prepare()).then(commit=>commit()),
+  wireTables:()=>{},title:()=>"",portalLinkMarkup:()=>"",
 });
 
 // A key on its own is not a selection a budget can answer for, so nothing is fetched.
@@ -273,5 +276,9 @@ assert.equal(asked.filter(u=>u.startsWith("/api/budgets")).length,1);
 node("upTagValue").onchange({target:{value:"billing"}});
 await new Promise(resolve=>setTimeout(resolve,0));
 assert.equal(node("uptimeBudget").innerHTML,"");
+budgets={budgets:[],demo_mode:true,
+  note:"Budgets are not part of the PostgreSQL demo data."};
+node("upTagValue").onchange({target:{value:"payments"}});
+await new Promise(resolve=>setTimeout(resolve,0));
+assert.match(node("uptimeBudget").innerHTML,/PostgreSQL demo data/);
 """)
-

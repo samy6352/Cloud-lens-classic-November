@@ -3,6 +3,13 @@ export function budgetPresentation(overview) {
   const budget = overview.budget;
   const hasReading = Number.isFinite(budget?.percent_used);
   const status = overview.budget_status;
+  if (status === "demo") {
+    return {
+      value: "Not in demo",
+      sub: overview.budget_note || "Budgets are not included in the PostgreSQL demo data",
+      tone: "",
+    };
+  }
   if (hasReading) {
     const complete = status === "ok";
     const name = budget.over > 1 ? `${budget.over} budgets over` : budget.name;

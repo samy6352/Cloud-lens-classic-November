@@ -1897,7 +1897,9 @@ function refreshExportLinks() {
   }
 }
 
-function budgetCard(b, idx, { compact = false, expanded = false, snapshotChart = false, chartAside = false } = {}) {
+function budgetCard(b, idx, {
+  compact = false, expanded = false, snapshotChart = false, lazyTrend = false, chartAside = false,
+} = {}) {
   const aside = chartAside && !compact;
   const known = value => typeof value === "number" && Number.isFinite(value);
   const pct = known(b.current_spend) && known(b.percent_used) ? b.percent_used : null;
@@ -1969,7 +1971,9 @@ function budgetCard(b, idx, { compact = false, expanded = false, snapshotChart =
     ${!exact ? '<p class="muted note">This filter cannot be reproduced exactly in local cost data. Review its full scope in Azure; an exact Tags drilldown is unavailable.</p>' : ""}
     ${aside ? "</div>" : ""}
 
-    ${b.trend || snapshotChart ? `<div class="budget-chart" data-chart="${esc(idx)}"></div>` : `<p class="muted note">${esc(b.trend_note || "Trend unavailable. Azure-reported spend above is unchanged.")}</p>`}
+    ${b.trend || snapshotChart || ((compact || lazyTrend) && exact && !b.trend_note)
+      ? `<div class="budget-chart" data-chart="${esc(idx)}"></div>`
+      : `<p class="muted note">${esc(b.trend_note || "Trend unavailable. Azure-reported spend above is unchanged.")}</p>`}
 
     <div class="budget-foot">
       <span class="muted">${b.start && b.end ? esc(`${b.start} → ${b.end}`) : ""}</span>

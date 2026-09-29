@@ -45,6 +45,10 @@ param(
     [ValidateRange(1, 1000000)]
     [int]$ModelCapacity = 30,
 
+    [string]$PostgresSku = 'Standard_E2ds_v5',
+
+    [string]$AppServicePlanSku = 'B2',
+
     [bool]$NetworkIsolation = $true,
 
     [string]$VnetAddressPrefix = '10.70.0.0/16'
@@ -222,35 +226,34 @@ Section "Region and capacity in $Location"
 
 # The capabilities API rather than `az postgres flexible-server list-skus`, whose
 # output is not JSON and cannot be queried. This also proves the region offers
-# the tier at all -- B1 App Service plans and B1ms PostgreSQL are not available
-# everywhere, and an earlier deployment of this stack had to move region for
-# exactly that reason.
+# the requested tier at all. SKU availability varies by region.
 $capUrl = ("https://management.azure.com/subscriptions/$($account.id)/providers/" +
            "Microsoft.DBforPostgreSQL/locations/$Location/capabilities?api-version=2024-08-01")
 $caps = az rest --method GET --url $capUrl -o json 2>$null | ConvertFrom-Json
 if ($caps) {
+    $tier = Get-CloudLensPostgresTier $PostgresSku
     $skus = $caps.value[0].supportedServerEditions |
-        Where-Object { $_.name -eq 'Burstable' } |
+        Where-Object { $_.name -eq $tier } |
         ForEach-Object { $_.supportedServerSkus.name }
-    if ($skus -contains 'Standard_B1ms') {
-        Ok "PostgreSQL Standard_B1ms is available in $Location"
+    if ($skus -contains $PostgresSku) {
+        Ok "PostgreSQL $PostgresSku ($tier) is available in $Location"
     } else {
-        Bad "PostgreSQL Standard_B1ms is not offered in $Location"
-        Info "available burstable SKUs: $($skus -join ', ')"
+        Bad "PostgreSQL $PostgresSku ($tier) is not offered in $Location"
+        Info "available $tier SKUs: $($skus -join ', ')"
     }
 } else {
     Warn "could not read PostgreSQL capabilities for $Location"
 }
 
-$planSkus = az appservice list-locations --sku B1 --linux-workers-enabled `
+$planSkus = az appservice list-locations --sku $AppServicePlanSku --linux-workers-enabled `
     --query "[].name" -o tsv 2>$null
 if ($planSkus) {
     $normalised = @($planSkus -split "`n" | ForEach-Object { $_ -replace '\s', '' }) 
     if ($normalised -contains $Location) {
-        Ok "Linux App Service B1 is available in $Location"
+        Ok "Linux App Service $AppServicePlanSku is available in $Location"
         Info "this is SKU availability, not a reservation or proof of regional subscription capacity"
     } else {
-        Bad "Linux App Service B1 is not offered in $Location"
+        Bad "Linux App Service $AppServicePlanSku is not offered in $Location"
     }
 } else {
     Warn "could not read App Service locations"

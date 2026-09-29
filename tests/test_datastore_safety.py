@@ -266,3 +266,13 @@ def test_reader_can_fetch_complete_sql_bounded_results(offline_warehouse, memory
     reader = offline_warehouse.Reader(memory)
     assert len(reader.rows("SELECT * FROM costs")) == 200
     assert len(reader.rows("SELECT * FROM costs", None)) == 201
+
+
+def test_model_query_timeout_can_only_tighten_the_database_limit(offline_warehouse):
+    con = Mock()
+    offline_warehouse._set_model_query_timeout(con)
+    sql, parameters = con.execute.call_args.args
+    assert "LEAST(" in sql
+    assert "current_setting('statement_timeout')" in sql
+    assert "make_interval(secs => ? / 1000.0)" in sql
+    assert parameters == [offline_warehouse.QUERY_TIMEOUT_MS]

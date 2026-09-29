@@ -29,7 +29,7 @@ REQUIRES = re.compile(r"^#\s*cloudlens-test:\s*requires-(\w+)\s*$", re.M)
 # checks the machine -- the latter reads the developer's own warehouse and passes for
 # them alone. `COST_` is still scrubbed for the settings that remain (COST_CLIENT_TYPE,
 # COST_QUERY_TIMEOUT_MS); the storage variables it used to cover are gone.
-SCRUB_PREFIXES = ("AUTH_", "COST_", "PG", "ARCHIVE_", "PROJECT_", "MODEL_")
+SCRUB_PREFIXES = ("AUTH_", "COST_", "PG", "ARCHIVE_", "PROJECT_", "MODEL_", "CLOUDLENS_DEMO_")
 
 # These older pytest modules predate the postgres marker. Their fixtures own schemas.
 POSTGRES_MODULES = {"test_postgres.py", "test_query_guard.py", "test_rollup.py"}

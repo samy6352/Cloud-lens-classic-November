@@ -21,6 +21,12 @@ function Test-CloudLensIpv4Overlap([string]$Left, [string]$Right) {
     return $a.Start -le $b.End -and $b.Start -le $a.End
 }
 
+function Get-CloudLensPostgresTier([string]$Sku) {
+    if ($Sku -match '^Standard_B') { return 'Burstable' }
+    if ($Sku -match '^Standard_E') { return 'MemoryOptimized' }
+    return 'GeneralPurpose'
+}
+
 function Get-CloudLensModelQuota($Models, $Usages, [string]$ModelName, [string]$Sku, [int]$Capacity) {
     $names = @($Models | Where-Object { $_.model.name -eq $ModelName } |
         ForEach-Object { $_.model.skus } |

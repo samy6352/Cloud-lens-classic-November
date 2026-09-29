@@ -334,6 +334,10 @@ def test_cost_lookup_pushes_ids_into_sql(monkeypatch):
 
 def test_unknown_commitment_coverage_is_unavailable():
     class Reader:
+        agg = "costs"
+        benefit = "costs"
+        spot = "costs"
+
         def rows(self, sql, limit=None):
             if 'max("ChargePeriodStart")' in sql:
                 return [{"hi": "2026-09-14"}]
@@ -362,6 +366,10 @@ def test_spot_uses_only_comparable_on_demand_and_selected_window():
                for model, amount, qty in (("OnDemand", 100, 100), ("Reservation", 90, 900), ("Spot", 30, 100))]
 
     class Reader:
+        agg = "costs"
+        benefit = "costs"
+        spot = "costs"
+
         def rows(self, sql, limit=None):
             queries.append(sql)
             return [{"hi": "2026-09-14"}] if 'max("ChargePeriodStart")' in sql else records

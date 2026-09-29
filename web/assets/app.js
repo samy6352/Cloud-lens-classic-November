@@ -644,7 +644,10 @@ async function loadGlance(attempt = 0) {
     // as "$0" in the largest type on the page. Null now means "no answer", and the tile says
     // which, because "—" with no reason is indistinguishable from a bug.
     if (o.month_to_date == null) {
-      setTile(tiles[0], "Month to date", "—", o.stale_note || "not loaded yet", "warn");
+      const byCurrency = (o.month_to_date_by_currency || [])
+        .map(row => money(row.cost, row.currency)).join(" · ");
+      setTile(tiles[0], "Month to date", byCurrency || "—",
+        o.currency_note || o.stale_note || "not loaded yet", "warn");
     } else {
       setKpi(tiles[0], {
         key: "Month to date",
@@ -654,7 +657,10 @@ async function loadGlance(attempt = 0) {
       });
     }
     if (o.last_month == null) {
-      setTile(tiles[1], "Last month", "—", "not loaded yet", "warn");
+      const byCurrency = (o.last_month_by_currency || [])
+        .map(row => money(row.cost, row.currency)).join(" · ");
+      setTile(tiles[1], "Last month", byCurrency || "—",
+        o.currency_note || "not loaded yet", "warn");
     } else {
       setKpi(tiles[1], { key: "Last month", value: money(o.last_month, cur), sub: monthLabel(-1) });
     }

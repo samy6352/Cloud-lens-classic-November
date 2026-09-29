@@ -44,6 +44,9 @@ def test_budget_header_reserves_none_set_for_confirmed_empty():
 import assert from "node:assert/strict";
 import {budgetPresentation} from "./web/assets/overview-status.js";
 assert.equal(budgetPresentation({budget:null,budget_status:"none"}).value,"none set");
+const demo=budgetPresentation({budget:null,budget_status:"demo",
+  budget_note:"Budgets are not part of the PostgreSQL demo data."});
+assert.equal(demo.value,"Not in demo");assert.match(demo.sub,/PostgreSQL demo data/);
 for(const status of ["unavailable","partial",undefined]) {
   assert.equal(budgetPresentation({budget:null,budget_status:status}).value,"Unavailable");
 }

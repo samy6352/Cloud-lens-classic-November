@@ -22,6 +22,15 @@ foreach($bad in @('10.80.1.1/24','999.0.0.0/16','10.0.0.0/33','::1/128')) {
     try { Get-CloudLensIpv4Range $bad | Out-Null } catch { $failed=$true }
     if (-not $failed) { throw "Accepted invalid CIDR $bad" }
 }
+foreach($pair in @(
+    @('Standard_B1ms','Burstable'),
+    @('Standard_E2ds_v5','MemoryOptimized'),
+    @('Standard_D2s_v5','GeneralPurpose')
+)) {
+    if ((Get-CloudLensPostgresTier $pair[0]) -ne $pair[1]) {
+        throw "Wrong PostgreSQL tier for $($pair[0])"
+    }
+}
 $models=@(@{model=@{name='gpt-4.1-mini'; skus=@(
     @{name='GlobalStandard'; usageName='OpenAI.GlobalStandard.gpt4.1-mini'},
     @{name='GlobalStandard'; usageName='OpenAI.GlobalStandard.gpt4.1-mini-finetune'}
