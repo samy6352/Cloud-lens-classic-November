@@ -625,6 +625,50 @@ async def _prepare_snapshot_generation(warehouse: Any, state: Any) -> None:
                       type(exc).__name__, attempt + 1)
             if attempt < 2:
                 await asyncio.sleep(5 * (attempt + 1))
+    # Said once, at the end, because the per-attempt lines above each look survivable
+    # and nothing else reports this now. Readiness used to: `/readyz` stayed 503 while
+    # `snapshot_bootstrap_ready` was false, which advertised the failure by refusing to
+    # come up -- an expensive way to raise an alarm, and one that also refused to come
+    # up for the far more common case of a rollup that was merely slow. With readiness
+    # back to its documented meaning, this log is the signal.
+    log.error("Snapshot startup preparation gave up after 3 attempts (%s); "
+              "the rollup generation is not coherent and cached reads will stay pending",
+              state.snapshot_bootstrap_error or "unknown")
+
+
+async def _open_snapshot_cache_later(cache: Any) -> None:
+    """Keep trying to open the snapshot cache after the first attempt failed.
+
+    `SnapshotCache.start()` opens PostgreSQL, and tenant policy stops the database
+    every night, so the inline first attempt is the one call in startup most likely
+    to meet a server that is not there. It used to take the process with it: the
+    exception left `lifespan`, uvicorn exited non-zero, and App Service -- seeing
+    several of those in a row -- blocked the site. Measured 29 Sep 2026 on
+    cloudlens-web-scale: `Container exited with exit code 3 during startup after
+    73.5s`, repeatedly, then `Site is blocked due to multiple, consecutive cold
+    start failures`. The database being asleep turned into the app being unable to
+    start at all, which is a far worse failure than the one it was reporting.
+
+    Serving without the cache is not free -- every request goes to the origin and
+    pays full price -- but it is strictly better than serving nothing, and
+    `SnapshotCache.get` already treats a failing store as a cache outage and falls
+    through to the origin rather than returning an error.
+    """
+    delay = 5.0
+    while True:
+        await asyncio.sleep(delay)
+        try:
+            await cache.start()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - keep retrying whatever the database says
+            log.warning("Snapshot cache start retry failed (%s)", type(exc).__name__)
+            # Capped, because a database stopped overnight should not be retried
+            # at ever-widening intervals into the next working day.
+            delay = min(delay * 2, 60.0)
+        else:
+            log.info("Snapshot cache opened on a later attempt")
+            return
 
 
 def snapshot_warming_enabled() -> bool:
@@ -647,8 +691,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from .readiness import ReadinessProbe
     from .warehouse import warehouse
 
-    readiness = ReadinessProbe(
-        lambda: warehouse.check_readiness() and app.state.snapshot_bootstrap_ready)
+    # Database and core schema only, which is exactly what `/readyz` is documented to
+    # mean: "an empty initialised warehouse is ready ... readiness does not establish
+    # data freshness". It had drifted to also require `snapshot_bootstrap_ready`, and
+    # that flag is only set once `_prepare_snapshot_generation` has finished -- which
+    # rebuilds the rollup when the generation is incoherent. So the warmup path waited
+    # on a full rebuild: measured 382.2s on the 16.9M-row estate, against a container
+    # start limit of 1800s, with `/readyz` returning 504 at the gateway meanwhile.
+    # Freshness is not dropped, only moved back to where it is already answered
+    # honestly -- `SnapshotCache.get` returns 503 with `Retry-After` per request while
+    # the generation is pending, which tells a caller what to do; a container that
+    # never reports ready does not.
+    readiness = ReadinessProbe(warehouse.check_readiness)
     background: list[asyncio.Task] = []
     try:
         auth = auth_service()
@@ -659,7 +713,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 SnapshotStore(warehouse.connect),
                 version=application_version(build_id=os.getenv("CLOUDLENS_BUILD_ID", "")),
             )
-            await _snapshot_cache.start()
+            try:
+                await _snapshot_cache.start()
+            except Exception as exc:  # noqa: BLE001 - a closed database must not stop the app booting
+                log.error("Snapshot cache could not open at startup (%s); serving uncached",
+                          type(exc).__name__)
+                background.append(asyncio.create_task(
+                    _open_snapshot_cache_later(_snapshot_cache), name="snapshot-cache-retry"))
             background.append(asyncio.create_task(
                 _prepare_snapshot_generation(warehouse, app.state), name="snapshot-bootstrap"))
         else:
@@ -671,8 +731,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 asyncio.create_task(_focus_refresh_loop(), name="focus-sync"),
                 asyncio.create_task(_recover_ingest_jobs(), name="ingest-recovery"),
             ])
-        if (not read_only_mode() and warehouse.summary()["rows"] == 0
-                and os.getenv("AUTO_INGEST", "true").lower() != "false"):
+        # `AUTO_INGEST` before `summary()`, because `summary()` reads PostgreSQL and this
+        # is the last database call left on the startup critical path. Asking whether
+        # automatic ingest is wanted costs nothing and is false wherever ingest is driven
+        # externally, so the deployment that most needs to survive a stopped database no
+        # longer touches it here. Where ingest *is* automatic the call still happens and a
+        # database failure is still fatal, which is right: there is no ingest without one.
+        if (not read_only_mode() and os.getenv("AUTO_INGEST", "true").lower() != "false"
+                and warehouse.summary()["rows"] == 0):
             await _start_ingest_task(functools.partial(
                 _run_ingest, int(os.getenv("INGEST_MONTHS", "3"))),
                 kind="automatic", identity="workload")

@@ -278,6 +278,53 @@ def test_startup_failure_cancels_tasks_and_closes_resources(runtime, monkeypatch
     asyncio.run(run())
 
 
+def test_snapshot_cache_failure_does_not_stop_startup(runtime):
+    """A stopped database must cost the cache, not the whole app.
+
+    `SnapshotCache.start()` opens PostgreSQL, and tenant policy stops the database
+    nightly. When this raised inline the exception left `lifespan`, uvicorn exited 3,
+    and App Service blocked the site for consecutive cold-start failures -- so a
+    sleeping database became an app that could not be started at all.
+    """
+    runtime.cache.start.side_effect = RuntimeError("the database is not accepting connections")
+
+    async def run():
+        async with main.lifespan(main.app):
+            probe = main.app.state.readiness
+            assert probe is not None
+            await asyncio.sleep(0)
+
+    asyncio.run(run())
+    runtime.cache.start.assert_awaited_once()
+    runtime.agent.close.assert_awaited_once()
+    runtime.warehouse._store.close.assert_called_once()
+
+
+def test_readiness_does_not_wait_for_the_rollup_rebuild(runtime, monkeypatch):
+    """`/readyz` means the database and core schema answer, nothing about freshness.
+
+    It had drifted to also require `snapshot_bootstrap_ready`, which is only set once
+    the rollup generation is coherent -- a rebuild measured at 382.2s on the 16.9M-row
+    estate, during which the documented readiness contract ("an empty initialised
+    warehouse is ready") was not being honoured.
+    """
+    started = asyncio.Event()
+
+    async def never_finishes(owner, state):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(main, "_prepare_snapshot_generation", never_finishes)
+
+    async def run():
+        async with main.lifespan(main.app):
+            await started.wait()
+            assert main.app.state.snapshot_bootstrap_ready is False
+            assert await main.app.state.readiness.ready()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("failing_resource", ["agent", "source_cache"])
 def test_one_cleanup_failure_does_not_skip_other_resources(runtime, failing_resource):
     getattr(runtime, failing_resource).close.side_effect = RuntimeError("close failed")
