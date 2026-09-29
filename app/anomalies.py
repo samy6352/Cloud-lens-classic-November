@@ -27,6 +27,7 @@ Three deliberate refusals:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -72,6 +73,18 @@ SAME_EVENT = 0.7
 # Beyond this the score stops meaning anything — it is just "far outside anything seen before".
 SCORE_CAP = 50.0
 
+# The detector's identity, mixed into every incident id. A threshold change alters which
+# days are anomalous, so an id minted under the old rules must not silently claim to be
+# the same finding as one minted under the new ones -- an acknowledged incident would
+# come back acknowledged after a tuning change nobody connected to it.
+ALGORITHM = "cloudlens-weekday-mad-v1"
+
+# How far apart two anomalous days can sit and still be one event. A runaway job that
+# bills for three days is one thing that happened, and reporting it three times is how a
+# list of findings stops being read. Two days rather than one, because a single settled
+# or merely-below-threshold day in the middle of a run does not end the incident.
+INCIDENT_GAP = 2
+
 # What a spike can be attributed to. Ordered by how actionable the answer is: a service name
 # tells you what broke, a subscription only tells you where to start looking.
 DIMENSIONS = {
@@ -86,6 +99,89 @@ DIMENSIONS = {
 
 class AnomalyError(RuntimeError):
     """Something the caller can act on."""
+
+
+def incident_id(dimension: str, key: str, currency: str, direction: str,
+                first_day: str, last_day: str) -> str:
+    """A name for one incident that survives the next run.
+
+    Derived from what the incident *is* rather than from where it landed in a list, so
+    the same run of days reported tomorrow carries the same id and an acknowledgement,
+    a suppression or a linked ticket still finds it. The span is part of the identity:
+    an incident that grows by a day is genuinely a different, longer incident, and
+    saying so is better than quietly extending something a human already signed off.
+    """
+    material = "|".join((ALGORITHM, dimension, key, currency, direction, first_day, last_day))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+def collapse_incidents(anomalies: list[dict[str, Any]],
+                       gap_days: int = INCIDENT_GAP) -> list[dict[str, Any]]:
+    """Consecutive anomalous days on one thing, in one direction, as single incidents.
+
+    Pure arithmetic over findings already made -- it decides nothing about what *is*
+    anomalous, only about how many times one event is allowed to be reported. Kept
+    beside the per-day list rather than replacing it: the daily rows are what a chart
+    plots and what an investigation walks through, while the incident list is what a
+    person reads and what an alert should fire on, and collapsing the one into the
+    other would cost the tab its evidence.
+
+    `cost` and `baseline` are taken from the worst day rather than summed, because they
+    describe a day's spend; `total_delta` is the summed movement across the run, which
+    is the figure that answers "what did this cost us".
+    """
+    runs: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+    for a in anomalies:
+        if not a.get("day"):
+            continue
+        runs.setdefault((str(a.get("dimension") or ""), str(a.get("key") or ""),
+                         str(a.get("currency") or ""), str(a.get("direction") or "")),
+                        []).append(a)
+
+    out: list[dict[str, Any]] = []
+    for (dimension, key, currency, direction), group in runs.items():
+        group.sort(key=lambda a: a["day"])
+        current: list[dict[str, Any]] = []
+        for a in group:
+            if current and (date.fromisoformat(a["day"])
+                            - date.fromisoformat(current[-1]["day"])).days > gap_days:
+                out.append(_incident(dimension, key, currency, direction, current))
+                current = []
+            current.append(a)
+        if current:
+            out.append(_incident(dimension, key, currency, direction, current))
+
+    out.sort(key=lambda i: (i["last_day"], abs(i["total_delta"])), reverse=True)
+    return out
+
+
+def _incident(dimension: str, key: str, currency: str, direction: str,
+              days: list[dict[str, Any]]) -> dict[str, Any]:
+    peak = max(days, key=lambda a: abs(a.get("delta") or 0.0))
+    first_day, last_day = days[0]["day"], days[-1]["day"]
+    order = ("low", "medium", "high")
+    severity = max((a.get("severity") or "low" for a in days),
+                   key=lambda s: order.index(s) if s in order else 0)
+    return {
+        "id": incident_id(dimension, key, currency, direction, first_day, last_day),
+        "algorithm": ALGORITHM,
+        "dimension": dimension,
+        "key": key,
+        "currency": currency,
+        "direction": direction,
+        "first_day": first_day,
+        "last_day": last_day,
+        # Inclusive, so a single-day incident lasts one day rather than zero.
+        "duration_days": (date.fromisoformat(last_day) - date.fromisoformat(first_day)).days + 1,
+        "days": len(days),
+        "peak_day": peak["day"],
+        "cost": peak.get("cost"),
+        "baseline": peak.get("baseline"),
+        "peak_delta": peak.get("delta"),
+        "total_delta": round(sum(a.get("delta") or 0.0 for a in days), 2),
+        "score": max((a.get("score") or 0.0) for a in days),
+        "severity": severity,
+    }
 
 
 def _is_weekend(day: str) -> bool:
@@ -407,7 +503,9 @@ def analyse(scope: list[str] | None = None, days: int = 60,
         ).fetchone()
 
         if not span or not span[2]:
-            return {"anomalies": [], "count": 0, "currency": fx.currency_code(display_currency),
+            return {"anomalies": [], "count": 0, "incidents": [], "incident_count": 0,
+                    "algorithm": ALGORITHM,
+                    "currency": fx.currency_code(display_currency),
                     "partial": True, "unavailable": True,
                     "coverage": {"basis": "validated_focus_day_receipts", "verified_days": 0},
                     "note": "No cost data is loaded yet, so there is nothing to compare against."}
@@ -466,15 +564,23 @@ def analyse(scope: list[str] | None = None, days: int = 60,
         # is what the reader is looking at. Reporting only the former put an unchanging date
         # range next to a finding count that changed with the period selector — two readings of
         # "period" on one screen that disagreed, and the wrong one was the more prominent.
+        #
+        # From the rollup, like everything above it. These two were the last readers of
+        # the detail table left in this tab after the routing described above, and on a
+        # 16.9M-row estate they were enough to undo it: the endpoint returned HTTP 500
+        # after 120.3s, which is the server's `statement_timeout` cancelling the scan
+        # rather than a fault in the query. Both dimensions are in the rollup grain and
+        # `BilledCost` is one of its measures, so summing the rollup by day and currency
+        # is the same arithmetic over 201,852 rows instead of 16,929,623.
         window = con.execute(
-            'SELECT min("ChargePeriodStart"), max("ChargePeriodStart") FROM costs '
+            f'SELECT min("ChargePeriodStart"), max("ChargePeriodStart") FROM {agg} '
             f"WHERE {period}"
         ).fetchone()
 
         # Daily totals, so the tab can draw the estate's own line with the flagged days on it.
         daily_rows = con.execute(
-            'SELECT "ChargePeriodStart", upper(trim("BillingCurrency")), sum("BilledCost") FROM costs '
-            f'WHERE {period} GROUP BY 1, 2 ORDER BY 1'
+            'SELECT "ChargePeriodStart", upper(trim("BillingCurrency")), sum("BilledCost") '
+            f'FROM {agg} WHERE {period} GROUP BY 1, 2 ORDER BY 1'
         ).fetchall()
     finally:
         con.close()
@@ -530,9 +636,17 @@ def analyse(scope: list[str] | None = None, days: int = 60,
         code: round(sum(a["delta"] for a in up if a["currency"] == code), 2)
         for code in codes if code not in unavailable and code
     }
+    incidents = collapse_incidents(merged)
     return {
         "anomalies": merged[:top],
         "count": len(merged),
+        # The same findings, with a run of consecutive days on one thing counted once.
+        # `count` above stays the number of anomalous *days* so nothing reading it
+        # changes meaning; `incident_count` is the number of *events*, which is the
+        # honest answer to "how many things went wrong".
+        "incidents": incidents[:top],
+        "incident_count": len(incidents),
+        "algorithm": ALGORITHM,
         "high": len(high),
         "increases": len(up),
         "decreases": len(merged) - len(up),

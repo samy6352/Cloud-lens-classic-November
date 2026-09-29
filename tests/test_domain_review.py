@@ -95,7 +95,15 @@ def test_mixed_resource_waste_converts_every_bucket(monkeypatch, mixed_costs, fx
     assert result["total_items"] == 1
     merged = savings.assemble({"waste": result}, {}, 30, "USD")
     assert not merged["partial"]
-    assert merged["total"] == merged["opportunities"][0]["items"][0]["cost"] == 200
+
+    # A deallocated VM's retained disks are `cost_at_risk`, not recoverable savings --
+    # deleting the VM is not what stops that bill -- so the finding is reported beside
+    # the bankable total rather than inside it. Every currency bucket is still converted
+    # on the way there, which is what this test exists to prove: 100 USD + 8000 INR at
+    # 80/USD is 200 USD however the finding is later classified.
+    assert merged["opportunities"] == []
+    assert merged["at_risk_count"] == 1
+    assert merged["at_risk_total"] == merged["at_risk"][0]["items"][0]["cost"] == 200
 
 
 def test_mixed_resource_rightsizing_converts_every_bucket(monkeypatch, mixed_costs, fx):

@@ -47,6 +47,9 @@ def scan(monkeypatch):
     )
 
     class Reader:
+        # Mirrors the real `Reader`'s relation handles, which default to `costs`.
+        agg = res = named = bill = "costs"
+
         def rows(self, sql, limit=None):
             state.queries.append(sql)
             if 'max("ChargePeriodStart") AS hi' in sql:

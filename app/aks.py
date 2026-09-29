@@ -113,7 +113,7 @@ def _cost_rows(
 
     days = reporting.period_days(days)
     with wh.reader(scope, currency=currency) as r:
-        hi = r.rows('SELECT max("ChargePeriodStart") AS hi FROM costs')
+        hi = r.rows(f'SELECT max("ChargePeriodStart") AS hi FROM {r.agg}')
         hi = hi[0]["hi"] if hi and hi[0]["hi"] else None
         if not hi:
             return [], [], None
@@ -131,16 +131,27 @@ def _cost_rows(
                 for sub, rg in sorted(set(node_groups))
             )
             aks_like += f' OR (lower("SubAccountId"), lower("ResourceGroup")) IN ({pairs})'
+        # `r.named` rather than `costs`: this needs `count(DISTINCT "ResourceId")` as well as
+        # the money, and the presence table is the one derived table that keeps resource
+        # identity -- `ResourceId` is in its `COUNTABLE` set, so the count is exact, not an
+        # estimate. `named` is precisely the right handle for a query that counts *and*
+        # prices: it resolves to the presence table where that table can also price, and to
+        # the detail table under a currency conversion, which presence cannot serve because
+        # `CostInUsd` is outside its grain. Every column the filter selects on --
+        # `ResourceGroup`, `ServiceName`, `SubAccountId` -- is in that grain, so the
+        # restriction means the same thing there as it did here.
         by_group = r.rows(
             'SELECT "ResourceGroup" AS rg, "SubAccountId" AS sub, "ServiceName" AS service, '
             '"RegionName" AS region, "BillingCurrency" AS currency, '
             'sum("BilledCost") AS cost, count(DISTINCT "ResourceId") AS resources '
-            f'FROM costs WHERE {period} AND ({aks_like}) '
+            f'FROM {r.named} WHERE {period} AND ({aks_like}) '
             "GROUP BY 1, 2, 3, 4, 5 ORDER BY cost DESC", None)
+        # The daily line needs no resource identity, so it takes the smaller table: every
+        # column it reads or filters on is in the rollup grain.
         daily = r.rows(
             'SELECT "ChargePeriodStart" AS day, "BillingCurrency" AS currency, '
             'sum("BilledCost") AS cost '
-            f'FROM costs WHERE {period} AND ({aks_like}) '
+            f'FROM {r.agg} WHERE {period} AND ({aks_like}) '
             "GROUP BY 1, 2 ORDER BY 1", None)
     return by_group, daily, str(hi)
 

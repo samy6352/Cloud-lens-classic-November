@@ -151,6 +151,7 @@ class Opportunity:
         "detail",
         "disputed",
         "folded",
+        "impact_class",
         "items",
         "key",
         "kind",
@@ -171,7 +172,8 @@ class Opportunity:
                  resource_group: str = "", subscription: str = "", region: str = "",
                  kind: str = "", detail: str = "", window: float | None = None,
                  annual: float | None = None, currency: str = "USD", action: str = "",
-                 count: int = 1, items: list[dict[str, Any]] | None = None) -> None:
+                 count: int = 1, items: list[dict[str, Any]] | None = None,
+                 impact_class: str = "potential_savings") -> None:
         self.key = key
         self.category = category
         self.title = title
@@ -188,6 +190,16 @@ class Opportunity:
         self.currency = currency or "USD"
         self.action = action
         self.count = count
+        # Which evidence class this belongs to, carried from `waste.IMPACT`. Only
+        # `potential_savings` is money an estate stops paying by acting on this row;
+        # `cost_at_risk` is real spend that needs a decision first and is reported
+        # beside the total rather than inside it, exactly as commitments already are.
+        #
+        # Named `impact_class` and not `impact` on purpose: `impact` is already a money
+        # key here, carrying Advisor's low/medium/high severity, and a non-severity
+        # string landing in it goes to `fx.convert_amount` and takes the whole finding
+        # out of the report as an unconvertible amount.
+        self.impact_class = impact_class or "potential_savings"
         self.items = items or []
         self.sources: list[dict[str, Any]] = []
         self.options: list[dict[str, Any]] = []
@@ -300,6 +312,7 @@ class Opportunity:
             "currency": self.currency,
             "action": self.action,
             "count": self.count,
+            "impact_class": self.impact_class,
             "items": self.items[:12],
             "more": max(0, len(self.items) - 12),
             "sources": self.sources,
@@ -382,6 +395,12 @@ def _from_waste(data: dict[str, Any], index: _Index, cur: str) -> list[Opportuni
         items = f.get("items") or []
         if f.get("count") == 0 and not items and not f.get("resource_ids"):
             continue
+        impact_class = f.get("impact_class") or "potential_savings"
+        # An unattached NIC or an empty resource group bills nothing, so deleting it
+        # saves nothing. Listing it here put a row with a 0.00 saving next to rows worth
+        # real money and invited the reader to treat the count as the finding.
+        if impact_class == "inventory":
+            continue
         cat = _WASTE_CATEGORY.get(f.get("category") or "", "orphaned")
         cost = _num(f.get("cost"))
         opp = Opportunity(
@@ -392,6 +411,7 @@ def _from_waste(data: dict[str, Any], index: _Index, cur: str) -> list[Opportuni
             window=cost,
             currency=f.get("currency") or cur,
             count=int(f.get("count") or len(items) or 1),
+            impact_class=impact_class,
             items=[{
                 "name": i.get("name"), "group": i.get("resource_group"),
                 "region": i.get("location"), "detail": i.get("detail"),
@@ -816,6 +836,15 @@ def assemble(data: dict[str, Any], failed: dict[str, str], days: int,
     commitments = [o for o in ranked if o.category == "commitment"]
     ranked = [o for o in ranked if o.category != "commitment"]
 
+    # The same argument as commitments, one step earlier: a deallocated VM's retained
+    # disks, a paused SQL database and an oversized elastic pool are all real, continuing
+    # spend, but none of them is money the estate stops paying by acting on the row as
+    # written -- each needs a sizing, migration or retention decision first. Adding them
+    # to the recoverable total produces a headline that cannot survive its first review,
+    # so they are reported alongside it instead. See `waste.IMPACT`.
+    at_risk = [o for o in ranked if o.impact_class == "cost_at_risk"]
+    ranked = [o for o in ranked if o.impact_class != "cost_at_risk"]
+
     # The number that matters, and the one the six separate tabs could not state: money counted
     # once. Split by basis because a bill and a projection should not be added into one figure
     # and presented as if they were the same kind of certainty.
@@ -853,6 +882,15 @@ def assemble(data: dict[str, Any], failed: dict[str, str], days: int,
         "commitment_note": ("Reservations and savings plans re-price what you keep rather than "
                             "remove it, so they are not in the figures above. They are compared "
                             "against pay-as-you-go on the Reservations & Savings Plans tab."),
+        # Same treatment, different reason: real spend, but not recoverable by the row alone.
+        "at_risk": [o.as_dict() for o in at_risk],
+        "at_risk_count": len(at_risk),
+        "at_risk_total": _known_total([o.window for o in at_risk]),
+        "at_risk_unpriced_count": sum(o.window is None for o in at_risk),
+        "at_risk_note": ("Spend that is continuing but is not recovered by deleting the resource "
+                         "named — retained disks behind a deallocated VM, a paused database, an "
+                         "oversized pool. Reported separately so the recoverable total stays "
+                         "one an estate can actually bank."),
         "merged": merged,
         "variants_folded": collapsed,
         "sources_read": sorted(data),

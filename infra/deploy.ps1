@@ -204,6 +204,121 @@ function Assert-AzSuccess([string]$Operation) {
     }
 }
 
+# The permissions CloudLens asks for, and the only ones this installer will ever
+# consent to on a registration it did not create. Kept in step with
+# infra/modules/identity.bicep, which requests exactly these.
+$CloudLensResourceAccess = @{
+    # Microsoft Graph: sign someone in and learn their name. Nothing more --
+    # cost data is read with the app's own identity or the caller's ARM token.
+    '00000003-0000-0000-c000-000000000000' = @{
+        name = 'Microsoft Graph'
+        scopes = @{
+            '37f7f235-527c-4136-accd-4a02d197296e' = 'openid'
+            '14dad69e-099b-42c9-810b-d002981feec1' = 'profile'
+            '7427e0e9-2fba-42fe-b0c0-848c9e6a8182' = 'offline_access'
+            'e1fe6dd8-ba31-4d61-89e7-88639da4683d' = 'User.Read'
+        }
+    }
+    # Azure Resource Manager: ask ARM as the signed-in person rather than as the app.
+    '797f4846-ba00-4fd7-ba43-dac1f8f63013' = @{
+        name = 'Azure Resource Manager'
+        scopes = @{ '41094075-9dad-400e-a0bd-54e686782033' = 'user_impersonation' }
+    }
+}
+
+function Assert-AdoptableRegistration([string]$ClientId) {
+    <#
+    .SYNOPSIS
+        Refuse to touch an app registration that is not a CloudLens sign-in app.
+
+    .DESCRIPTION
+        `-EntraClientId` exists so an identity team can create the registration and
+        hand back its client id. The cost of that convenience is that a mistyped or
+        pasted-from-the-wrong-window id names somebody else's application, and the
+        three things this script then does to it are all silent and all wrong:
+
+          * adds a redirect URI pointing at this deployment,
+          * adds delegated Azure Resource Manager access,
+          * grants tenant-wide administrator consent for *everything it requests*.
+
+        The third is the severe one. `az ad app permission admin-consent` consents
+        to the whole of `requiredResourceAccess`, so pointing this at an app that
+        happens to request `Directory.ReadWrite.All` would grant that, to that app,
+        for every user in the tenant -- from a typo, with no prompt.
+
+        So the registration is read once and checked before anything is written to
+        it. The checks are deliberately conservative: each one describes a property
+        a genuine CloudLens sign-in registration has, and anything else is refused
+        by name rather than adopted hopefully.
+    #>
+    Step "Checking the registration $ClientId may be adopted"
+    $json = az ad app show --id $ClientId -o json 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $json) {
+        throw ("The sign-in registration '$ClientId' could not be read. Check the client id, " +
+               "and that you can see it in this tenant. Nothing has been changed.")
+    }
+    $app = $json | ConvertFrom-Json
+    $name = if ($app.displayName) { $app.displayName } else { '(no display name)' }
+    Write-Host "    adopting     : $name"
+
+    $refusals = @()
+
+    # A multi-tenant registration is used by directories this deployment has no
+    # business altering, and consenting for it reaches further than this tenant.
+    if ($app.signInAudience -ne 'AzureADMyOrg') {
+        $refusals += "its sign-in audience is '$($app.signInAudience)', not the single-tenant AzureADMyOrg"
+    }
+
+    # An app exposing roles or an API is a platform component; CloudLens's own
+    # registration exposes neither.
+    if (@($app.appRoles | Where-Object { $_ }).Count) {
+        $refusals += "it exposes $(@($app.appRoles).Count) app role(s)"
+    }
+    if (@($app.api.oauth2PermissionScopes | Where-Object { $_ }).Count) {
+        $refusals += "it exposes its own API scope(s)"
+    }
+
+    # CloudLens signs people in as a public client with PKCE and never holds a
+    # secret, so credentials here mean this is a different kind of application --
+    # and a `web` redirect URI would make Entra refuse the code exchange anyway
+    # (AADSTS7000218), which is a confusing failure to ship into.
+    if (@($app.passwordCredentials | Where-Object { $_ }).Count -or
+        @($app.keyCredentials | Where-Object { $_ }).Count) {
+        $refusals += "it holds client credentials, which a PKCE public client does not use"
+    }
+    if (@($app.web.redirectUris | Where-Object { $_ }).Count) {
+        $refusals += "it has web-platform redirect URIs, which make it a confidential client"
+    }
+
+    # The check that makes the later admin-consent safe.
+    foreach ($resource in @($app.requiredResourceAccess | Where-Object { $_ })) {
+        $known = $CloudLensResourceAccess[$resource.resourceAppId]
+        if (-not $known) {
+            $refusals += "it requests permissions from an API CloudLens does not use ($($resource.resourceAppId))"
+            continue
+        }
+        foreach ($access in @($resource.resourceAccess | Where-Object { $_ })) {
+            if ($access.type -ne 'Scope') {
+                $refusals += "it requests an application permission on $($known.name), which CloudLens never needs"
+            }
+            elseif (-not $known.scopes.ContainsKey($access.id)) {
+                $refusals += "it requests an unrecognised $($known.name) permission ($($access.id))"
+            }
+        }
+    }
+
+    if ($refusals.Count) {
+        Write-Warning "This registration is not a CloudLens sign-in application:"
+        foreach ($refusal in $refusals) { Write-Warning "  - $refusal" }
+        Write-Warning ""
+        Write-Warning "Nothing has been changed. Either pass the correct -EntraClientId, or omit"
+        Write-Warning "it and let this script create a registration for you."
+        throw ("Refusing to modify app registration '$ClientId' ($name): it is not owned by this " +
+               "deployment and adopting it would alter, and consent for, an application in use elsewhere.")
+    }
+    Write-Host "    checks       : single-tenant, no credentials, no extra permissions" -ForegroundColor Green
+}
+
 # ------------------------------------------------------------ preconditions
 
 Step "Checking sign-in"
@@ -492,6 +607,11 @@ if (-not $clientId -and -not $SkipEntra) {
 
 if ($clientId) {
     if ($EntraClientId) {
+        # Verify before writing. Everything below this line modifies the registration
+        # or consents on its behalf, so the one chance to notice it is the wrong one
+        # is here, before the first write.
+        Assert-AdoptableRegistration $EntraClientId
+
         # An existing registration. Its redirect URIs are whatever the identity
         # team set, which will not include this deployment's hostname -- add it
         # without disturbing the others.

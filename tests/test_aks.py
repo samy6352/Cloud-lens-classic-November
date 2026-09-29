@@ -44,6 +44,12 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 class FakeReader:
+    # The real `Reader` exposes the relation each query should name -- `agg` for the
+    # rollup, `named` for the presence table where it can also price -- defaulting to
+    # `costs`. Modelled here so a caller that routes itself off the detail table is
+    # exercised rather than crashing on a missing attribute.
+    agg = res = named = bill = "costs"
+
     def __init__(self, hi, rows, daily):
         self.hi, self._rows, self._daily = hi, rows, daily
 

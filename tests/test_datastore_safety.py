@@ -248,9 +248,10 @@ def test_every_setup_failure_returns_the_pool_slot(offline_warehouse, monkeypatc
     monkeypatch.setattr(reporting, "view_predicate",
                         Mock(side_effect=error) if failure == "period" else lambda: "")
     monkeypatch.setattr(wh, "_columns_sql",
-                        Mock(side_effect=error) if failure == "projection" else lambda *_: "*")
+                        Mock(side_effect=error) if failure == "projection" else lambda *_, **__: "*")
     monkeypatch.setattr(wh, "_currency_sql",
-                        Mock(side_effect=error) if failure == "currency-sql" else lambda *_: ("1", "1"))
+                        Mock(side_effect=error) if failure == "currency-sql"
+                        else lambda *_, **__: ("1", "1"))
     expected = ValueError if failure == "unknown-currency" else type(error)
     with pytest.raises(expected):
         wh.connect(read_only=True, scope=["sub-a"], currency="USD", filters={"service": ["Compute"]})

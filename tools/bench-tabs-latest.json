@@ -1,0 +1,9 @@
+[
+  {
+    "path": "/api/dashboard/uptime?days=30",
+    "cold": 72.037,
+    "warm": 0.362,
+    "status": 200,
+    "bytes": 5804591
+  }
+]

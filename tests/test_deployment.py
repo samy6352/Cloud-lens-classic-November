@@ -83,6 +83,56 @@ function global:az {
     if ($call.StartsWith('ad app show') -and $call.Contains('requiredResourceAccess')) {
         return '[{"resourceAppId":"797f4846-ba00-4fd7-ba43-dac1f8f63013","resourceAccess":[{"id":"41094075-9dad-400e-a0bd-54e686782033","type":"Scope"}]}]'
     }
+    # The whole registration, read by the adoption guard before anything is written
+    # to it. Each scenario names a different reason a real registration would be
+    # refused; 'unreadable' is the mistyped-client-id case.
+    if ($call.StartsWith('ad app show')) {
+        if ($scenario -eq 'adopt-unreadable') { $global:LASTEXITCODE = 3; return }
+        $app = @{
+            displayName = 'CloudLens'
+            signInAudience = 'AzureADMyOrg'
+            appRoles = @()
+            api = @{ oauth2PermissionScopes = @() }
+            passwordCredentials = @()
+            keyCredentials = @()
+            web = @{ redirectUris = @() }
+            publicClient = @{ redirectUris = @('https://fixture-app.azurewebsites.net/auth/callback') }
+            requiredResourceAccess = @(
+                @{ resourceAppId = '797f4846-ba00-4fd7-ba43-dac1f8f63013'
+                   resourceAccess = @(@{ id = '41094075-9dad-400e-a0bd-54e686782033'; type = 'Scope' }) }
+            )
+        }
+        switch ($scenario) {
+            'adopt-multitenant'  { $app.displayName = 'Contoso Portal'; $app.signInAudience = 'AzureADMultipleOrgs' }
+            'adopt-approles'     { $app.displayName = 'Contoso API'; $app.appRoles = @(@{ id = 'r1'; value = 'Admin' }) }
+            'adopt-secret'       { $app.displayName = 'Contoso Daemon'; $app.passwordCredentials = @(@{ keyId = 'k1' }) }
+            'adopt-webredirect'  { $app.displayName = 'Contoso Web'; $app.web = @{ redirectUris = @('https://contoso.example/signin') } }
+            'adopt-extra-graph'  {
+                $app.displayName = 'Contoso Directory Tool'
+                $app.requiredResourceAccess = @(
+                    @{ resourceAppId = '00000003-0000-0000-c000-000000000000'
+                       resourceAccess = @(@{ id = '19dbc75e-c2e2-444c-a770-ec69d8559fc7'; type = 'Role' }) }
+                )
+            }
+            'adopt-extra-scope'  {
+                $app.displayName = 'Contoso Mail Reader'
+                $app.requiredResourceAccess = @(
+                    @{ resourceAppId = '00000003-0000-0000-c000-000000000000'
+                       resourceAccess = @(@{ id = '570282fd-fa5c-430d-a7fd-fc8dc98a9dca'; type = 'Scope' }) }
+                )
+            }
+            'adopt-foreign-api'  {
+                $app.displayName = 'Contoso Integration'
+                $app.requiredResourceAccess = @(
+                    @{ resourceAppId = '00000002-0000-0ff1-ce00-000000000000'
+                       resourceAccess = @(@{ id = 'dc50a0fb-09a3-484d-be87-e023b12c6440'; type = 'Scope' }) }
+                )
+            }
+        }
+        return (ConvertTo-Json -Depth 10 -InputObject $app)
+    }
+    if ($call.StartsWith('ad app update')) { return }
+    if ($call.StartsWith('ad app permission add')) { return }
     if ($call.StartsWith('webapp config appsettings set')) {
         if ($call.Contains('AUTH_DELEGATED_ARM=true')) { Write-Host 'UPGRADED_TO_DELEGATED' }
         return
@@ -146,6 +196,79 @@ class DeploymentFailures(unittest.TestCase):
                                  "-SkipCode -EntraClientId fixture-client -AllowAppIdentityFallback")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("UPGRADED_TO_DELEGATED", result.stdout)
+
+    # ------------------------------------------------ adopting a registration
+    #
+    # `-EntraClientId` takes an id typed or pasted by a person, and everything the
+    # script then does to that registration is a write: a redirect URI, delegated
+    # ARM access, and tenant-wide admin consent for everything it requests. A
+    # mistyped id therefore silently alters -- and consents for -- an application
+    # in use somewhere else. Each of these asserts the write never happens.
+
+    def _assert_refused(self, result, reason):
+        combined = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0, combined)
+        self.assertIn("Refusing to modify app registration", combined)
+        self.assertIn(reason, combined)
+        # The three writes, none of which may have been attempted.
+        self.assertNotIn("redirect URI added", result.stdout)
+        self.assertNotIn("UPGRADED_TO_DELEGATED", result.stdout)
+        self.assertNotIn("consented    :", result.stdout)
+
+    def test_adopting_a_multi_tenant_registration_is_refused(self):
+        result = self.run_deploy("adopt-multitenant", "-SkipCode -EntraClientId fixture-client")
+        self._assert_refused(result, "AzureADMultipleOrgs")
+
+    def test_adopting_a_registration_exposing_app_roles_is_refused(self):
+        result = self.run_deploy("adopt-approles", "-SkipCode -EntraClientId fixture-client")
+        self._assert_refused(result, "app role")
+
+    def test_adopting_a_registration_holding_a_secret_is_refused(self):
+        result = self.run_deploy("adopt-secret", "-SkipCode -EntraClientId fixture-client")
+        self._assert_refused(result, "client credentials")
+
+    def test_adopting_a_confidential_web_client_is_refused(self):
+        result = self.run_deploy("adopt-webredirect", "-SkipCode -EntraClientId fixture-client")
+        self._assert_refused(result, "confidential client")
+
+    def test_extra_graph_permissions_are_never_consented_for(self):
+        """The severe case: admin-consent grants everything an app requests.
+
+        `Directory.ReadWrite.All` as an *application* permission is the worst of
+        it -- consenting for it would grant the app tenant-wide directory write,
+        with no user in the loop at all.
+        """
+        result = self.run_deploy("adopt-extra-graph", "-SkipCode -EntraClientId fixture-client")
+        self._assert_refused(result, "application permission on Microsoft Graph")
+
+    def test_an_unrecognised_delegated_scope_is_refused(self):
+        result = self.run_deploy("adopt-extra-scope", "-SkipCode -EntraClientId fixture-client")
+        self._assert_refused(result, "unrecognised Microsoft Graph permission")
+
+    def test_permissions_from_an_unused_api_are_refused(self):
+        result = self.run_deploy("adopt-foreign-api", "-SkipCode -EntraClientId fixture-client")
+        self._assert_refused(result, "an API CloudLens does not use")
+
+    def test_an_unreadable_client_id_stops_before_any_write(self):
+        """The mistyped-id case: say so, rather than failing later mid-change."""
+        result = self.run_deploy("adopt-unreadable", "-SkipCode -EntraClientId typo-client")
+        combined = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0, combined)
+        self.assertIn("could not be read", combined)
+        self.assertIn("Nothing has been changed", combined)
+
+    def test_a_genuine_cloudlens_registration_is_still_adopted(self):
+        """The guard must not break the case it exists to protect."""
+        result = self.run_deploy("consent-ok", "-SkipCode -EntraClientId fixture-client")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("single-tenant, no credentials, no extra permissions", result.stdout)
+        self.assertNotIn("Refusing to modify", result.stdout + result.stderr)
+
+    def test_a_created_registration_is_not_subjected_to_the_adoption_guard(self):
+        """Only `-EntraClientId` adopts; a registration this script created is ours."""
+        result = self.run_deploy("consent-ok", "-SkipCode")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("may be adopted", result.stdout)
 
     def test_default_does_not_sweep_unselected_subscriptions(self):
         """Other visible subscriptions are not implicitly selected for application grants."""

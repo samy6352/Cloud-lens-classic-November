@@ -686,7 +686,8 @@ check("and remembers what the chart was", "chart.$clCategorical = useCategorical
 print("\ndashboard.js — performance contracts")
 
 filters = read("filters.js")
-check("opening data starts alongside navigation", "executiveData(tabsController.signal)" in dash)
+check("opening data starts alongside navigation",
+      re.search(r"executiveData\(\s*(?:ctx\.)?tabsController\??\.signal\s*\)", dash) is not None)
 check("secondary filters wait for the dashboard", '"cl:dashboard-ready"' in filters)
 check("duplicate filter requests share one promise", "pendingKey === requestKey" in filters)
 check("superseded filter requests are aborted", "requestController?.abort()" in filters)

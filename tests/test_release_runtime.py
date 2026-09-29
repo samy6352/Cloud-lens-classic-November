@@ -723,7 +723,12 @@ def test_quick_replacement_filters_whole_protected_days_and_binds_scope(monkeypa
     def connect():
         def execute(sql, params=None):
             commands.append((sql, params))
-            return SimpleNamespace(fetchall=lambda: [] if "FROM meta" in sql else [(date(2026, 9, 1),)])
+            rows = [] if "FROM meta" in sql else [(date(2026, 9, 1),)]
+            # `fetchone` as well as `fetchall`: the generation stamp now reads the
+            # dirty-window bookkeeping out of `meta`, and a cursor that only answers
+            # one of the two shapes fails the swap rather than the contract under test.
+            return SimpleNamespace(fetchall=lambda: rows,
+                                   fetchone=lambda: rows[0] if rows else None)
         yield SimpleNamespace(execute=execute)
 
     monkeypatch.setattr(instance, "connect", connect)

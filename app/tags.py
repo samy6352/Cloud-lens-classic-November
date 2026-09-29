@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from collections.abc import Iterable
 from typing import Any
 
 log = logging.getLogger("cloudlens.tags")
@@ -56,6 +58,46 @@ LIVE_KEYS_QUERY = """
     | summarize n = count() by k
     | order by n desc
 """
+
+# Tags Azure writes for itself, which no one chose and no one can act on.
+#
+# They matter because the tab ranks keys by the spend carrying them, and these ride on
+# *everything*: `aks-managed-*` is stamped on every node-pool disk, NIC and public IP in
+# a cluster, `hidden-*` on whole classes of platform resource. A real business key like
+# `CostCentre` applied to 60% of an estate loses the top of the list to a key the
+# platform applied to 100% of one noisy service, and the governance answer underneath
+# ("what are we failing to attribute") is buried below four rows nobody can change.
+#
+# They are flagged rather than dropped. Someone auditing an AKS estate has a legitimate
+# reason to look at them, and silently removing keys from a coverage report is how a
+# tool starts disagreeing with the portal for reasons the reader cannot see.
+PLATFORM_TAG_PREFIXES = (
+    "aks-managed-",
+    "k8s-azure-",
+    "kubernetes.io-",
+    "kubernetes.io/",
+    "hidden-",
+)
+
+# Values Azure generates rather than a person choosing them. A key whose values are all
+# timestamps or GUIDs is machine bookkeeping however it is spelled, so the prefix list
+# above does not have to be exhaustive to catch the same class of noise.
+_MACHINE_VALUE = re.compile(
+    r"^(?:\d{4}-\d{2}-\d{2}(?:[t ]\d{2}:\d{2}|$)"
+    r"|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$)",
+    re.IGNORECASE,
+)
+
+
+def is_platform_key(key: str, values: Iterable[str] = ()) -> bool:
+    """Whether a tag key is Azure's own bookkeeping rather than someone's decision."""
+    lowered = str(key or "").strip().lower()
+    if not lowered:
+        return False
+    if any(lowered.startswith(prefix) for prefix in PLATFORM_TAG_PREFIXES):
+        return True
+    sample = [v for v in values if v]
+    return bool(sample) and all(_MACHINE_VALUE.match(v) for v in sample)
 
 
 async def live_tag_keys(scope: list[str] | None = None) -> list[dict[str, Any]]:
@@ -103,7 +145,8 @@ def merge_live_keys(payload: dict[str, Any], live: list[dict[str, Any]]) -> dict
         return payload
 
     costed = {k["key"] for k in payload.get("keys", [])}
-    payload["uncosted"] = [k for k in live if k["key"] not in costed]
+    payload["uncosted"] = [{**k, "platform": is_platform_key(k["key"])}
+                           for k in live if k["key"] not in costed]
     payload["live_keys"] = len(live)
     return payload
 
@@ -315,10 +358,17 @@ def cost_by_tag(scope: list[str] | None = None, days: int = 30,
         k["cost"] = round(k["cost"], 2)
         # How many values sit under this key, so the picker can show which keys are worth
         # opening. A key with one value is a label; a key with nine is a breakdown.
-        k["values"] = len(k.pop("distinct"))
+        distinct = k.pop("distinct")
+        k["platform"] = is_platform_key(k["key"], distinct)
+        k["values"] = len(distinct)
+    # Platform bookkeeping sinks below anything a person chose, whatever it costs. The
+    # ordering is the ranking most readers act on, so leaving an `aks-managed-*` key at
+    # the top because it rides on every node-pool disk answers a question nobody asked.
+    keys_out.sort(key=lambda k: (k["platform"], -k["cost"], k["key"].lower()))
 
     return {
         "keys": keys_out,
+        "platform_keys": sum(1 for k in keys_out if k["platform"]),
         "resources": resources,
         "values": pool,
         "currency": currency,
@@ -340,7 +390,8 @@ def cost_by_tag(scope: list[str] | None = None, days: int = 30,
 
 
 def _empty(days: int) -> dict[str, Any]:
-    return {"keys": [], "resources": [], "values": [], "currency": None, "mixed": False,
+    return {"keys": [], "platform_keys": 0, "resources": [], "values": [],
+            "currency": None, "mixed": False,
             "native_currencies": {},
             "tagged": {"cost": 0.0, "resources": 0},
             "untagged": {"cost": 0.0, "resources": 0},

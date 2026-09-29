@@ -257,6 +257,65 @@ RULES: dict[str, dict[str, str]] = {
 }
 
 
+# Three evidence classes, and the rule that they are never added together.
+#
+# A single "waste total" is the fastest way to lose an audience. Adding a stopped
+# VM's recoverable compute to a deallocated VM's disks to an unattached NIC that
+# bills nothing produces one confident number answering no question anybody asked:
+# part of it is money you would stop paying tomorrow, part of it is money you will
+# keep paying until someone decides something, and part of it is not money at all.
+# The first FinOps review that spots the difference discounts every figure the tab
+# has ever shown, including the sound ones.
+#
+#   potential_savings -- the resource is billing, and removing or deallocating *it*
+#                        is what stops the bill. The measured window cost is the
+#                        recoverable amount.
+#   cost_at_risk      -- the spend is real and continuing, but the named resource is
+#                        not the thing you delete to stop it (a deallocated VM costs
+#                        nothing; its retained disks do), or a sizing/migration
+#                        decision has to come first. A number to review, not to bank.
+#   inventory         -- carries no charge of its own. Counting these is hygiene and
+#                        blast-radius, not savings, and their cost column is zero
+#                        because they are free, not because pricing was missed.
+IMPACT: dict[str, str] = {
+    "unattached_disks": "potential_savings",
+    "unassociated_public_ips": "potential_savings",
+    "stopped_vms": "potential_savings",
+    "empty_app_service_plans": "potential_savings",
+    "old_snapshots": "potential_savings",
+    "idle_nat_gateways": "potential_savings",
+    "empty_load_balancers": "potential_savings",
+    "orphaned_private_endpoints": "potential_savings",
+    "unused_app_gateways": "potential_savings",
+
+    "deallocated_vms": "cost_at_risk",
+    "stopped_sql_databases": "cost_at_risk",
+    "oversized_sql_pools": "cost_at_risk",
+    "classic_disks": "cost_at_risk",
+
+    "orphaned_nics": "inventory",
+    "unused_nsgs": "inventory",
+    "empty_resource_groups": "inventory",
+}
+
+IMPACT_LABELS = {
+    "potential_savings": "Recoverable by removing or deallocating these resources.",
+    "cost_at_risk": "Spend that continues until a decision is made; not a clean deletion.",
+    "inventory": "No charge of their own. Counted for hygiene, not savings.",
+}
+
+# Why a category's cost is what it is, per item. `verified_cost` means the warehouse
+# priced this exact resource id over the window. `no_charge` means the resource type
+# does not bill. `unpriced` means we could not establish a currency-qualified cost and
+# are saying so rather than substituting a zero.
+def _evidence_type(impact: str, buckets: dict[str, float | None]) -> str:
+    if impact == "inventory":
+        return "no_charge"
+    if not buckets or any(amount is None for amount in buckets.values()):
+        return "unpriced"
+    return "verified_cost"
+
+
 async def _arg(
     query: str, subscriptions: list[str], top: int = 500, *,
     max_records: int = 5000, max_pages: int = 100,
@@ -457,7 +516,12 @@ async def find_waste(
     findings = []
     # Keep totals per currency; adding EUR to USD would produce a confident, wrong number.
     grand_by_currency: dict[str, float | None] = {}
+    # ... and per evidence class as well as per currency, for the same reason one step up:
+    # a recoverable amount and an at-risk amount are no more addable than USD and EUR.
+    by_impact: dict[str, dict[str, float | None]] = {}
+    checked_clear: list[str] = []
     for key in keys:
+        impact = IMPACT.get(key, "potential_savings")
         items = []
         sub_by_currency: dict[str, float | None] = {}
         unpriced = 0
@@ -483,17 +547,36 @@ async def find_waste(
                 "currency": cur,
                 "cost_by_currency": buckets,
                 "pricing_status": hit.get("pricing_status") or ("priced" if cur else "unavailable"),
+                "evidence_type": _evidence_type(impact, buckets),
                 "id": r.get("id"),
             })
+
+        # A category that matched nothing is dropped rather than rendered as a zero.
+        # "0 unattached disks, 0.00 recoverable" is not a finding; it is a row that
+        # makes a clean estate look like a long list of problems, and it is the row a
+        # narrating model reaches for when it wants something to say. The categories
+        # that were checked and came back clean are named separately, so dropping them
+        # from `findings` never reads as "we did not look".
+        if not items:
+            checked_clear.append(key)
+            continue
+
         items.sort(key=lambda x: (x["currency"] or "", -(x["cost"] or 0)))
         single = next(iter(sub_by_currency)) if len(sub_by_currency) == 1 and not unpriced else None
         if unpriced:
             errors[f"{key}_pricing"] = f"{unpriced} resource(s) have no complete currency-qualified billing cost."
+        bucket = by_impact.setdefault(impact, {})
+        for code, amount in sub_by_currency.items():
+            if amount is None or bucket.get(code, 0.0) is None:
+                bucket[code] = None
+            else:
+                bucket[code] = bucket.get(code, 0.0) + amount
         findings.append({
             "category": key,
             "title": RULES[key]["title"],
             "why": RULES[key]["why"],
-            "count": len(items),
+            "impact_class": impact,
+            "impact_note": IMPACT_LABELS[impact],            "count": len(items),
             "cost": round(sub_by_currency[single], 2) if single else None,
             "currency": single,
             "cost_by_currency": {code: round(amount, 2) if amount is not None else None
@@ -520,6 +603,20 @@ async def find_waste(
         "currency": currencies[0] if len(currencies) == 1 and currencies[0] != "unknown" else None,
         "mixed_currency": mixed,
         "findings": findings,
+        # Per evidence class, never rolled into one figure. `total_cost` above is the
+        # sum of everything found and is kept for callers that predate this split, but
+        # the honest headline is `by_impact["potential_savings"]`: that is the part an
+        # estate actually stops paying. See IMPACT for what separates the three.
+        "by_impact": {impact: {code: round(amount, 2) if amount is not None else None
+                               for code, amount in bucket.items()}
+                      for impact, bucket in by_impact.items()},
+        "impact_notes": {impact: IMPACT_LABELS[impact] for impact in by_impact},
+        "items_by_impact": {impact: sum(f["count"] for f in findings if f["impact_class"] == impact)
+                            for impact in by_impact},
+        # Categories that ran cleanly and matched nothing. Named rather than listed as
+        # zero-count findings, so a tidy estate reads as tidy instead of as sixteen
+        # problems that all happen to be empty.
+        "checked_clear": checked_clear,
         "errors": errors,
         "partial": bool(errors),
         "review_note": (

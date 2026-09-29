@@ -508,6 +508,38 @@ def _costs_ddl(cols: str) -> str:
             f'PARTITION BY RANGE ("ChargePeriodStart")')
 
 
+def _spelling_source(con: Any) -> str:
+    """Where to look for the distinct subscription spellings the repair normalises.
+
+    The rollup groups by `"SubAccountId"`, so the set of spellings it holds is the
+    set the detail table holds -- it differs only in how many charges stand behind
+    each one, which this repair does not ask. On the real estate that is 201,852
+    rows rather than 16,929,623, and the difference is not academic: measured at
+    23.5s of a 24.7s warehouse construction, and the construction happens at import,
+    so every second of it is a second before the process can bind a port.
+
+    Falls back to `costs` whenever the rollup cannot be trusted to hold *every*
+    spelling, because a missed spelling here is a subscription silently counted
+    twice. Two such cases: a first boot, where this runs before `_ensure_derived`
+    has created the published view at all; and a rollup behind the detail table,
+    where a spelling ingested since the last rebuild would not be in it yet. Both
+    are answered by the same freshness check every reader uses.
+
+    Deliberately a module function rather than a method: the repair it serves is
+    called unbound against a bare connection, so reaching it through `self` would
+    tie a query-planning detail to an instance that need not exist.
+    """
+    from . import jobs, rollup
+
+    try:
+        if rollup.TABLE in jobs.fresh_derived_tables(con):
+            return rollup.TABLE
+    except Exception as exc:  # noqa: BLE001 - an unreadable rollup is simply not used
+        log.debug("warehouse: could not establish rollup freshness for the "
+                  "spelling repair (%s); reading the detail table", str(exc)[:200])
+    return "costs"
+
+
 class Warehouse:
     @property
     def state(self) -> dict[str, Any]:
@@ -1656,8 +1688,10 @@ class Warehouse:
         record the affected subscription/date ranges for an explicit scoped reingest.
         """
         try:
+            source = _spelling_source(con)
             identities = con.execute(
-                'SELECT DISTINCT "SubAccountId" FROM costs WHERE "SubAccountId" IS NOT NULL'
+                f'SELECT DISTINCT "SubAccountId" FROM {source} '
+                'WHERE "SubAccountId" IS NOT NULL'
             ).fetchall()
             replacements = [(canonical_sub_id(raw), raw) for (raw,) in identities
                             if canonical_sub_id(raw) != raw]

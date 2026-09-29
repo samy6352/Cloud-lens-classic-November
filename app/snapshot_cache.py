@@ -235,7 +235,17 @@ class SnapshotStore:
 
     def __init__(self, connect: Callable, *, generation: Callable = read_generation,
                  max_entries: int = 512, max_bytes: int = 64 * 1024 * 1024,
-                 max_payload: int = 2 * 1024 * 1024):
+                 max_payload: int = 8 * 1024 * 1024):
+        """`max_payload` bounds one entry; `max_bytes` bounds the whole store.
+
+        8MB rather than 2MB because the total is what actually protects memory --
+        `_prune` evicts by cumulative `byte_size` against `max_bytes`, so a larger
+        per-entry ceiling buys fewer retained entries, never more memory. The old
+        2MB ceiling silently excluded the single most expensive endpoint in the
+        app: `/api/dashboard/uptime` ships 6.19MB of per-resource detail for the
+        client-side filtering the tab is built on, so it was never cached and cost
+        84 seconds on every single load, warm or cold.
+        """
         if min(max_entries, max_bytes, max_payload) < 1:
             raise ValueError("Snapshot bounds must be positive.")
         self.connect, self.generation = connect, generation
@@ -431,6 +441,26 @@ def _cacheable_report(value: Any) -> bool:
     # Partial means evidence coverage, not an unfinished request. Keep all original
     # unknowns/notices/statuses; only failure-shaped empty reports are rejected.
     return not _partial_evidence(value) or _has_evidence(value)
+
+
+def oversize(response: Response, limit: int) -> int:
+    """How far a complete, well-formed JSON response exceeds the per-entry cap, else 0.
+
+    Worth telling apart from every other reason a body is not cacheable. An
+    oversized body is not incomplete, not failed and not pending -- it is a
+    perfectly good answer that simply will not fit, and the consequence is that
+    *every* viewer pays the full origin cost forever rather than the first one.
+
+    Measured on the real estate: `/api/dashboard/uptime` returns 6.19MB against a
+    2MB cap, so it was never once cached and every load cost 84 seconds. Nothing
+    said so -- it was reported as `source-incomplete`, which sent anyone looking
+    at the query instead of at the size.
+    """
+    body = getattr(response, "body", None)
+    if (response.status_code != 200 or not isinstance(body, bytes) or len(body) <= limit
+            or response.headers.get("content-type", "").split(";")[0] != "application/json"):
+        return 0
+    return len(body)
 
 
 def _body(response: Response, limit: int) -> bytes | None:
@@ -745,6 +775,19 @@ class SnapshotCache:
                 if body is None:
                     if _pending_body(response, self.store.max_payload):
                         return self._source_state(response, "source-pending", generation)
+                    # Size is its own diagnosis. Saying "incomplete" about a complete
+                    # answer sends the next person to read the query rather than the
+                    # response length, which is how a 6MB tab stayed uncached for as
+                    # long as it did.
+                    too_big = oversize(response, self.store.max_payload)
+                    if too_big:
+                        log.warning(
+                            "snapshot: %s returned %.1fMB, over the %.1fMB cache limit -- "
+                            "not cached, so every viewer pays the full origin cost",
+                            request.url.path, too_big / 1048576,
+                            self.store.max_payload / 1048576)
+                        response.headers["X-CloudLens-Refresh-Error"] = "response_too_large"
+                        return self._source_state(response, "response-too-large", generation)
                     self._log_failure("eligibility", request, ValueError())
                     await self._record_failure(old, request, "source_incomplete")
                     response.headers["X-CloudLens-Refresh-Error"] = "source_incomplete"

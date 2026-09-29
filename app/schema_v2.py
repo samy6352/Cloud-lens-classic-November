@@ -61,7 +61,8 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 log = logging.getLogger("cloudlens.schema_v2")
 
