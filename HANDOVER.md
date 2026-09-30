@@ -36,8 +36,17 @@ performance table, test list and open items are stale.
 >   `resource_costs` is gone, so a local v2 fails at boot (`"resource_ids" is not a view`,
 >   rolled back, nothing damaged). Local benches skip `_ensure_derived`; decide with Ravi
 >   whether to give v2 and v3 separate databases.
-> - Still open: items 1, 5, 9 (need Ravi) and 8 (July partition; now unblocked while the DB
->   is up — read-only catalog probe).
+> - Still open: items 1, 5, 9 (need Ravi). **Item 8 answered** (read-only, 1 Oct 03:25 IST):
+>   `costs_202607` is 20,064MB of heap for 5.02M rows (4,188 B/row) against 1,834 and 1,807
+>   B/row for August and September, with identical sampled row widths (~1,654B, Tags ~980B).
+>   Its counters show why: **11.64M rows inserted and 5.81M deleted** — July was imported
+>   twice and the first copy deleted. Autovacuum cleared the dead tuples (0 dead), but a
+>   plain vacuum never returns space mid-file, and a closed month gets no new inserts to
+>   reuse it, so every scan of July reads ~2x the pages. Fix, with Ravi's go-ahead and in a
+>   quiet window: `VACUUM (FULL, ANALYZE) costs_202607` (ACCESS EXCLUSIVE lock on that
+>   partition for its duration; needs ~10GB free disk) — or `pg_repack` if installed, to
+>   avoid the lock. Generic follow-up to consider: a reingest that replaces a whole closed
+>   month could load into a fresh partition and swap it in, instead of delete + insert.
 
 **Start here:** §0 (the rules), then §6 (the pending list, with what each item waits on),
 then §5b (why paging is no longer the obvious next step). §9 is the literal first moves.
@@ -540,7 +549,7 @@ re-run since. See §3–§5.
 | 5 | Verify Entra sign-in warming on live; first end-to-end test of `d3a6fcb` | **Ravi**: one SSO sign-in after a deploy |
 | 6 | Seven pre-existing test failures + one ordering-dependent error | **Done** `a171364` (error did not recur) |
 | 7 | `/api/schedules` 8.2s cold and uncached — cache it or not | **Done** `ac9bf8e`: not cached, reason recorded |
-| 8 | Possibly bloated July partition (~20GB vs ~10GB for August) | Nothing — ready |
+| 8 | Possibly bloated July partition (~20GB vs ~10GB for August) | **Confirmed**: double import + delete; `VACUUM FULL` needs **Ravi**'s go-ahead (see top) |
 | 9 | Carried: `stash@{0}` Environment filter, browser-suite clean pass, two UI decisions; Tags/Uptime ignore the global filter bar | **Ravi**, for the UI decisions |
 
 At the close of 30 Sep, Ravi was offered: start the unblocked work (3 in the background,
