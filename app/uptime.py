@@ -96,13 +96,13 @@ def hourly_cost(scope: list[str] | None = None, days: int = 30,
 
         hourly = f"""
             SELECT
-              COALESCE(NULLIF("ResourceId", ''), "ResourceName", '(unnamed)') AS id,
+              COALESCE(NULLIF("ResourceId", ''), "ResourceName", '(unnamed)') COLLATE "C" AS id,
               COALESCE(NULLIF("ResourceName", ''), '(unnamed)')               AS name,
               COALESCE("ServiceName", '')                                     AS service,
               COALESCE("SubAccountName", '')                                  AS subscription,
               COALESCE("ResourceGroup", '')                                   AS resource_group,
               COALESCE("RegionName", '')                                      AS region,
-              COALESCE("MeterName", '')                                       AS meter,
+              COALESCE("MeterName", '') COLLATE "C"                           AS meter,
               COALESCE(NULLIF("BillingCurrency", ''), 'unknown')              AS currency,
               "ChargePeriodStart"                                             AS day,
               COALESCE("PricingQuantity", 0) * COALESCE(
@@ -126,6 +126,17 @@ def hourly_cost(scope: list[str] | None = None, days: int = 30,
 
         # One row per resource, meter and day is the grain everything else is built from: the
         # peak day gives the instance count, and the day list gives the weekday profile.
+        #
+        # The resource id and meter are grouped byte for byte (`COLLATE "C"` above): under
+        # the database's linguistic collation, sorting 600K long resource ids that share
+        # their first 100 characters took 30 of this query's 34s on the live estate, and
+        # 3.8s byte-wise. Equality is the same under both -- the collation is deterministic
+        # -- so the groups cannot differ. The keys return to the default collation before
+        # anything joins on them, or the tag lookup can no longer use its index.
+        #
+        # Each returned meter carries its own daily cells. They were a second pass over
+        # every meter in the estate -- 594K cells on the live estate, over the cap and then
+        # discarded whole -- when only the returned meters' cells are ever used.
         rows = r.rows(
             f"""
             WITH src AS ({hourly}),
@@ -137,7 +148,7 @@ def hourly_cost(scope: list[str] | None = None, days: int = 30,
                           MAX(resource_group) AS resource_group, MAX(region) AS region
                    FROM src GROUP BY id, meter, currency, day
                  ),
-                 meters AS (
+                 ranked AS (
                    SELECT id, meter, currency,
                           MAX(name)            AS name,
                           MAX(service)         AS service,
@@ -149,12 +160,20 @@ def hourly_cost(scope: list[str] | None = None, days: int = 30,
                           MAX(hours)           AS peak_day_hours,
                           COUNT(*)             AS days_billed,
                           MIN(day)             AS first_day,
-                          MAX(day)             AS last_day
+                          MAX(day)             AS last_day,
+                          json_agg(json_build_array(day, hours, cost) ORDER BY day)
+                            FILTER (WHERE hours > 0) AS cells
                    FROM daily
                    GROUP BY id, meter, currency
                    HAVING SUM(hours) > 0
                    ORDER BY cost DESC
                    LIMIT {MAX_ROWS + 1}
+                 ),
+                 meters AS (
+                   SELECT id COLLATE "default" AS id, meter COLLATE "default" AS meter,
+                          currency, name, service, subscription, resource_group, region,
+                          hours, cost, peak_day_hours, days_billed, first_day, last_day, cells
+                   FROM ranked
                  )
             {tagged}
             """,
@@ -174,17 +193,16 @@ def hourly_cost(scope: list[str] | None = None, days: int = 30,
         )
 
         # The same series, but per meter, so a filter can rebuild the charts from the rows it
-        # kept. Fetched as a second pass rather than derived from the one above because the
-        # estate totals must stay exact even when this is dropped for size.
-        cells = r.rows(
-            f"""
-            WITH src AS ({hourly})
-            SELECT id, meter, currency, day, SUM(hours) AS hours, SUM(cost) AS cost
-            FROM src GROUP BY id, meter, currency, day
-            HAVING SUM(hours) > 0
-            """,
-            limit=MAX_DAILY_CELLS + 1,
-        )
+        # kept -- already gathered per returned meter above. The estate series is kept
+        # separate because the estate totals must stay exact even when this is dropped.
+        cells = [
+            {"id": row["id"], "meter": row["meter"], "currency": row["currency"],
+             "day": day, "hours": hours, "cost": cost}
+            for row in rows[:MAX_ROWS]
+            for day, hours, cost in reporting.json_list(row.pop("cells", None))
+        ]
+        for row in rows[MAX_ROWS:]:
+            row.pop("cells", None)
 
     # A later currency filter cannot restore rows omitted by the database fetch cap.
     truncated = len(rows) > MAX_ROWS

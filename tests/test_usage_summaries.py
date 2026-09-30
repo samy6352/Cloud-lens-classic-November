@@ -196,6 +196,50 @@ def test_the_routed_tabs_really_read_the_summaries(wh):
         assert stored > 0
 
 
+def test_each_uptime_meter_carries_exactly_its_own_daily_cells(wh):
+    result = _uptime(SUBS)
+    assert not result["daily_dropped"]
+    meters = {row["key"]: row for row in result["resources"]}
+    assert set(result["daily"]) == set(meters)
+    for key, series in result["daily"].items():
+        assert [cell[0] for cell in series] == sorted({cell[0] for cell in series}), "day order"
+        assert sum(cell[1] for cell in series) == pytest.approx(meters[key]["hours"], abs=0.1)
+        assert sum(cell[2] for cell in series) == pytest.approx(meters[key]["cost"], abs=1e-3)
+        assert len(series) == meters[key]["days_billed"]
+
+
+@pytest.mark.parametrize("scope", [None, SUBS[:1]])
+def test_tags_money_and_daily_series_match_the_detail_table_query(wh, monkeypatch, scope):
+    """The summary path groups per day first and carries each resource's cells inline;
+    the `costs` path is the original single-pass query. Money, identity and every daily
+    cell must agree -- only the tag text itself is sourced differently."""
+    from app import warehouse as module
+
+    routed = _tags(scope)
+    original = wh.reader
+
+    @contextmanager
+    def detail_only(*args, **kwargs):
+        with original(*args, **kwargs) as r:
+            r.tags = None
+            yield r
+
+    monkeypatch.setattr(wh, "reader", detail_only)
+    monkeypatch.setattr(module, "warehouse", wh)
+    plain = _tags(scope)
+
+    def shape(result):
+        return (
+            result["dates"], [round(v, 6) for v in result["daily_total"]],
+            result["daily_dropped"], result["truncated"],
+            [(r["id"], r["name"], r["service"], r["subscription"], r["subscription_id"],
+              r["group"], round(r["cost"], 6), [[i, round(c, 6)] for i, c in r["d"]])
+             for r in result["resources"]])
+
+    assert routed["dates"], "the fixture must produce a daily series"
+    assert shape(routed) == shape(plain)
+
+
 def test_latest_tags_in_the_window_win_across_a_month_boundary(wh):
     result = _tags(SUBS)
     vm = next(r for r in result["resources"] if r["name"] == "vm0")

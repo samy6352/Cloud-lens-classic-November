@@ -206,18 +206,50 @@ def cost_by_tag(scope: list[str] | None = None, days: int = 30,
         if tag_source:
             # The subscription's display name from the rollup, which holds it per
             # subscription; the per-resource summary does not carry it.
+            #
+            # Grouped twice -- per resource per day, then per resource -- so the daily cells
+            # the trend is drawn from come out of the same pass for the resources returned,
+            # rather than from a second pass over every resource in the estate (594K cells
+            # on the live estate: over the cap, and then discarded whole). The resource id
+            # is grouped byte for byte: under the database's linguistic collation, sorting
+            # millions of long ids sharing their first 100 characters was most of the 151s
+            # this took on the live estate; it is 13s. Equality does not depend on the
+            # collation, so the groups are the same; the id returns to the default
+            # collation for the ranking tie-break and the tag lookup's index.
             rows = r.rows(
                 f"""
                 WITH names AS (
                   SELECT "SubAccountId" AS name_sub, MAX("SubAccountName") AS name_text
                   FROM {agg} WHERE {display_window} GROUP BY 1
-                ), top AS (
-                  SELECT {identity}
-                    MAX(COALESCE(name_text, ''))                              AS subscription,
-                    {grouped}
+                ), days AS (
+                  SELECT
+                    COALESCE(NULLIF("ResourceId", ''), "ResourceName", '(unnamed)') COLLATE "C" AS id,
+                    COALESCE(NULLIF("BillingCurrency", ''), 'unknown')      AS currency,
+                    "ChargePeriodStart"                                     AS day,
+                    MAX(COALESCE(NULLIF("ResourceName", ''), '(unnamed)'))  AS name,
+                    MAX(COALESCE("ServiceName", ''))                        AS service,
+                    MAX(COALESCE(name_text, ''))                            AS subscription,
+                    MAX(COALESCE("ResourceGroup", ''))                      AS resource_group,
+                    SUM(COALESCE("BilledCost", 0))                          AS cost,
+                    MIN(COALESCE("SubAccountId", ''))                       AS sub_low,
+                    MAX(COALESCE("SubAccountId", ''))                       AS sub_high,
+                    MAX(NULLIF("SubAccountId", ''))                         AS sub_id
                   FROM {named} LEFT JOIN names ON name_sub = "SubAccountId"
                   WHERE {display_window}
-                  GROUP BY 1, 6
+                  GROUP BY 1, 2, 3
+                ), top AS (
+                  SELECT days.id COLLATE "default"                           AS id,
+                    MAX(name)                                               AS name,
+                    MAX(service)                                            AS service,
+                    MAX(subscription)                                       AS subscription,
+                    MAX(resource_group)                                     AS resource_group,
+                    currency,
+                    SUM(cost)                                               AS cost,
+                    -- One subscription across every day, as COUNT(DISTINCT ...) = 1 was.
+                    CASE WHEN MIN(sub_low) = MAX(sub_high) THEN MAX(sub_id) END AS subscription_id,
+                    json_agg(json_build_array(day, cost) ORDER BY day)     AS cells
+                  FROM days
+                  GROUP BY days.id, currency
                   ORDER BY cost DESC, id, currency
                   LIMIT {MAX_RESOURCES + 1}
                 )
@@ -227,6 +259,16 @@ def cost_by_tag(scope: list[str] | None = None, days: int = 30,
                 """,
                 limit=MAX_RESOURCES + 1,
             )
+            # Per resource per day, for the trend and the day drill-down. Both are driven
+            # entirely client-side: changing the tag selection re-answers instantly, and a
+            # daily series fetched per selection would put a round trip behind every click.
+            daily = [
+                {"id": row["id"], "day": day, "currency": row["currency"], "cost": cost}
+                for row in rows[:MAX_RESOURCES]
+                for day, cost in reporting.json_list(row.get("cells"))
+            ]
+            for row in rows:
+                row.pop("cells", None)
         else:
             rows = r.rows(
                 f"""
@@ -245,24 +287,19 @@ def cost_by_tag(scope: list[str] | None = None, days: int = 30,
                 """,
                 limit=MAX_RESOURCES + 1,
             )
-
-        # Per resource per day. Needed for both the trend and the day drill-down, and both are
-        # driven entirely client-side: the whole point of the tab is that changing the tag
-        # selection re-answers instantly, and a daily series fetched per selection would put a
-        # round trip behind every click.
-        daily = r.rows(
-            f"""
-            SELECT
-              COALESCE(NULLIF("ResourceId", ''), "ResourceName", '(unnamed)') AS id,
-              "ChargePeriodStart"                                             AS day,
-              COALESCE(NULLIF("BillingCurrency", ''), 'unknown')              AS currency,
-              SUM(COALESCE("BilledCost", 0))                                  AS cost
-            FROM {named}
-            WHERE {display_window}
-            GROUP BY 1, 2, 3
-            """,
-            limit=MAX_DAILY_CELLS + 1,
-        )
+            daily = r.rows(
+                f"""
+                SELECT
+                  COALESCE(NULLIF("ResourceId", ''), "ResourceName", '(unnamed)') AS id,
+                  "ChargePeriodStart"                                             AS day,
+                  COALESCE(NULLIF("BillingCurrency", ''), 'unknown')              AS currency,
+                  SUM(COALESCE("BilledCost", 0))                                  AS cost
+                FROM {named}
+                WHERE {display_window}
+                GROUP BY 1, 2, 3
+                """,
+                limit=MAX_DAILY_CELLS + 1,
+            )
 
     # Budget amounts are native billing units, never the dashboard's converted currency.
     # Aggregate per subscription before applying a row cap so a mixed unit cannot look single.

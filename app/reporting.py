@@ -72,6 +72,17 @@ def period_days(days: int) -> int:
     return (bounds[1] - bounds[0]).days + 1 if bounds else max(1, min(int(days), 365))
 
 
+def json_list(value: Any) -> list:
+    """A JSON array column as a list, whether the driver decoded it or not."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        import json
+
+        value = json.loads(value)
+    return list(value)
+
+
 def start_sql(hi: Any, days: int) -> str:
     """Exclusive lower edge, shared by > predicates (not >= predicates)."""
     bounds = month_bounds()

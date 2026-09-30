@@ -34,11 +34,14 @@ def hourly_reader(monkeypatch):
     queries = []
     rows = [
         {"id": "a", "meter": "vm", "currency": "USD", "hours": 24, "cost": 10,
-         "peak_day_hours": 24, "first_day": "2026-09-06", "last_day": "2026-09-06"},
+         "peak_day_hours": 24, "first_day": "2026-09-06", "last_day": "2026-09-06",
+         "cells": [["2026-09-06", 24, 10]]},
         {"id": "b", "meter": "vm", "currency": "EUR", "hours": 24, "cost": 5,
-         "peak_day_hours": 24, "first_day": "2026-09-06", "last_day": "2026-09-06"},
+         "peak_day_hours": 24, "first_day": "2026-09-06", "last_day": "2026-09-06",
+         "cells": [["2026-09-06", 24, 5]]},
     ]
-    cells = [{**row, "day": "2026-09-06"} for row in rows]
+    daily = [{"day": "2026-09-06", "currency": row["currency"], "hours": row["hours"],
+              "cost": row["cost"]} for row in rows]
 
     class Reader:
         def rows(self, sql, limit=200):
@@ -48,8 +51,8 @@ def hourly_reader(monkeypatch):
             if "WITH src" not in sql:
                 return [{"currency": "USD", "cost": 10}, {"currency": "EUR", "cost": 5}]
             if "peak_day_hours" in sql:
-                return rows[:limit]
-            return cells[:limit]
+                return [dict(row) for row in rows[:limit]]
+            return daily[:limit]
 
     @contextmanager
     def reader(*args, **kwargs):
@@ -84,7 +87,8 @@ def test_native_currency_filter_does_not_hide_truncated_daily_cells(hourly_reade
 def test_hourly_currency_is_selected_before_detail_limits(hourly_reader):
     uptime.hourly_cost(["a"])
     detail = [query for query in hourly_reader if "WITH src" in query]
-    assert len(detail) == 3
+    # The meters, each carrying its own daily cells, and the estate's daily series.
+    assert len(detail) == 2
     assert all('AND COALESCE(NULLIF("BillingCurrency", \'\'), \'unknown\') = \'USD\'' in query
                for query in detail)
 
