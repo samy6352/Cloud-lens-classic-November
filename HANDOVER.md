@@ -43,6 +43,12 @@ performance table, test list and open items are stale.
 >   subscriptions; Service Health reports its own failed read as the app identity).
 >   Recommendation to Ravi: option **(a), no paging** — what remains is ~1.1MB gzip download
 >   and browser memory, not waiting. Awaiting his confirmation.
+> - **Next session, in order:** (1) Ravi confirms no paging → close item 1; (2) Ravi rotates
+>   the live admin password (typed into the 1 Oct chat); (3) July `VACUUM (FULL, ANALYZE)
+>   costs_202607` if approved, in a quiet window; (4) one SSO sign-in for item 5;
+>   (5) Insights' new ceiling: `waste` 20s, `rightsizing` 19s — measure, then generic fix;
+>   (6) separate local databases for v2 and v3; (7) item 9 UI decisions. MCAPS stops the
+>   live DB overnight — start it first (~5 min) and expect cold buffers.
 > - Still open: items 1 (decision only), 5, 9 (need Ravi). **Item 8 answered** (read-only, 1 Oct 03:25 IST):
 >   `costs_202607` is 20,064MB of heap for 5.02M rows (4,188 B/row) against 1,834 and 1,807
 >   B/row for August and September, with identical sampled row widths (~1,654B, Tags ~980B).
