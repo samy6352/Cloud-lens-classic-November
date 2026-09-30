@@ -222,6 +222,30 @@ r = inv([row(id="idle-1", name="orphan-ri", resources=0)])
 check("an idle commitment's drill-down is empty, not missing",
       r["commitments"][0]["resources_top"] == [] and r["commitments"][0]["resources_more"] == 0)
 
+# The drill-down's ceiling has to be stated to the database, not applied after it answers.
+# Reading n rows from an unbounded sort still makes the server order every covered resource in
+# the estate: measured on live, the same 4000 rows cost 34.3s that way and 1.65s from a bounded
+# sort. The SQL limit and the fetch limit must therefore agree, which is what this pins.
+captured: list[tuple[str, int | None]] = []
+
+
+class RecordingReader(FakeReader):
+    def rows(self, sql, limit=None):
+        captured.append((sql, limit))
+        return super().rows(sql, limit)
+
+
+c = C.Commitments.__new__(C.Commitments)
+c.wh = FakeWarehouse(RecordingReader("2026-08-31", [row()], (), ()))
+c.inventory(None, days=90)
+drill = [(sql, limit) for sql, limit in captured if "AS grp" in sql]
+check("the drill-down runs exactly once", len(drill) == 1, len(drill))
+drill_sql, drill_limit = drill[0]
+check("its row ceiling is pushed into SQL so the server bounds its sort",
+      f"LIMIT {C.MAX_RESOURCE_ROWS}" in drill_sql, drill_sql[-60:])
+check("and the fetch cap is the same number, so the two cannot drift",
+      drill_limit == C.MAX_RESOURCE_ROWS, drill_limit)
+
 print()
 print("=" * 72)
 print(f"  {passed} passed, {failed} failed")

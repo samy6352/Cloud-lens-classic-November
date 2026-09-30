@@ -34,6 +34,13 @@ ON_DEMAND = ("ondemand", "on demand", "payg", "standard")
 # as well as the full list would, at a fraction of the payload.
 MAX_RESOURCES_SHOWN = 8
 
+# How many drill-down rows the resource query is allowed to return in total, across every
+# commitment. This has to be stated to PostgreSQL rather than applied after the fact: the query
+# groups every covered resource and orders by cost, so without a LIMIT the server sorts the whole
+# estate and the reader throws almost all of it away. Measured on the live estate, the same 4000
+# rows cost 34.3s fetched from an unbounded sort and 1.65s from a bounded one.
+MAX_RESOURCE_ROWS = 4000
+
 
 def _bucket(pricing_model: str | None) -> str:
     """Group a raw PricingModel value into something a person would recognise."""
@@ -89,10 +96,19 @@ class Commitments:
                 '"ServiceFamily" = \'Compute\' OR "ServiceName" ILIKE \'%virtual machine%\''
                 ") GROUP BY 1, 2", None)
 
+            # Grouped byte for byte, and the distinct resource count with it. Benefit names and
+            # resource ids are long strings that share their leading characters, and under the
+            # live server's `en_US.utf8` collation grouping them took 65.7s of this statement
+            # against 5.7s byte-wise — the same cost `a1bc0cd` removed from Uptime and Tags.
+            # Equality is identical under both collations because both are deterministic, so
+            # the groups and the counts cannot differ; measured on the live estate, both
+            # spellings return the same 43 rows. Nothing here joins or tie-breaks on text —
+            # `ORDER BY cost` is numeric — so the keys never need casting back.
             benefits = r.rows(
-                'SELECT "BenefitName" AS name, coalesce("PricingModel", \'\') AS model, '
+                'SELECT "BenefitName" COLLATE "C" AS name, '
+                'coalesce("PricingModel", \'\') AS model, '
                 '"BillingCurrency" AS currency, sum("BilledCost") AS cost, '
-                'count(DISTINCT "ResourceId") AS resources '
+                'count(DISTINCT "ResourceId" COLLATE "C") AS resources '
                 f'FROM {r.benefit} WHERE {period} AND "BenefitName" IS NOT NULL '
                 "AND \"BenefitName\" <> '' GROUP BY 1, 2, 3 ORDER BY cost DESC", None)
 
@@ -233,13 +249,18 @@ class Commitments:
 
             period = f'"ChargePeriodStart" > {reporting.start_sql(hi, days)}'
 
+            # Byte-order grouping, for the reason set out in `coverage` above: the benefit id is
+            # a full ARM resource path and the distinct-resource count is over resource ids, so
+            # this one statement spent 70.6s in libc string comparison on the live estate and
+            # 7.9s byte-wise — the same 81 rows either way. Deterministic collations agree on
+            # equality, and nothing downstream joins or orders on these keys.
             rows = r.rows(
-                'SELECT "BenefitId" AS id, "BenefitName" AS name, '
+                'SELECT "BenefitId" COLLATE "C" AS id, "BenefitName" COLLATE "C" AS name, '
                 'coalesce("PricingModel", \'\') AS model, '
                 '"BillingCurrency" AS currency, '
                 'sum("BilledCost") AS cost, '
-                'count(DISTINCT "ResourceId") AS resources, '
-                'count(DISTINCT "SubAccountId") AS subscriptions, '
+                'count(DISTINCT "ResourceId" COLLATE "C") AS resources, '
+                'count(DISTINCT "SubAccountId" COLLATE "C") AS subscriptions, '
                 'min("ChargePeriodStart") AS first_seen, '
                 'max("ChargePeriodStart") AS last_seen '
                 f'FROM {r.benefit} WHERE {period} '
@@ -258,10 +279,16 @@ class Commitments:
                 'AND coalesce("BenefitId", "BenefitName") <> \'\' '
                 "GROUP BY 1, 2 ORDER BY cost DESC", None)
 
-            # Which resources are actually covered, for the drill-down beneath each row. Capped
-            # in Python rather than in SQL (`resources` above already counts every one of them),
-            # because a `LIMIT` here would cut off arbitrarily between commitments rather than
-            # leaving each its own fair share.
+            # Which resources are actually covered, for the drill-down beneath each row. Bounded
+            # in SQL at the same number the reader keeps, so the two cannot drift: `rows(..., n)`
+            # fetches n rows but the server had already sorted every group to produce them, which
+            # is the whole cost of this statement. The per-commitment share is still taken in
+            # Python (`MAX_RESOURCES_SHOWN`) — a LIMIT cannot give each commitment a fair slice,
+            # and this cap is a ceiling on the sort, not a per-commitment budget.
+            #
+            # Unlike the two statements above, byte-order grouping does *not* help here and was
+            # measured making it worse (9.8s → 22.6s): the collation changes the plan rather than
+            # just the comparison cost. Bounding the sort is the lever; the collation is not.
             resource_rows = r.rows(
                 'SELECT coalesce("BenefitId", "BenefitName") AS id, '
                 'coalesce("ResourceName", "ResourceId") AS name, '
@@ -271,7 +298,8 @@ class Commitments:
                 'AND coalesce("BenefitId", "BenefitName") IS NOT NULL '
                 'AND coalesce("BenefitId", "BenefitName") <> \'\' '
                 'AND "ResourceId" IS NOT NULL '
-                "GROUP BY 1, 2, 3 ORDER BY cost DESC", 4000)
+                f"GROUP BY 1, 2, 3 ORDER BY cost DESC LIMIT {MAX_RESOURCE_ROWS}",
+                MAX_RESOURCE_ROWS)
 
         by_id: dict[str, list[str]] = {}
         for row in services:

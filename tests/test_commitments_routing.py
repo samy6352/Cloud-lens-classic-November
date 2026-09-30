@@ -9,6 +9,16 @@ from app.commitments import Commitments
 pytestmark = pytest.mark.offline
 
 
+def _is_benefits(sql: str) -> bool:
+    """The coverage benefit pass, identified by what it reads rather than how it spells it.
+
+    Matching the exact projection text made this suite fail the moment the grouping keys gained
+    a collation, which is a change to how fast the statement runs and not to which table it
+    reads -- the thing this test is actually about.
+    """
+    return "AS name" in sql and "FROM commitment_benefits " in sql
+
+
 def test_coverage_uses_rollup_for_additive_summaries_and_detail_for_benefits():
     queries = []
     reader_options = []
@@ -22,7 +32,7 @@ def test_coverage_uses_rollup_for_additive_summaries_and_detail_for_benefits():
             queries.append(sql)
             if "AS hi" in sql:
                 return [{"hi": "2026-09-17"}]
-            if '"BenefitName" AS name' in sql:
+            if _is_benefits(sql):
                 return [{"name": "Plan A", "model": "Reservation",
                          "currency": "USD", "cost": 20, "resources": 1}]
             if 'strftime("ChargePeriodStart"' in sql:
@@ -55,15 +65,20 @@ def test_coverage_uses_rollup_for_additive_summaries_and_detail_for_benefits():
     assert reader_options[0]["include_commitments"] is True
     summary_queries = [
         sql for sql in queries
-        if '"BenefitName" AS name' not in sql
+        if not _is_benefits(sql)
         and ("AS hi" in sql or '"ServiceFamily" = \'Compute\'' in sql
              or 'strftime("ChargePeriodStart"' in sql
              or '"BillingCurrency" AS currency' in sql)
     ]
     assert all("FROM costs_rollup" in sql for sql in summary_queries)
-    assert any('"BenefitName" AS name' in sql and "FROM commitment_benefits " in sql
-               for sql in queries)
-    assert all('count(DISTINCT "ResourceId")' not in sql for sql in summary_queries)
+    assert any(_is_benefits(sql) for sql in queries)
+    assert all('count(DISTINCT "ResourceId"' not in sql for sql in summary_queries)
+    # The benefit pass groups byte for byte. Under the live server's linguistic collation the
+    # same statement took 65.7s against 5.7s, so this is a property worth pinning rather than
+    # an incidental spelling -- see the comment on the query itself.
+    benefits_sql = next(sql for sql in queries if _is_benefits(sql))
+    assert '"BenefitName" COLLATE "C" AS name' in benefits_sql
+    assert 'count(DISTINCT "ResourceId" COLLATE "C")' in benefits_sql
 
 
 def test_billing_currency_census_uses_reader_aggregate(monkeypatch):
