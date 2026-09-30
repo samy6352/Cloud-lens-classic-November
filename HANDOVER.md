@@ -1,4 +1,4 @@
-# CloudLens — handover, 30 September 2026 (final, 22:00 IST)
+# CloudLens — handover, 30 September 2026 (final, 22:30 IST)
 
 Supersedes the 28 Sep handover, kept as `HANDOVER-2026-09-28.md`. Its architecture
 section (§6) and measurement traps (§3) still hold and are not repeated here; its
@@ -11,12 +11,13 @@ next task). §9 is the literal first five commands.
 snapshot cache in 0.1–3.9s — now including Anomalies and Billing opportunities, which were
 never cached before `e99b71c` — and since `383f72e` the server itself recomputes the views
 people use after a deploy, so the first view after a deploy is a cache hit too
-(Commitments 98.6s → 0.10s, Insights 46.6s → 0.13s). The cold path for users the warmer has
-not seen has since been profiled and fixed at both ends: Commitments was never waiting on
-Azure at all but on collation and an unbounded sort (`9920e2d`, live), and
-Insights/Recommendations were paying a TLS handshake per subscription on the Advisor
-fan-out (`d3a6fcb`, 59.4s → 4.2s, committed but **not yet deployed**). What remains:
-deploy and re-bench that fix, then payload size and server-side filtering and paging.**
+(Commitments 98.6s → 0.10s, Insights 46.6s → 0.13s). Scale now runs `d3a6fcb`, the same
+code as `main`. Commitments' cold path was collation and an unbounded sort (`9920e2d`,
+13.3s server compute). The shared ARM client (`d3a6fcb`) was deployed and re-measured: it
+changes nothing on Scale's own cold path, because Scale's identity sees one subscription
+and its Advisor fan-out is one call, not the 71 the 59.4s was measured on (§5a). Insights'
+cold time is its `tags` source — the full Tags tab query, 31s, run to read three numbers.
+That, then server-side filtering and paging, is what remains.**
 
 Everything below is measured on the live Scale deployment or read from the code.
 Guesses say so.
@@ -38,9 +39,11 @@ Guesses say so.
    at import time. Scope isolation depends on per-connection temp views (§4).
 5. **Never edit source while pytest runs** — several tests read or `exec` source.
    Run the full suite **detached** (§1); attached runs were killed by interruptions.
-6. **`main` is 20 commits ahead of `backup/cloud-lens-v2/main`** (nothing after `e42bfef`
-   is pushed). `git push` needs credentials that are not cached on this machine. Ask Ravi
-   before pushing.
+6. **Nothing after `e42bfef` is pushed to `backup/cloud-lens-v2/main`** — 22 commits
+   including this handover; count with `git rev-list --count backup/cloud-lens-v2/main..main`
+   rather than trusting a number here (the last two handovers each went stale by the commit
+   that recorded them). `git push` needs credentials that are not cached on this machine.
+   Ask Ravi before pushing.
 7. **The live admin password is never written down.** Ask Ravi and pass it only in the
    process environment. It was typed into the 30 Sep chat, so Ravi was asked to rotate it —
    if the old one still works, remind him.
@@ -118,11 +121,11 @@ carry `X-CloudLens-Cache` (`hit`/`miss`/`response-too-large`/…) and `Server-Ti
 | Platform | One uvicorn worker. `alwaysOn` **enabled 30 Sep** (had drifted to `false` from `infra/modules/stack.bicep`) |
 | Data | 16.9M cost rows, 2026-07-01 → 2026-09-28, 70 subscriptions (HDFC demo) |
 | Sign-in | SSO shows only the user's own RBAC subscriptions; use local `admin` to see all 70 |
+| App identity | `cloudlens-id-scale` (user-assigned): Reader + Cost Management Reader on **one** subscription, the one hosting `CloudLens-Scale`. Local `admin` has no delegated token, so its live Azure calls (Advisor, Resource Graph, Monitor) go out as this identity and cover that one subscription — not the 70 in the warehouse |
 
-Deployed commit: **`9920e2d`** (30 Sep — the Commitments collation/sort fix, verified live).
-All 11 derived tables stamped. **`d3a6fcb` (shared ARM client) is committed but not
-deployed**; `fbbf999` is test-only. Local `main` is therefore two code commits ahead of
-Scale, one of which matters.
+Deployed commit: **`d3a6fcb`** (30 Sep 16:41 UTC, `az webapp deploy`, RuntimeSuccessful;
+warm pass claimed 16:41:09, all 18 targets recomputed by 16:44:45). All 11 derived tables
+stamped. `fbbf999` is test-only, so Scale runs the same application code as `main`.
 
 ---
 
@@ -140,7 +143,7 @@ Scale, one of which matters.
 | `e99b71c` | Opportunity prices count as evidence; Anomalies declares `partial_basis` | Billing opportunities 12.9s → 0.15s and Anomalies 2.2s → 0.14s on repeat (were never cached) |
 | `9920e2d` | Commitments: `COLLATE "C"` on the benefit grouping/DISTINCT keys, `LIMIT 4000` on the inventory drill-down | Inventory headline 70.6s → 7.9s, coverage benefits 65.7s → 5.7s, drill-down 34.3s → 1.65s, identical rows. Deployed and verified live |
 | `fbbf999` | Test stub identifies the benefit query by what it reads, not how it spells it | `9920e2d` changed the spelling; a stub matching on text went stale. Caught by the full suite |
-| `d3a6fcb` | One shared `httpx.AsyncClient` for all ARM calls instead of one per call | Advisor fan-out, 71 subscriptions, same 4 slots, same outcome: 59.4s → 4.2s wall, 141.3s → 13.3s summed, 2.05s → 0.18s mean per refused call |
+| `d3a6fcb` | One shared `httpx.AsyncClient` for all ARM calls instead of one per call | Advisor fan-out, 71 subscriptions, same 4 slots, same outcome: 59.4s → 4.2s wall, 141.3s → 13.3s summed, 2.05s → 0.18s mean per refused call — **measured on the dev machine with the 71 ids passed in**. Deployed; no end-to-end change on Scale, whose fan-out is one call (§5a) |
 
 `c88bb58` (`plan.md`) is **another session's v3 plan**, not this work.
 
@@ -260,31 +263,40 @@ row with *no* currency code is data, a real code with no rate is source).
 
 ## 5. Performance — live, 30 Sep after `383f72e` and `e99b71c`
 
-**The table below is a snapshot taken at `e99b71c`. Its "Cold after deploy" column is stale
-for Commitments, Insights and Recommendations — see §5a for what `9920e2d` and `d3a6fcb`
-did to those three. Every other column still holds.**
+**Two measures, not one.** The bench columns are client-side at `e99b71c` and include
+transfer. The **server compute** column is newer: each view's cold cost as the server timed
+it during the warm pass that followed the `d3a6fcb` deploy (`snapshot_warm_targets.seconds`,
+written in `snapshot_cache._refresh`: from after the slot and authorisation to the snapshot
+being stored — so the route's computation plus the cache's own body checks and write, but
+no transfer and no queueing; the pass runs one view at a time). For the 8–15MB views the
+body checks are ~2s of it (§6 item 3). It supersedes the bench's cold column wherever they
+disagree, which is Commitments, Insights and Recommendations (§5a). Every other bench
+column still holds.
 
 `tools\bench_tabs.py`, full runs. "Cold" = first view right after the deploy of `383f72e`,
 before any warm targets existed. "After warming" = first view on a *new* app version
 (`CLOUDLENS_BUILD_ID` bumped), measured once the server's warm pass had finished and before
 anyone opened a tab. Session files `bench-deploy1-cold.txt`, `bench-deploy2-warmed.txt`.
 
-| Tab | Before this session | Cold after deploy | After warming | Repeat | Payload |
-|---|---|---|---|---|---|
-| Commitments | 98–101s | 98.6s | **0.10s** | 0.10s | 61KB |
-| Insights | 209–220s | 46.6s | **0.13s** | 0.10s | 6KB |
-| Recommendations (AI) | — | 33.8s | **0.08s** | 0.08s | — |
-| Resources | 500 at 180s | 31.3s | **4.6s** | 3.7s | 15.3MB |
-| Tags | 184–212s | 29.9s | **2.5s** | 2.3–3.9s | 10.5MB |
-| Uptime | 78–94s | 13.5s | **1.7s** | 1.6s | 7.8MB |
-| Savings | — | 12.1s | **0.08s** | 0.08s | 24KB |
-| AI Billing | 500 at 180s | 9.9s | **0.39s** | 0.38s | 47KB |
-| Governance | — | 7.6s | **0.10s** | 0.09s | 17KB |
-| Executive | — | 6.9s | **0.09s** | 0.09s | 17KB |
-| Billing opportunities | — | 13.2s | 12.9s → **0.15s repeat since `e99b71c`** (was never cached) | 0.15s | 9KB |
-| Anomalies | 2.2s | 2.1s | 2.2s → **0.14s repeat since `e99b71c`** (was never cached) | 0.14s | 5KB |
-| Schedules | — | 8.2s | 8.6s (not a cached route) | 0.08s | 10KB |
-| Budgets | 504 at 240s | 0.3s | 1.5s | 0.19s | 4KB |
+| Tab | Before this session | Cold after deploy (bench, `e99b71c`) | **Server compute, cold (`d3a6fcb`)** | After warming | Repeat | Payload |
+|---|---|---|---|---|---|---|
+| Commitments | 98–101s | 98.6s | **13.3s** | **0.10s** | 0.10s | 61KB |
+| Insights | 209–220s | 46.6s | **31.2s** | **0.13s** | 0.10s | 6KB |
+| Recommendations (AI) | — | 33.8s | **25.6s** | **0.08s** | 0.08s | — |
+| Resources | 500 at 180s | 31.3s | 26.6s | **4.6s** | 3.7s | 15.3MB |
+| Tags | 184–212s | 29.9s | 25.4s | **2.5s** | 2.3–3.9s | 10.5MB |
+| Uptime | 78–94s | 13.5s | 12.0s | **1.7s** | 1.6s | 7.8MB |
+| Savings | — | 12.1s | 12.0s | **0.08s** | 0.08s | 24KB |
+| AI Billing | 500 at 180s | 9.9s | 6.5s | **0.39s** | 0.38s | 47KB |
+| Governance | — | 7.6s | 6.9s | **0.10s** | 0.09s | 17KB |
+| Executive | — | 6.9s | 6.9s | **0.09s** | 0.09s | 17KB |
+| Billing opportunities | — | 13.2s | 13.1s | 12.9s → **0.15s repeat since `e99b71c`** (was never cached) | 0.15s | 9KB |
+| Anomalies | 2.2s | 2.1s | 2.1s | 2.2s → **0.14s repeat since `e99b71c`** (was never cached) | 0.14s | 5KB |
+| Schedules | — | 8.2s | not a warm target | 8.6s (not a cached route) | 0.08s | 10KB |
+| Budgets | 504 at 240s | 0.3s | 0.0s (below the 1s floor, not re-warmed) | 1.5s | 0.19s | 4KB |
+
+Also warm targets, server compute at `d3a6fcb`: Filters 5.5s, Rightsizing 6.0s, Waste 5.5s,
+AKS 5.4s, Health 2.0s, ESU 0.7s.
 
 45 endpoints: 42 × 200; the three 400s (`change-analysis`, `performance`,
 `service-health`) need parameters the bench does not send — by design.
@@ -293,8 +305,9 @@ Repeat views of Resources/Tags are 2–4s because of payload size, not queries.
 ### 5a. The cold path, profiled — and what the old §6 item 1 got wrong
 
 The old item 1 assumed all three slow cold tabs "wait on live Azure/Advisor/AI calls".
-**That was wrong for Commitments and only half the story for the other two.** Profiling
-statement by statement, as §1 prescribes, found two unrelated causes.
+**That was wrong for Commitments, and — measured after the deploy — wrong on Scale for the
+other two as well.** Profiling statement by statement, as §1 prescribes, found two unrelated
+causes; deploying the second showed it does not apply to Scale's own cold path.
 
 **Commitments never touched Azure.** Its 98.6s was SQL, and the same `en_US.utf8` collation
 trap already recorded for Uptime and Tags: grouping and `DISTINCT` on long resource ids.
@@ -311,10 +324,13 @@ Rows are identical. Deployed to Scale and verified live. Note the asymmetry, bec
 a trap: `COLLATE "C"` on the *drill-down* was measured **worse** (9.8s → 22.6s) — it changes
 the plan. The lever there is bounding the sort, not the collation.
 
-**Insights and Recommendations do wait on Azure, but not on Azure being slow.**
-`waste.advisor_recommendations` issues one ARM call per subscription — 71 on the live estate
-— through the process-wide `cost._CONCURRENCY = asyncio.Semaphore(4)`. 67 of the 71 return
-401, because the seeded HDFC subscription ids are real subscriptions in a foreign tenant.
+**What the Advisor profile measured — correct on the dev machine, not Scale's cold path.**
+The profile below ran the app's code on the dev machine with the 71 seeded HDFC ids passed
+in explicitly, because locally the fan-out cannot be reproduced otherwise (the dev
+credential sees one subscription). On that input:
+`waste.advisor_recommendations` issues one ARM call per subscription through the
+process-wide `cost._CONCURRENCY = asyncio.Semaphore(4)`, and 67 of the 71 return 401,
+because the seeded HDFC subscription ids are real subscriptions in a foreign tenant.
 Measured: 157.5s of HTTP compressed into 59.3s wall, worst call waiting 55.9s for a slot.
 
 The cost was not the requests. `_fetch` opened a fresh `httpx.AsyncClient` per call, so every
@@ -327,8 +343,55 @@ one of the 71 paid a new TCP connect and TLS handshake. `d3a6fcb` shares a singl
 
 Same 71 calls, same four slots, same outcome (14 recommendations, 68 refusals). The
 semaphore was deliberately **not** raised — throttling behaviour is what it exists to manage,
-and the handshake was the whole problem. Committed, **not yet deployed to Scale**, and the
-end-to-end cold tab timings have not been re-benched since.
+and the handshake was the whole problem.
+
+**Deployed and re-measured on Scale (30 Sep 16:41 UTC): no end-to-end change.** A deploy
+changes the version digest, so the server's warm pass recomputes all 18 of `admin`'s
+targets above the 1s floor, serially, in fixed `used DESC` order, from an empty process.
+That makes the pass after `9920e2d` (14:35 UTC) and the pass after `d3a6fcb` (16:41 UTC)
+like for like, read from `snapshot_warm_targets.seconds` without signing in
+(`warm_compare.py`, §8):
+
+| View | `9920e2d` | `d3a6fcb` |
+|---|---|---|
+| Insights | 31.4s | 31.2s |
+| Recommendations | 20.2s | 25.6s |
+| Commitments | 13.6s | 13.3s |
+| Billing opportunities (first in the pass) | 17.8s | 13.1s |
+| All 18 targets, summed | 214.1s | 206.7s |
+
+Movements of ±3–5s appear in both directions on views `d3a6fcb` cannot touch (Resources
+−2.7s, Tags +1.0s), so none of these is attributable from one pass each. Recommendations'
++5.4s is unexplained: its two data sources (Savings, Anomalies) did not move in their own
+tabs, and its model call's latency is recorded nowhere.
+
+**Why nothing moved: on Scale the fan-out is one call.** The warm pass runs as local
+`admin`, which carries no delegated token, so ARM calls go out as the app's identity, and
+`cloudlens-id-scale` holds Reader on one subscription (§2). `list_subscriptions()` returns
+that one; Advisor is asked once. There were never 71 handshakes on Scale to save. Insights'
+own per-source timings, which it stores in every payload (`timing_ms`) and so in every
+snapshot, confirm it:
+
+| Insights computed (UTC) | tags | waste | rightsizing | commitments | anomalies | advisor |
+|---|---|---|---|---|---|---|
+| 14:36, `9920e2d` warm pass | 31.1s | 22.0s | 15.7s | 11.0s | 9.8s | **0.2s** |
+| 16:41, `d3a6fcb` warm pass | 31.0s | 21.6s | 15.4s | 10.9s | 10.0s | **0.1s** |
+
+Advisor's 7.6–8.8s at 12:49 and 13:26 is what the first Advisor read in a fresh process
+cost when Insights was the view that made it (token, connection and Advisor itself — not
+broken down). Billing opportunities became a target at 13:27, has been first in the pass
+order since, and makes that read; Insights then gets Advisor from the in-process ARM cache
+(same URL, same caller, inside its 300s TTL), hence 0.1–0.2s.
+
+`d3a6fcb` stays: it is correct, the suite passes, and it is what a real estate needs — an
+SSO user whose own token sees many subscriptions, or a customer install that grants the
+identity Reader at management-group scope (the v3 deployment model) fans out exactly as the
+dev-machine profile did. It has not yet been measured end to end on such an estate (§6).
+
+**Insights' cold time is its `tags` source.** `_gather` runs eight sources concurrently and
+waits for the slowest; that is `tags.cost_by_tag`, the Tags tab's full per-resource query
+(25.4s alone, 31s when sharing 2 vCPUs with seven others). `_from_tags` reads three numbers
+from its result: `total`, `untagged.cost`, `untagged.resources`.
 
 Two things were considered and rejected:
 
@@ -347,25 +410,31 @@ process per scenario.**
 
 Done on 30 Sep and no longer pending: server-side warming (`383f72e`), Always On enabled
 on Scale, Anomalies and Billing opportunities cached (`e99b71c`), the cold-path profile and
-both fixes it produced (`9920e2d`, `d3a6fcb` — §5a), and the full suite, which ran at
+both fixes it produced (`9920e2d`, `d3a6fcb` — §5a), `d3a6fcb` deployed and re-measured on
+Scale (no end-to-end change there, and why — §5a), the stale §5 column replaced by
+server-measured cold compute, and the full suite, which ran at
 `d3a6fcb`: **2220 passed, 7 failed, 10 skipped, 1 error, 14m13s with `-n 4`** (log in the
 session folder, §8). See §3–§5.
 
-1. **Deploy `d3a6fcb` to Scale and re-bench the cold path.** `9920e2d` is already live and
-   verified; the shared ARM client is committed but not deployed, and no end-to-end cold
-   timing exists for Insights/Recommendations after it. Bench the three tabs in §5a on a
-   fresh `CLOUDLENS_BUILD_ID` before the warmer has seen the user, and replace the stale
-   column in §5.
-2. **Server-side filtering and paging** (approved by Ravi: "summary tables first, then
+1. **Server-side filtering and paging** (approved by Ravi: "summary tables first, then
    this"). Uptime, Tags, Resources, Billing return KPIs + chart data + one page (~50 rows);
    filters/sort/page as query params; same look and feel; update `tests/browser_*.js` and
    frontend tests. This is what removes the 8–15MB payloads and the 2–4s repeat views.
-3. **Resources cold ~30s.** SQL is ~17s (9.7s narrow ranking over `resource_costs` + ~6s
-   detail gather); the rest is app-side on a 2-vCPU box, including ~2.3s of snapshot-cache
-   body checks on a 15MB answer (`_safe_content` regex scan 1.5s). Paging (item 2) shrinks
-   both.
+2. **Insights: stop running the whole Tags query to read three numbers** (§5a). Its cold
+   time is the `tags` source, 31s; `_from_tags` needs only the window's total, untagged
+   cost and untagged resource count. Serve those from one aggregate over the `tags` usage
+   summary, through the reader like every other tab, and prove it equal to
+   `cost_by_tag`'s `total`/`untagged` at three scopes before switching (§8). The next
+   ceiling is then `waste` (21.6s), then `rightsizing` (15.4s). Small, generic, measured.
+3. **Resources cold ~30s** (26.6s server compute at `d3a6fcb`). SQL is ~17s (9.7s narrow
+   ranking over `resource_costs` + ~6s detail gather); the rest is app-side on a 2-vCPU
+   box, including ~2.3s of snapshot-cache body checks on a 15MB answer (`_safe_content`
+   regex scan 1.5s). Paging (item 1) shrinks both.
 4. **Verify Entra sign-in warming on live** (§4): after a deploy, sign in via SSO, confirm a
    `sign-in` pass runs for that oid (its targets' `computed` moves) and the next views hit.
+   The same sign-in is the only way to measure `d3a6fcb` end to end without a customer
+   estate: if that user's token sees many subscriptions, Insights' stored `timing_ms.advisor`
+   is the fan-out's cost for them (§5a shows how to read it without the admin password).
 5. **The seven pre-existing test failures, still unfixed.** Proved pre-existing on 30 Sep
    by re-running them against a clean tree with `app/cost.py` stashed — all seven fail
    identically, so no 28–30 Sep work caused them:
@@ -413,6 +482,12 @@ session folder, §8). See §3–§5.
   window in any captured SQL before comparing.
 - **Changing an app setting right before `az webapp deploy`** restarted Kudu mid-build
   (see §1). Not a code problem; wait for the restart.
+- **Measuring a live Azure fan-out from the dev machine and treating it as the server's.**
+  The dev credential sees one subscription, so the Advisor profile passed the 71 seeded ids
+  in by hand and measured a 59.4s fan-out Scale never performs — Scale's identity lists one
+  subscription (§2). The fix was right; the prediction that it would move Scale's cold tabs
+  was not (§5a). Before profiling a live Azure call, check what the *server's* caller
+  (`list_subscriptions()` as that identity) returns, and measure on that input.
 - **Measuring warming right after the restart that follows a setting change:** the app
   took ~100s to pass its warm-up probe and the warmer waits 30s more, so the claim did not
   move for ~2.5 min. Check `meta.snapshot_warm_claim.updated_at`, not the clock.
@@ -435,22 +510,34 @@ session folder, §8). See §3–§5.
   and warm-target state read-only; `live_watch.py` follows a warm pass; both bench
   outputs), and `…\session-state\1ccfca3b-…\files\` (the 30 Sep full-suite log
   `suite-d3a6fcb.log` and the clean-tree baseline `suite-baseline-clean-tree.log` that
-  proves the seven failures pre-existing). Not in the repo. Copy the probes into the new
-  session's folder if useful.
+  proves the seven failures pre-existing), and `…\session-state\81c61fc4-…\files\` (the
+  `d3a6fcb` deploy: `cloudlens-d3a6fcb.zip` as deployed, sha256 `3cfe79b5…`;
+  `warm_compare.py`, which snapshots `snapshot_warm_targets`, follows a warm pass and
+  compares two passes, read-only; `warm-before-9920e2d.json` and `warm-after-d3a6fcb.json`,
+  the two passes in §5a). Not in the repo. Copy the probes into the new session's folder if
+  useful.
+- **Cold compute on live without the admin password.** Any deploy (new version digest) makes
+  the warmer recompute every target serially; `warm_compare.py snap` before the deploy and
+  `watch <before> <after>` after it gives a per-view before/after from the server's own
+  timer. Insights also stores per-source `timing_ms` in its body, readable from
+  `private_snapshots` (plain JSON; filter `byte_size < 300000` so large bodies are never
+  detoasted). Neither needs a sign-in; both are read-only.
 
 ---
 
 ## 9. First moves in the new chat
 
 1. `git status` (only `tools/bench-tabs-latest.json` should be dirty) and
-   `git log --oneline -8` — top should be this handover, then `d3a6fcb`, `fbbf999`,
-   `9920e2d`, `e99b71c`, `383f72e`. Scale is running `9920e2d`, so `main` is ahead of
-   live by one code commit that matters (§2).
+   `git log --oneline -8` — top should be this handover, then `399894c`, `571171a`,
+   `94f3439`, `d3a6fcb`, `fbbf999`, `9920e2d`. Scale runs `d3a6fcb`: the same application
+   code as `main` (§2).
 2. Start the Scale database if stopped; confirm the firewall rule for today's IP (§1).
-3. Ask Ravi for the live admin password (process environment only) and re-run
-   `tools\bench_tabs.py` against live for today's baseline. Expect hits almost everywhere:
-   the 19 warm targets were computed after the last deploy and Always On keeps them warm.
-4. Pick up §6 item 1 (deploy `d3a6fcb`, re-bench the cold path, replace the stale §5
-   column), unless Ravi prefers item 2 (paging).
-5. Before believing any number: read §7 first, and re-measure in isolation. Two of the
+3. Baseline without the password: `warm_compare.py snap` (§8) records every warm target's
+   server compute time and whether the last pass finished. Ask Ravi for the live admin
+   password (process environment only) only when a client-side `tools\bench_tabs.py` run
+   is needed — expect hits almost everywhere: 18 of the 19 warm targets were recomputed after
+   the last deploy (Budgets sits below the 1s floor by design) and Always On keeps them warm.
+4. Pick up §6 item 1 (paging), unless Ravi prefers item 2 (Insights' tags source — smaller
+   and measured, but only the cold path benefits).
+5. Before believing any number: read §7 first, and re-measure in isolation. Three of the
    entries there are traps this session walked into and had to back out of.
