@@ -5,11 +5,11 @@ section (§6) and measurement traps (§3) still hold and are not repeated here; 
 performance table, test list and open items are stale.
 
 **State: every data tab on the Scale deployment answers, repeat views come from the
-snapshot cache in 0.1–3.9s, and since `383f72e` the server itself recomputes the views
+snapshot cache in 0.1–3.9s — now including Anomalies and Billing opportunities, which were
+never cached before `e99b71c` — and since `383f72e` the server itself recomputes the views
 people use after a deploy, so the first view after a deploy is a cache hit too
-(Commitments 98.6s → 0.10s, Insights 46.6s → 0.13s). What remains: two views the cache
-refuses to store (Anomalies, Billing opportunities), the tabs that wait on live Azure
-for anyone the warmer has not seen, and payload size.**
+(Commitments 98.6s → 0.10s, Insights 46.6s → 0.13s). What remains: the tabs that wait on
+live Azure for anyone the warmer has not seen, and payload size.**
 
 Everything below is measured on the live Scale deployment or read from the code.
 Guesses say so.
@@ -103,11 +103,11 @@ carry `X-CloudLens-Cache` (`hit`/`miss`/`response-too-large`/…) and `Server-Ti
 | Database | `cloudlens-postgres-scale`, Standard_E2ds_v5, PostgreSQL 18, 2 vCPU |
 | DB settings | `shared_buffers` 4GB, `max_parallel_workers_per_gather` 2, default collation **`en_US.utf8`** |
 | App settings | `PG_WORK_MEM=128MB`, `PG_STATEMENT_TIMEOUT=180s` (read-only connections only), `SNAPSHOT_CACHE_ENABLED=true`, `SNAPSHOT_WARMING_ENABLED=true`, `SNAPSHOT_SERVER_WARMING_ENABLED=true`, `AUTH_ALLOW_LOCAL=true`, `AUTO_INGEST=false`, `AUTO_REFRESH=false` |
-| Platform | One uvicorn worker. **`alwaysOn` is `false`** — drift from `infra/modules/stack.bicep`, which sets it for every paid tier; see §6 item 1 |
+| Platform | One uvicorn worker. `alwaysOn` **enabled 30 Sep** (had drifted to `false` from `infra/modules/stack.bicep`) |
 | Data | 16.9M cost rows, 2026-07-01 → 2026-09-28, 70 subscriptions (HDFC demo) |
 | Sign-in | SSO shows only the user's own RBAC subscriptions; use local `admin` to see all 70 |
 
-Deployed commit: **`383f72e`** (30 Sep, 12:29 UTC). All 11 derived tables stamped.
+Deployed commit: **`e99b71c`** (30 Sep, 13:26 UTC). All 11 derived tables stamped.
 
 ---
 
@@ -122,6 +122,7 @@ Deployed commit: **`383f72e`** (30 Sep, 12:29 UTC). All 11 derived tables stampe
 | `0c1ad5d` | Resources ranks narrowly first, details for winners only; snapshot entry cap 8MB → 32MB, store 256MB → 1GB | 33s → ~17s SQL; 15MB answer was never cached |
 | `a1bc0cd` | Uptime and Tags group on byte-order keys; daily cells only for returned rows | Uptime 34.3s → 3.8s SQL, Tags 151s → 13s SQL |
 | `383f72e` | Server-side snapshot warming (§4) | First view after a deploy: Commitments 98.6s → 0.10s, Insights 46.6s → 0.13s, Recommendations 33.8s → 0.08s, Resources 31.3s → 4.6s, Tags 29.9s → 2.5s |
+| `e99b71c` | Opportunity prices count as evidence; Anomalies declares `partial_basis` | Billing opportunities 12.9s → 0.15s and Anomalies 2.2s → 0.14s on repeat (were never cached) |
 
 `c88bb58` (`plan.md`) is **another session's v3 plan**, not this work.
 
@@ -242,8 +243,8 @@ anyone opened a tab. Session files `bench-deploy1-cold.txt`, `bench-deploy2-warm
 | AI Billing | 500 at 180s | 9.9s | **0.39s** | 0.38s | 47KB |
 | Governance | — | 7.6s | **0.10s** | 0.09s | 17KB |
 | Executive | — | 6.9s | **0.09s** | 0.09s | 17KB |
-| Billing opportunities | — | 13.2s | 12.9s (**never cached**) | 0.1s (in-memory) | 9KB |
-| Anomalies | 2.2s | 2.1s | 2.2s (**never cached**) | 2.2s | 5KB |
+| Billing opportunities | — | 13.2s | 12.9s → **0.15s repeat since `e99b71c`** (was never cached) | 0.15s | 9KB |
+| Anomalies | 2.2s | 2.1s | 2.2s → **0.14s repeat since `e99b71c`** (was never cached) | 0.14s | 5KB |
 | Schedules | — | 8.2s | 8.6s (not a cached route) | 0.08s | 10KB |
 | Budgets | 504 at 240s | 0.3s | 1.5s | 0.19s | 4KB |
 
@@ -255,19 +256,18 @@ Repeat views of Resources/Tags are 2–4s because of payload size, not queries.
 
 ## 6. Pending work — in the order I would do it
 
-1. **Enable Always On for Scale** (needs Ravi's go-ahead; free on B2). Live has
-   `alwaysOn: false`, so after 20 idle minutes the process is unloaded and warm passes for
-   a publish or the UTC day boundary wait until the next visitor starts it. Stored
-   snapshots survive an unload (they are in PostgreSQL), so this affects only *when* a pass
-   runs. `az webapp config set -g CloudLens-Scale -n cloudlens-web-scale --always-on true`.
-2. **Anomalies and Billing opportunities are never cached** (`X-CloudLens-Cache:
-   source-incomplete` on every view). Measured 30 Sep on live: both bodies carry
-   `partial: true` (Anomalies also `unavailable: true`; Billing opportunities
-   `status: partial`, `potential.partial`, `commitments.partial`) and **no** non-zero money
-   field, so `_cacheable_report` and `_partial_body` both refuse them as failure-shaped.
-   Decide per view whether that partial answer is a genuine result (cache it with
-   `PARTIAL_TTL`, e.g. by carrying its evidence in a recognised field) or a real failure
-   to fix at source. Until then warming cannot help them: 12.9s and 2.2s on every view.
+1. **Done 30 Sep: Always On enabled on Scale** (`az webapp config set --always-on true`),
+   so warm passes for a publish or the UTC day boundary run on time instead of waiting
+   for the next visitor after an idle unload.
+2. **Done 30 Sep (`e99b71c`): Anomalies and Billing opportunities are cached.** Both had
+   returned `source-incomplete` on every view. Billing opportunities carried money only
+   in `monthly_savings`/`annual_savings`, which the cache's evidence scan did not know;
+   now it does. Anomalies has 0 of 6,020 subscription-days verified by FOCUS receipts on
+   this demo estate, so it honestly reports unavailable with no money; `analyse()` now
+   declares `partial_basis: "data"` (or `"source"` when receipts are unreadable or a real
+   currency has no rate) and the cache keeps a clean `"data"` report for the normal TTL.
+   Live: repeat views 0.14s / 0.15s, both now warm targets. Any other report whose
+   partial coverage is a property of the data can opt in with the same field.
 3. **Commitments, Insights, Recommendations cold for anyone the warmer has not seen** (a
    new Entra user, a new filter): 98.6s / 46.6s / 33.8s. These wait on live
    Azure/Advisor/AI calls; not yet profiled. Profile first — the collation and "discarded
@@ -342,4 +342,5 @@ Repeat views of Resources/Tags are 2–4s because of payload size, not queries.
 2. Start the Scale database if stopped; confirm the firewall rule for today's IP.
 3. Re-run `tools\bench_tabs.py` against live to get today's baseline (password from Ravi,
    in the process environment only).
-4. Ask Ravi about §6 item 1 (Always On), then pick up §6 item 2 (the two uncached views).
+4. Pick up §6 item 3 (profile Commitments, Insights, Recommendations cold) or item 4
+   (server-side paging), as Ravi prefers.
