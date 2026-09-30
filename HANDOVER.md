@@ -44,10 +44,11 @@ Guesses say so.
 5. **Never edit source while pytest runs** — several tests read or `exec` source.
    Run the full suite **detached** (§1); attached runs were killed by interruptions.
 6. **`main` is pushed to `backup/cloud-lens-v2/main`** (private repo `samy6352/CloudLensv2`)
-   through `34ba93d`, 30 Sep ~22:40 IST, at Ravi's instruction. Anything newer is
-   unpushed — count with `git rev-list --count backup/cloud-lens-v2/main..main` rather than
-   trusting a number written here. Git Credential Manager holds working credentials (that
-   push needed no prompt). **Still ask Ravi before every push.**
+   at Ravi's instruction — last on 30 Sep ~23:59 IST, and that push included the handover
+   commit that says so. Anything newer is unpushed — count with
+   `git rev-list --count backup/cloud-lens-v2/main..main` rather than trusting a number
+   written here. Git Credential Manager holds working credentials (pushes need no prompt).
+   **Still ask Ravi before every push.**
 7. **The live admin password is never written down.** Ask Ravi and pass it only in the
    process environment. It was typed into the 30 Sep chat, so Ravi was asked to rotate it —
    if the old one still works, remind him.
