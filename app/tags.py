@@ -465,6 +465,122 @@ def cost_by_tag(scope: list[str] | None = None, days: int = 30,
     }
 
 
+def untagged_summary(scope: list[str] | None = None, days: int = 30,
+                     currency: str | None = None) -> dict[str, Any]:
+    """The three numbers Insights reads from the Tags tab, without building the tab.
+
+    Insights needs only the window's total, the untagged cost and the untagged resource
+    count. `cost_by_tag` spends most of its time on what the tab draws -- a per-resource
+    per-day grain with inline daily cells and every tag set -- which was 31s of Insights'
+    cold time on the live estate for three scalars.
+
+    Same inputs and the same arithmetic as `cost_by_tag`: one row per resource and
+    currency, ranked and cut at `MAX_RESOURCES` exactly as the tab cuts, the display
+    currency chosen the same way, and a resource untagged only when it carried no tags on
+    any day in the window and its tag knowledge is complete. So the finding and the Tags
+    tab it links to report the same figures. `tests/test_usage_summaries.py` holds the two
+    equal, routed and on the detail table, at three scopes.
+    """
+    from . import reporting, resource_tags
+
+    days = reporting.period_days(days)
+    if scope is not None and not scope:
+        return _summary_empty(days)
+    from .warehouse import warehouse
+
+    with warehouse.reader(scope=scope, currency=currency, usage=("tags",)) as r:
+        agg = getattr(r, "agg", "costs")
+        tag_source = getattr(r, "tags", None)
+        named = getattr(r, "named", "costs") if tag_source else "costs"
+        edge = r.rows(f'SELECT max("ChargePeriodStart") AS hi FROM {agg}')
+        hi = edge[0]["hi"] if edge and edge[0]["hi"] else None
+        if hi is None:
+            return _summary_empty(days)
+
+        start = reporting.start_sql(hi, days)
+        window = f'"ChargePeriodStart" > {start}'
+        totals = r.rows(
+            'SELECT COALESCE(NULLIF("BillingCurrency", \'\'), \'unknown\') AS currency, '
+            'SUM(COALESCE("BilledCost", 0)) AS cost '
+            f'FROM {agg} WHERE {window} GROUP BY 1',
+            limit=MAX_RESOURCES + 1,
+        )
+        currency, mixed = _dominant(totals)
+        display_window = window
+        if mixed:
+            code = currency.replace("'", "''")
+            display_window += f' AND COALESCE(NULLIF("BillingCurrency", \'\'), \'unknown\') = \'{code}\''
+
+        identity = "COALESCE(NULLIF(\"ResourceId\", ''), \"ResourceName\", '(unnamed)')"
+        money = "COALESCE(NULLIF(\"BillingCurrency\", ''), 'unknown')"
+        if tag_source:
+            # Grouped byte for byte, as the tab groups: the same groups, without sorting
+            # millions of long ids under the linguistic collation. The id returns to the
+            # default collation for the ranking tie-break and the tag lookup's index.
+            rows = r.rows(
+                f"""
+                WITH per AS (
+                  SELECT {identity} COLLATE "C" AS id, {money} AS currency,
+                         SUM(COALESCE("BilledCost", 0)) AS cost
+                  FROM {named} WHERE {display_window}
+                  GROUP BY 1, 2
+                ), top AS (
+                  SELECT per.id COLLATE "default" AS id, currency, cost FROM per
+                  ORDER BY cost DESC, 1, currency
+                  LIMIT {MAX_RESOURCES + 1}
+                )
+                SELECT top.cost,
+                       CASE WHEN tg.tags IS NOT NULL THEN 'tagged'
+                            WHEN tg.unknown THEN 'unknown' ELSE 'untagged' END AS status
+                FROM top
+                {resource_tags.lateral_sql(tag_source, "top.id", "top.currency", start, str(hi)[:10])}
+                ORDER BY top.cost DESC, top.id, top.currency
+                """,
+                limit=MAX_RESOURCES + 1,
+            )
+        else:
+            rows = r.rows(
+                f"""
+                SELECT SUM(COALESCE("BilledCost", 0)) AS cost,
+                       CASE WHEN MAX(CASE WHEN {resource_tags.TAGGED} THEN "Tags" END) IS NOT NULL
+                            THEN 'tagged'
+                            WHEN BOOL_AND(NOT {resource_tags.UNKNOWN}) THEN 'untagged'
+                            ELSE 'unknown' END AS status
+                FROM costs WHERE {display_window}
+                GROUP BY {identity}, {money}
+                ORDER BY cost DESC, {identity}, {money}
+                """,
+                limit=MAX_RESOURCES + 1,
+            )
+
+    truncated = len(rows) > MAX_RESOURCES
+    rows = rows[:MAX_RESOURCES]
+    # Summed per status in the tab's order, and totalled as the tab totals, so the rounded
+    # figures are the tab's to the cent.
+    sums = {"tagged": 0.0, "untagged": 0.0, "unknown": 0.0}
+    untagged_count = 0
+    for row in rows:
+        status = row.get("status") or "unknown"
+        sums[status] += float(row.get("cost") or 0.0)
+        untagged_count += status == "untagged"
+    untagged_cost = sums["untagged"]
+    return {
+        "currency": currency,
+        "mixed": mixed,
+        "total": round(sums["tagged"] + sums["untagged"] + sums["unknown"], 2),
+        "untagged": {"cost": round(untagged_cost, 2), "resources": untagged_count},
+        "truncated": truncated,
+        "days": days,
+        "latest": str(hi),
+    }
+
+
+def _summary_empty(days: int) -> dict[str, Any]:
+    return {"currency": None, "mixed": False, "total": 0.0,
+            "untagged": {"cost": 0.0, "resources": 0}, "truncated": False,
+            "days": days, "latest": None}
+
+
 def _empty(days: int) -> dict[str, Any]:
     return {"keys": [], "platform_keys": 0, "resources": [], "values": [],
             "currency": None, "mixed": False,

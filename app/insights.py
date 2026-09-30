@@ -174,7 +174,9 @@ async def _gather(subs: list[str] | None, days: int,
                              display_currency=currency)
 
     async def tags_of() -> Any:
-        return await offload(tags.cost_by_tag, subs, days=days, currency=currency)
+        # Only the total and the untagged figures are read (`_from_tags`); building the
+        # whole Tags tab for them was this source's entire 31s on the live estate.
+        return await offload(tags.untagged_summary, subs, days=days, currency=currency)
 
     async def commitments_of() -> Any:
         c = get_commitments()

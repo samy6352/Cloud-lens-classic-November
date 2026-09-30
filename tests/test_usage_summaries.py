@@ -240,6 +240,51 @@ def test_tags_money_and_daily_series_match_the_detail_table_query(wh, monkeypatc
     assert shape(routed) == shape(plain)
 
 
+def _untagged(scope, currency=None):
+    from app import reporting, tags
+
+    with reporting.select(None):
+        return tags.untagged_summary(scope, days=30, currency=currency)
+
+
+def _tag_figures(result):
+    return (result["currency"], result["total"], result["untagged"], result["truncated"])
+
+
+@pytest.mark.parametrize("cap", [None, 3])
+@pytest.mark.parametrize("scope", [None, SUBS, SUBS[:1]])
+def test_insights_untagged_summary_is_the_tags_tab_figures(wh, monkeypatch, scope, cap):
+    """Insights reads three figures from the Tags tab; the slim summary must report
+    exactly those -- routed, on the detail table, and when the tab truncates."""
+    from app import tags
+
+    if cap:
+        monkeypatch.setattr(tags, "MAX_RESOURCES", cap)
+    tab = _tags(scope)
+    assert _tag_figures(_untagged(scope)) == _tag_figures(tab)
+    if cap is None:
+        assert tab["untagged"]["resources"] > 0, "the fixture must carry untagged spend"
+
+    original = wh.reader
+
+    @contextmanager
+    def detail_only(*args, **kwargs):
+        with original(*args, **kwargs) as r:
+            r.tags = None
+            yield r
+
+    monkeypatch.setattr(wh, "reader", detail_only)
+    assert _tag_figures(_untagged(scope)) == _tag_figures(_tags(scope))
+
+
+def test_insights_untagged_summary_follows_the_display_currency(wh, monkeypatch):
+    from app import currency
+
+    monkeypatch.setattr(currency, "rate_to", lambda target: 83.0)
+    assert _tag_figures(_untagged(SUBS, "INR")) == _tag_figures(_tags(SUBS, "INR"))
+    assert _untagged([])["total"] == 0.0
+
+
 def test_latest_tags_in_the_window_win_across_a_month_boundary(wh):
     result = _tags(SUBS)
     vm = next(r for r in result["resources"] if r["name"] == "vm0")
