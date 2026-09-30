@@ -471,6 +471,133 @@ def test_warm_hit_reauthorizes_no_origin_or_database_writes_and_etag():
     asyncio.run(scenario())
 
 
+# A large answer: rows well past the 1KB gzip floor, with the partial flag at the very end so
+# the coverage walk has to visit every row to find it.
+BIG = {"total": 1234.5, "currency": "USD",
+       "resources": [{"id": f"/subscriptions/s/resourcegroups/rg/providers/x/vm-{n}",
+                      "cost": n + 0.25, "tags": [{"key": "team", "value": f"t{n % 7}"}]}
+                     for n in range(400)],
+       "truncated": True}
+GZIP = [(b"accept-encoding", b"gzip, deflate, br")]
+
+
+@pytest.mark.parametrize("payload,coverage", [(BIG, "partial"),
+                                              ({**BIG, "truncated": False}, "as-reported")])
+def test_hit_serves_bytes_prepared_at_write_without_reparsing(monkeypatch, payload, coverage):
+    import gzip as gz
+
+    import app.snapshot_cache as snapshot_cache
+
+    async def scenario():
+        cache, auth = make_cache(), Authorize()
+        cache.store.max_payload = 10 ** 7
+
+        async def origin():
+            return JSONResponse(payload)
+
+        await cache.start()
+        first = await cache.get(request(headers=GZIP), origin, auth)
+        stored = cache.store.rows[next(iter(cache.store.rows))]
+        assert stored.coverage == coverage
+        assert json.loads(gz.decompress(stored.gzipped)) == payload
+
+        def no_parse(*args, **kwargs):
+            raise AssertionError("a cache hit must not parse the stored body")
+
+        # Every hit below is served from what the write prepared: no parse, no walk.
+        monkeypatch.setattr(snapshot_cache.json, "loads", no_parse)
+        packed = await cache.get(request(headers=GZIP), origin, auth)
+        plain = await cache.get(request(), origin, auth)
+        monkeypatch.undo()
+
+        for response in (first, packed, plain):
+            assert response.headers["x-cloudlens-coverage"] == coverage
+            assert response.headers["vary"] == "Accept-Encoding"
+        assert packed.headers["x-cloudlens-cache"] == "hit"
+        assert packed.headers["content-encoding"] == "gzip"
+        assert packed.body == stored.gzipped
+        assert json.loads(gz.decompress(packed.body)) == payload
+        assert "content-encoding" not in plain.headers
+        assert plain.body == stored.body and json.loads(plain.body) == payload
+        assert packed.headers["etag"] == plain.headers["etag"] == first.headers["etag"]
+        await cache.close()
+
+    asyncio.run(scenario())
+
+
+def test_hit_on_a_snapshot_stored_before_prepared_bytes_existed_behaves_as_before():
+    async def scenario():
+        cache, auth = make_cache(), Authorize()
+        cache.store.max_payload = 10 ** 7
+
+        async def origin():
+            return JSONResponse(BIG)
+
+        await cache.start()
+        await cache.get(request(), origin, auth)
+        key = next(iter(cache.store.rows))
+        cache.store.rows[key] = replace(cache.store.rows[key], coverage="", gzipped=None)
+
+        async def must_not_run():
+            raise AssertionError("a valid hit must not call the origin")
+
+        legacy = await cache.get(request(headers=GZIP), must_not_run, auth)
+        assert legacy.headers["x-cloudlens-cache"] == "hit"
+        assert legacy.headers["x-cloudlens-coverage"] == "partial"
+        # Sent plain, for GZipMiddleware to compress exactly as it did before.
+        assert "content-encoding" not in legacy.headers
+        assert json.loads(legacy.body) == BIG
+        await cache.close()
+
+    asyncio.run(scenario())
+
+
+def test_small_answer_is_not_stored_twice():
+    async def scenario():
+        cache, auth = make_cache(), Authorize()
+
+        async def origin():
+            return JSONResponse({"total": 12})
+
+        await cache.start()
+        await cache.get(request(), origin, auth)
+        stored = next(iter(cache.store.rows.values()))
+        assert (stored.coverage, stored.gzipped) == ("as-reported", None)
+        hit = await cache.get(request(headers=GZIP), origin, auth)
+        assert "content-encoding" not in hit.headers
+        assert json.loads(hit.body) == {"total": 12}
+        await cache.close()
+
+    asyncio.run(scenario())
+
+
+def test_stored_gzip_passes_through_gzip_middleware_exactly_once():
+    from starlette.middleware.gzip import GZipMiddleware
+
+    app, cache, auth, calls = FastAPI(), make_cache(), Authorize(), []
+    cache.store.max_payload = 10 ** 7
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+    @app.get(PATH)
+    async def endpoint(request: Request):
+        calls.append(1)
+        return JSONResponse(BIG)
+
+    install_snapshot_routes(app, lambda: cache, auth)
+    with TestClient(app) as client:
+        miss = client.get(PATH, headers={"Accept-Encoding": "gzip"})
+        hit = client.get(PATH, headers={"Accept-Encoding": "gzip"})
+        plain = client.get(PATH, headers={"Accept-Encoding": "identity"})
+    assert calls == [1]
+    assert hit.headers["x-cloudlens-cache"] == "hit"
+    for response in (miss, hit):
+        assert response.headers["content-encoding"] == "gzip"
+        # The client removes one layer; a doubly compressed body would not parse.
+        assert response.json() == BIG
+    assert "content-encoding" not in plain.headers
+    assert plain.json() == BIG
+
+
 def test_period_family_serves_previous_snapshot_and_refreshes_exact_key():
     async def scenario():
         now = [1000.0]
@@ -1623,6 +1750,66 @@ def test_postgres_new_cache_instance_reads_persistent_snapshot(postgres_warehous
         await restarted.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.postgres
+@pytest.mark.usefixtures("ready_cache_warehouse")
+def test_postgres_prepared_bytes_round_trip_and_old_rows_still_serve(postgres_warehouse):
+    import gzip as gz
+
+    store = SnapshotStore(postgres_warehouse.connect)
+    store.initialize()
+    body = json.dumps(BIG).encode()
+    packed = gz.compress(body, 6, mtime=0)
+    item = Snapshot("prepared", "partition", "0", body, 100, 110, 200, '"etag"',
+                    coverage="partial", gzipped=packed)
+    assert store.put(item)
+    loaded = store.load("prepared", "partition", 105)[0]
+    assert (loaded.body, loaded.coverage, loaded.gzipped) == (body, "partial", packed)
+    assert store.load_family("prepared", "partition", 105).gzipped == packed
+
+    # A row written by the previous code: no coverage, no gzip copy.
+    with postgres_warehouse.connect() as con:
+        con.execute(
+            "INSERT INTO private_snapshots (cache_key,partition_hash,family_key,"
+            "source_generation,body,created,expires,retain_until,etag,byte_size) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            ["old", "partition", "old", "0", '{"total":12}', 100, 110, 200, '"old"', 12])
+    old = store.load("old", "partition", 105)[0]
+    assert (old.body, old.coverage, old.gzipped) == (b'{"total":12}', "", None)
+
+    # Rewriting a key replaces its prepared bytes rather than keeping a stale copy.
+    assert store.put(replace(item, created=101, body=b'{"total":13}', coverage="as-reported",
+                             gzipped=None))
+    again = store.load("prepared", "partition", 105)[0]
+    assert (again.body, again.coverage, again.gzipped) == (b'{"total":13}', "as-reported", None)
+
+
+@pytest.mark.postgres
+def test_postgres_existing_snapshot_table_gains_prepared_columns_in_place(postgres_warehouse):
+    # The shape deployed before this change, with a row in it: initialize must add the new
+    # columns without disturbing what is already stored.
+    with postgres_warehouse.connect() as con:
+        con.execute("DROP TABLE IF EXISTS private_snapshots")
+        con.execute("""CREATE TABLE private_snapshots (
+            cache_key TEXT PRIMARY KEY, partition_hash TEXT NOT NULL,
+            family_key TEXT NOT NULL DEFAULT '',
+            source_generation TEXT NOT NULL, body TEXT NOT NULL,
+            created DOUBLE PRECISION NOT NULL, expires DOUBLE PRECISION NOT NULL,
+            retain_until DOUBLE PRECISION NOT NULL, etag TEXT NOT NULL,
+            byte_size BIGINT NOT NULL, failures INTEGER NOT NULL DEFAULT 0,
+            retry_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+            error_code TEXT NOT NULL DEFAULT '')""")
+        con.execute(
+            "INSERT INTO private_snapshots (cache_key,partition_hash,family_key,"
+            "source_generation,body,created,expires,retain_until,etag,byte_size) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            ["kept", "partition", "kept", "0", '{"total":7}', 100, 110, 9e12, '"kept"', 11])
+    store = SnapshotStore(postgres_warehouse.connect)
+    store.initialize()
+    store.initialize()
+    kept = store.load("kept", "partition", 105)[0]
+    assert (kept.body, kept.coverage, kept.gzipped) == (b'{"total":7}', "", None)
 
 
 @pytest.mark.postgres

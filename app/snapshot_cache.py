@@ -21,11 +21,16 @@ reads. Source-revision write fences, private keys and coverage rules still apply
 Views people use are also recorded as warm targets (identity, path, normalised query and
 cost; never a credential) so `snapshot_warmer` can compute them again after a deploy,
 publish or UTC day boundary through `SnapshotCache.warm`, before anyone asks.
+
+A hit sends stored bytes and nothing else. The coverage header and a gzip copy of the body
+are derived once, off the event loop, when a snapshot is written -- not on every view (see
+`_prepared`).
 """
 from __future__ import annotations
 
 import asyncio
 import functools
+import gzip
 import hashlib
 import json
 import logging
@@ -47,6 +52,7 @@ from fastapi.routing import APIRoute, request_response
 from starlette.requests import Request
 from starlette.responses import Response
 
+from .assets import _accepts_gzip
 from .store import PoolBusy
 
 try:
@@ -317,6 +323,31 @@ class Snapshot:
     error: str = ""
     scope: tuple[str, ...] | None = None
     family_key: str = ""
+    # Derived from `body` when it is written (`_prepared`). Empty/None on rows written before
+    # these were stored; `_response` then derives the header the old way, per view.
+    coverage: str = ""
+    gzipped: bytes | None = None
+
+
+# A cache hit used to pay for the body on every view. Measured on the live Resources answer
+# (14.6MB), per hit, on a dev laptop: `json.loads` 231ms plus a walk of every row for the one
+# `X-CloudLens-Coverage` header, 791ms together, then `GZipMiddleware` recompressing the same
+# bytes at level 9, 253ms -- about 1s of CPU, the parse and walk on the event loop, where every
+# other request waits behind them. Live repeat views scaled with body size (Uptime 7.8MB 1.6s,
+# Tags 10.5MB 2.3-3.9s, Resources 15.3MB 3.7s). Both are now derived once per write.
+#
+# Level 6 rather than the middleware's 9: on that body it is 40% faster and 1% smaller. The
+# floor matches `GZipMiddleware(minimum_size=1024)` in main.py -- below it both send plain.
+_GZIP_LEVEL = 6
+_GZIP_MIN_BYTES = 1024
+
+
+def _prepared(body: bytes) -> tuple[str, bytes | None]:
+    """The coverage header and gzip copy a stored body is served with. CPU-bound; thread it."""
+    coverage = "partial" if _partial_evidence(json.loads(body)) else "as-reported"
+    packed = (gzip.compress(body, _GZIP_LEVEL, mtime=0)
+              if len(body) >= _GZIP_MIN_BYTES else None)
+    return coverage, packed
 
 
 class SnapshotBusy(RuntimeError):
@@ -367,6 +398,12 @@ class SnapshotStore:
                     error_code TEXT NOT NULL DEFAULT ''
                 )""")
                 con.execute("ALTER TABLE private_snapshots ADD COLUMN IF NOT EXISTS family_key TEXT")
+                # Derived at write time so a hit does not re-derive them (`_prepared`). Rows
+                # from before these existed keep '' / NULL and are served the old way.
+                con.execute("ALTER TABLE private_snapshots "
+                            "ADD COLUMN IF NOT EXISTS coverage TEXT NOT NULL DEFAULT ''")
+                con.execute("ALTER TABLE private_snapshots "
+                            "ADD COLUMN IF NOT EXISTS body_gzip BYTEA")
                 con.execute(
                     "CREATE INDEX IF NOT EXISTS private_snapshots_family_idx "
                     "ON private_snapshots (family_key,partition_hash,created DESC)")
@@ -416,14 +453,19 @@ class SnapshotStore:
     def _snapshot(row, scope=None):
         values = list(row)
         values[3] = values[3].encode("utf-8")
-        return Snapshot(*values[:11], scope=scope, family_key=values[11] or "")
+        packed = values[13]
+        return Snapshot(*values[:11], scope=scope, family_key=values[11] or "",
+                        coverage=values[12] or "",
+                        gzipped=bytes(packed) if packed is not None else None)
+
+    _COLUMNS = ("cache_key,partition_hash,source_generation,body,created,expires,"
+                "retain_until,etag,failures,retry_at,error_code,family_key,coverage,body_gzip")
 
     def load(self, key: str, partition: str, now: float, scope=None):
         with self.connect() as con:
             generation = self.generation(con, scope)
             row = con.execute(
-                "SELECT cache_key,partition_hash,source_generation,body,created,expires,"
-                "retain_until,etag,failures,retry_at,error_code,family_key FROM private_snapshots "
+                f"SELECT {self._COLUMNS} FROM private_snapshots "
                 "WHERE cache_key=? AND partition_hash=? AND retain_until>?",
                 [key, partition, now]).fetchone()
         if row:
@@ -433,8 +475,7 @@ class SnapshotStore:
     def load_family(self, family_key: str, partition: str, now: float, scope=None):
         with self.connect() as con:
             row = con.execute(
-                "SELECT cache_key,partition_hash,source_generation,body,created,expires,"
-                "retain_until,etag,failures,retry_at,error_code,family_key FROM private_snapshots "
+                f"SELECT {self._COLUMNS} FROM private_snapshots "
                 "WHERE family_key=? AND partition_hash=? AND retain_until>? "
                 "ORDER BY created DESC,cache_key LIMIT 1",
                 [family_key, partition, now]).fetchone()
@@ -461,18 +502,20 @@ class SnapshotStore:
                 row = con.execute(
                     "INSERT INTO private_snapshots "
                     "(cache_key,partition_hash,family_key,source_generation,body,created,expires,"
-                    "retain_until,etag,byte_size) VALUES (?,?,?,?,?,?,?,?,?,?) "
+                    "retain_until,etag,byte_size,coverage,body_gzip) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
                     "ON CONFLICT(cache_key) DO UPDATE SET "
                     "partition_hash=excluded.partition_hash,"
                     "family_key=excluded.family_key,"
                     "source_generation=excluded.source_generation,body=excluded.body,"
                     "created=excluded.created,expires=excluded.expires,"
                     "retain_until=excluded.retain_until,etag=excluded.etag,"
-                    "byte_size=excluded.byte_size,failures=0,retry_at=0,error_code='' "
+                    "byte_size=excluded.byte_size,coverage=excluded.coverage,"
+                    "body_gzip=excluded.body_gzip,failures=0,retry_at=0,error_code='' "
                     "WHERE private_snapshots.created<=excluded.created RETURNING cache_key",
                     [item.key, item.partition, family, item.generation, item.body.decode("utf-8"),
                      item.created, item.expires, item.retain_until, item.etag,
-                     len(item.body)]).fetchone()
+                     len(item.body), item.coverage, item.gzipped]).fetchone()
                 self._prune(con, item.created)
                 con.execute("COMMIT")
                 return bool(row)
@@ -1193,12 +1236,14 @@ class SnapshotCache:
                     return self._source_state(response, "source-incomplete", generation)
                 if _source_pending(generation):
                     return self._source_state(response, "source-pending", generation)
+                coverage, packed = await asyncio.to_thread(_prepared, body)
                 item = Snapshot(key, partition, generation, body, started,
                                 started + ttl, started + policy.retention,
                                 '"' + _digest([generation, self.version,
                                                hashlib.sha256(body).hexdigest()]) + '"',
                                 scope=context.selected, family_key=cache_family_key(
-                                    request, context, self.version, policy))
+                                    request, context, self.version, policy),
+                                coverage=coverage, gzipped=packed)
                 try:
                     accepted = await self._db(self.store.put, item)
                 except SnapshotBusy:
@@ -1253,7 +1298,7 @@ class SnapshotCache:
             "X-CloudLens-Age": str(max(0, int(self.clock() - item.created))),
             "X-CloudLens-Stale": str(stale).lower(),
             "X-CloudLens-Revalidating": str(revalidating).lower(),
-            "X-CloudLens-Coverage": (
+            "X-CloudLens-Coverage": item.coverage or (
                 "partial" if _partial_evidence(json.loads(item.body)) else "as-reported"),
         }
         if self.policies[request.url.path].daily:
@@ -1271,8 +1316,17 @@ class SnapshotCache:
             headers["Retry-After"] = str(max(1, int(item.retry_at - self.clock())))
         tags = request.headers.get("if-none-match", "").split(",")
         unchanged = any(tag.strip().removeprefix("W/") in {item.etag, "*"} for tag in tags)
-        return Response(b"" if unchanged else item.body, status_code=304 if unchanged else 200,
-                        media_type="application/json", headers=headers)
+        if unchanged:
+            return Response(b"", status_code=304, media_type="application/json", headers=headers)
+        # The stored gzip copy goes out as-is; `GZipMiddleware` passes a response that already
+        # carries Content-Encoding straight through, so the body is not compressed again.
+        headers["Vary"] = "Accept-Encoding"
+        if item.gzipped is not None and _accepts_gzip(request.headers.get("accept-encoding", "")):
+            headers["Content-Encoding"] = "gzip"
+            return Response(item.gzipped, status_code=200, media_type="application/json",
+                            headers=headers)
+        return Response(item.body, status_code=200, media_type="application/json",
+                        headers=headers)
 
 
 def install_snapshot_routes(app, cache: Callable[[], SnapshotCache | None],
