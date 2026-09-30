@@ -39,11 +39,11 @@ Guesses say so.
    at import time. Scope isolation depends on per-connection temp views (§4).
 5. **Never edit source while pytest runs** — several tests read or `exec` source.
    Run the full suite **detached** (§1); attached runs were killed by interruptions.
-6. **Nothing after `e42bfef` is pushed to `backup/cloud-lens-v2/main`** — 22 commits
-   including this handover; count with `git rev-list --count backup/cloud-lens-v2/main..main`
-   rather than trusting a number here (the last two handovers each went stale by the commit
-   that recorded them). `git push` needs credentials that are not cached on this machine.
-   Ask Ravi before pushing.
+6. **`main` is pushed to `backup/cloud-lens-v2/main`** (private repo `samy6352/CloudLensv2`)
+   through this handover, 30 Sep ~22:40 IST, at Ravi's instruction. Anything newer is
+   unpushed — count with `git rev-list --count backup/cloud-lens-v2/main..main` rather than
+   trusting a number written here. Git Credential Manager holds working credentials (that
+   push needed no prompt). **Still ask Ravi before every push.**
 7. **The live admin password is never written down.** Ask Ravi and pass it only in the
    process environment. It was typed into the 30 Sep chat, so Ravi was asked to rotate it —
    if the old one still works, remind him.
