@@ -1,4 +1,4 @@
-# CloudLens — handover, 30 September 2026 (updated 18:40 IST)
+# CloudLens — handover, 30 September 2026 (final, 19:05 IST)
 
 Supersedes the 28 Sep handover, kept as `HANDOVER-2026-09-28.md`. Its architecture
 section (§6) and measurement traps (§3) still hold and are not repeated here; its
@@ -31,9 +31,12 @@ Guesses say so.
    at import time. Scope isolation depends on per-connection temp views (§4).
 5. **Never edit source while pytest runs** — several tests read or `exec` source.
    Run the full suite **detached** (§1); attached runs were killed by interruptions.
-6. **Nothing after `e42bfef` has been pushed to the `backup` remote.**
-   `git push` needs credentials that are not cached on this machine. Ask Ravi before
-   pushing.
+6. **`main` is 14 commits ahead of `backup/cloud-lens-v2/main`** (nothing after `e42bfef`
+   is pushed). `git push` needs credentials that are not cached on this machine. Ask Ravi
+   before pushing.
+7. **The live admin password is never written down.** Ask Ravi and pass it only in the
+   process environment. It was typed into the 30 Sep chat, so Ravi was asked to rotate it —
+   if the old one still works, remind him.
 
 ---
 
@@ -221,10 +224,26 @@ its original two queries.
 - Verified on live 30 Sep: bench recorded 16 targets for `env:admin`; forcing a new version
   (`CLOUDLENS_BUILD_ID`) → pass claimed 12:49:04 UTC, all 16 computed by 12:54:09 (≈5 min,
   serial); a restart on an already-warm version claimed its pass and recomputed nothing.
+  After the `e99b71c` deploy the pass computed all 19 current targets (≈5–6 min).
+- **Not yet verified on live: Entra sign-in warming.** Every live test used local `admin`.
+  It is covered by tests (`test_snapshot_warming.py`, incl. replay through the real
+  `main.app`), but nobody has signed in via SSO after a deploy and checked the pass.
+- The benchmark itself creates targets (it signs in as `admin` and opens every tab), so
+  running it on a new deploy both measures cold views and registers them for warming.
+- A target whose warm computation is cheap drops below the 1s floor and stops being warmed
+  (live: `/api/budgets` recomputed in 0.0s, so it is skipped from now on) — by design.
+
+**Partial-report rules** (`e99b71c`): `monthly_savings` and `annual_savings` count as
+money evidence. A report may declare `"partial_basis": "data"` when its partial coverage is
+a property of the committed data (missing receipts, no rows); the cache then keeps it for
+the normal TTL and the generation fence retires it on new data. `"source"` (a failed read),
+a missing basis, errors and unfinished jobs are still refused. Only Anomalies declares it
+today (`anomalies.RECEIPTS_UNREADABLE` / `NO_VERIFIED_RATE` mark the `"source"` cases; a
+row with *no* currency code is data, a real code with no rate is source).
 
 ---
 
-## 5. Performance — live, 30 Sep after `383f72e`
+## 5. Performance — live, 30 Sep after `383f72e` and `e99b71c`
 
 `tools\bench_tabs.py`, full runs. "Cold" = first view right after the deploy of `383f72e`,
 before any warm targets existed. "After warming" = first view on a *new* app version
@@ -256,39 +275,35 @@ Repeat views of Resources/Tags are 2–4s because of payload size, not queries.
 
 ## 6. Pending work — in the order I would do it
 
-1. **Done 30 Sep: Always On enabled on Scale** (`az webapp config set --always-on true`),
-   so warm passes for a publish or the UTC day boundary run on time instead of waiting
-   for the next visitor after an idle unload.
-2. **Done 30 Sep (`e99b71c`): Anomalies and Billing opportunities are cached.** Both had
-   returned `source-incomplete` on every view. Billing opportunities carried money only
-   in `monthly_savings`/`annual_savings`, which the cache's evidence scan did not know;
-   now it does. Anomalies has 0 of 6,020 subscription-days verified by FOCUS receipts on
-   this demo estate, so it honestly reports unavailable with no money; `analyse()` now
-   declares `partial_basis: "data"` (or `"source"` when receipts are unreadable or a real
-   currency has no rate) and the cache keeps a clean `"data"` report for the normal TTL.
-   Live: repeat views 0.14s / 0.15s, both now warm targets. Any other report whose
-   partial coverage is a property of the data can opt in with the same field.
-3. **Commitments, Insights, Recommendations cold for anyone the warmer has not seen** (a
-   new Entra user, a new filter): 98.6s / 46.6s / 33.8s. These wait on live
-   Azure/Advisor/AI calls; not yet profiled. Profile first — the collation and "discarded
-   pass" patterns were only found by timing statements.
-4. **Server-side filtering and paging** (approved by Ravi: "summary tables first, then
+Done on 30 Sep and no longer pending: server-side warming (`383f72e`), Always On enabled
+on Scale, Anomalies and Billing opportunities cached (`e99b71c`). See §3–§5.
+
+1. **Commitments, Insights, Recommendations are slow for anyone the warmer has not seen**
+   — a new Entra user, a new filter, a new scope: 98.6s / 46.6s / 33.8s cold. They wait on
+   live Azure/Advisor/AI calls and have never been profiled. Profile first on live, call by
+   call (`live_probe.py`-style read-only access + timing the app's real code path, §1) —
+   the collation and "discarded pass" wins were only found by timing statements. Look for
+   serial per-subscription Azure calls over 70 subscriptions, and repeated reads.
+2. **Server-side filtering and paging** (approved by Ravi: "summary tables first, then
    this"). Uptime, Tags, Resources, Billing return KPIs + chart data + one page (~50 rows);
    filters/sort/page as query params; same look and feel; update `tests/browser_*.js` and
-   frontend tests. This is what removes the 8–15MB payloads, and the 2–4s repeat views.
-5. **Resources cold ~30s.** SQL is ~17s (9.7s narrow ranking over `resource_costs` + ~6s
+   frontend tests. This is what removes the 8–15MB payloads and the 2–4s repeat views.
+3. **Resources cold ~30s.** SQL is ~17s (9.7s narrow ranking over `resource_costs` + ~6s
    detail gather); the rest is app-side on a 2-vCPU box, including ~2.3s of snapshot-cache
-   body checks on a 15MB answer (`_safe_content` regex scan 1.5s). Paging (item 4) shrinks
+   body checks on a 15MB answer (`_safe_content` regex scan 1.5s). Paging (item 2) shrinks
    both.
-6. **7 failing tests — all pre-existing** (identical set before and after this session's
-   work):
+4. **Verify Entra sign-in warming on live** (§4): after a deploy, sign in via SSO, confirm a
+   `sign-in` pass runs for that oid (its targets' `computed` moves) and the next views hit.
+5. **Run the full suite detached** (§1) — not run since `383f72e`. Expected: only the
+   7 pre-existing failures (identical set before and after the 28–30 Sep work):
    `test_budget_reading`, `test_datastore_safety::test_summary_does_not_label_unknown_plus_usd_as_single_currency`,
    `test_overview`, `test_postgres::test_rows_written_by_copy_come_back_intact`,
    `test_postgres::test_duplicate_spellings_preserve_charges_pending_authoritative_reingest`,
    `test_summary_pending::test_warehouse_summary_returns_pending_after_an_exists_probe`,
    `test_visuals` (399/400: "the server hands over the parsed filter for that link").
-   The full suite has not been re-run after `383f72e`; the 27 new tests and 449 related
-   ones (snapshot, cache integration, SSO, deployment, hardening, release) pass.
+   Targeted runs so far: `383f72e` 27 new + 449 related pass; `e99b71c` 388 + 114 pass.
+6. `/api/schedules` is 8.2s cold and not a snapshot-cached route (0.08s repeat from its
+   own cache). Small; check whether it belongs in `DEFAULT_POLICIES`.
 7. Unconfirmed: live July partition looks bloated (≈20GB heap for 5.0M rows vs ≈10GB for
    5.8M in August, 0 dead tuples). Not investigated.
 8. Carried from 28 Sep and still open: `stash@{0}` (`env_tags`, Environment filter
@@ -330,17 +345,18 @@ Repeat views of Resources/Tags are 2–4s because of payload size, not queries.
 - Commit messages explain *why*, with the numbers.
 - Session scratch (bench outputs, captured SQL, plans, probe scripts) lives in the Scout
   session folders `…\session-state\93969277-…\files\` (up to `a1bc0cd`) and
-  `…\session-state\e27b8924-…\files\` (warming: `live_probe.py` read-only live state,
-  `live_watch.py` follows a warm pass, both bench outputs), not in the repo.
+  `…\session-state\e27b8924-…\files\` (warming: `live_probe.py` prints live meta, snapshot
+  and warm-target state read-only; `live_watch.py` follows a warm pass; both bench
+  outputs), not in the repo. Copy the probes into the new session's folder if useful.
 
 ---
 
 ## 9. First moves in the new chat
 
 1. `git status` (only `tools/bench-tabs-latest.json` should be dirty) and
-   `git log --oneline -8`.
+   `git log --oneline -8` — top should be this handover, then `e99b71c`, `383f72e`.
 2. Start the Scale database if stopped; confirm the firewall rule for today's IP.
-3. Re-run `tools\bench_tabs.py` against live to get today's baseline (password from Ravi,
-   in the process environment only).
-4. Pick up §6 item 3 (profile Commitments, Insights, Recommendations cold) or item 4
-   (server-side paging), as Ravi prefers.
+3. Ask Ravi for the live admin password (process environment only) and re-run
+   `tools\bench_tabs.py` against live for today's baseline. Expect hits almost everywhere:
+   the 19 warm targets were computed after the last deploy and Always On keeps them warm.
+4. Pick up §6 item 1 (profile the Azure-bound tabs), unless Ravi prefers item 2 (paging).
