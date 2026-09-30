@@ -280,6 +280,30 @@ def test_resources_ranks_on_the_hashed_tables_when_they_answer(wh):
         assert r.rows('SELECT count(*) AS n FROM resource_costs')[0]["n"] > 0
 
 
+@pytest.mark.parametrize("cap", [1, 4, 7])
+def test_a_truncated_resource_list_keeps_the_same_money_either_way(wh, monkeypatch, cap):
+    """Ranked narrowly first on the fast path, in one pass on the other: at the row cap
+    both must keep resources with the same money, and report every figure the same.
+    Which of several equally-costed resources survives the cut may differ -- ties are
+    broken by the hash on one path and by the id on the other."""
+    from app import resources
+
+    monkeypatch.setattr(resources, "MAX_RESOURCES", cap)
+    routed = _resources(wh, SUBS)
+    _plain(monkeypatch, wh)
+    plain = _resources(wh, SUBS)
+
+    def money(result):
+        return sorted((r["cost"], r["prior_cost"]) for r in result["resources"])
+
+    assert routed["truncated"] and plain["truncated"]
+    assert money(routed) == money(plain)
+    by_id = {(r["subscription_id"], r["id"]): r for r in plain["resources"]}
+    for row in routed["resources"]:
+        if (row["subscription_id"], row["id"]) in by_id:
+            assert row == by_id[(row["subscription_id"], row["id"])]
+
+
 @pytest.mark.parametrize("kwargs", [
     {"filters": {"charge": ["Usage"]}},  # not a column of the hashed grain
     {"currency": "INR"},                 # money there is only valid unconverted

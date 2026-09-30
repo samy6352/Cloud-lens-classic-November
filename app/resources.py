@@ -61,12 +61,28 @@ class Resources:
             combined = f'"ChargePeriodStart" > {prev} AND "ChargePeriodStart" <= DATE \'{hi}\''
             period = f'"ChargePeriodStart" > {start}'
             previous = f'"ChargePeriodStart" > {prev} AND "ChargePeriodStart" <= {start}'
+            currency_sql = ('COALESCE(NULLIF(NULLIF(UPPER(TRIM("BillingCurrency")), '
+                            '\'\'), \'UNKNOWN\'), \'unknown\')')
             resource_identity = (
                 f'{key} AS id, LOWER(COALESCE("SubAccountId", \'\')) '
-                'AS subscription_id, COALESCE(NULLIF(NULLIF(UPPER(TRIM("BillingCurrency")), '
-                '\'\'), \'UNKNOWN\'), \'unknown\') AS currency')
+                f'AS subscription_id, {currency_sql} AS currency')
             has_id = ('' if hashed else
                       'AND "ResourceId" IS NOT NULL AND TRIM("ResourceId") <> \'\' ')
+            winners = ""
+            if hashed:
+                # Rank first on the key and the two sums alone, then gather names, regions
+                # and services for the winners only. Carrying those through the ranking
+                # sorted 2.5M wide rows to keep 8,001 of them: 33s for 30 days on the
+                # live estate, against 9s to rank narrowly and 5s to fetch the details.
+                winners = (
+                    f'winners AS (SELECT {resource_identity}, '
+                    f'SUM(CASE WHEN {period} THEN "BilledCost" ELSE 0 END) AS w_cost, '
+                    f'SUM(CASE WHEN {previous} THEN "BilledCost" ELSE 0 END) AS w_prior '
+                    f'FROM {source} WHERE {combined} GROUP BY 1, 2, 3 '
+                    'ORDER BY w_cost DESC, w_prior DESC, id, subscription_id, currency '
+                    f'LIMIT {MAX_RESOURCES + 1}), ')
+                has_id = (f'AND ({key}, LOWER(COALESCE("SubAccountId", \'\')), {currency_sql}) '
+                          'IN (SELECT id, subscription_id, currency FROM winners) ')
             # Ranked per service rather than per row: every ranking key but the date is a
             # per-service figure, so the first-ranked service is the same, and the window
             # function sorts services instead of every charge.
@@ -75,6 +91,7 @@ class Resources:
                 'WITH names AS (SELECT LOWER(COALESCE("SubAccountId", \'\')) AS name_sub, '
                 'MAX(COALESCE("SubAccountName", "SubAccountId", \'\')) AS name_text '
                 f'FROM {agg} WHERE {combined} GROUP BY 1), '
+                f'{winners}'
                 f'svc AS (SELECT {resource_identity}, "ServiceName", "ServiceFamily", '
                 f'SUM(CASE WHEN {period} THEN "BilledCost" ELSE 0 END) AS service_cost, '
                 f'SUM(CASE WHEN {previous} THEN "BilledCost" ELSE 0 END) AS service_prior_cost, '

@@ -694,10 +694,14 @@ def _positive_int_env(name: str, default: int) -> int:
 
 
 def snapshot_cache_settings() -> dict[str, int]:
+    # Sizes are of the uncompressed JSON; PostgreSQL stores it compressed, and a body is
+    # in app memory only while one response is built or sent. 32MB per entry because
+    # Resources returns up to 8,000 resources -- 16MB on the 16.9M-row estate -- and an
+    # answer that does not fit is recomputed on every view, which cost 33s each time.
     return {
-        "max_bytes": _positive_int_env("SNAPSHOT_MAX_BYTES", 256 * 1024 * 1024),
+        "max_bytes": _positive_int_env("SNAPSHOT_MAX_BYTES", 1024 * 1024 * 1024),
         "max_entries": _positive_int_env("SNAPSHOT_MAX_ENTRIES", 4096),
-        "max_payload": _positive_int_env("SNAPSHOT_MAX_PAYLOAD", 8 * 1024 * 1024),
+        "max_payload": _positive_int_env("SNAPSHOT_MAX_PAYLOAD", 32 * 1024 * 1024),
         "origin_timeout": _positive_int_env("SNAPSHOT_ORIGIN_TIMEOUT", 300),
     }
 
