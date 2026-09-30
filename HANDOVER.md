@@ -36,7 +36,14 @@ performance table, test list and open items are stale.
 >   `resource_costs` is gone, so a local v2 fails at boot (`"resource_ids" is not a view`,
 >   rolled back, nothing damaged). Local benches skip `_ensure_derived`; decide with Ravi
 >   whether to give v2 and v3 separate databases.
-> - Still open: items 1, 5, 9 (need Ravi). **Item 8 answered** (read-only, 1 Oct 03:25 IST):
+> - **Item 1 measured** (1 Oct 03:30 IST, `bench_tabs.py`, live, all groups, after
+>   `ac9bf8e`): repeat views **Resources 3.7s → 0.30s, Tags 2.3–3.9s → 0.51s, Uptime
+>   1.6s → 0.25s**; 45 endpoints, none over 2s warm (worst `/api/anomalies/alerts` 1.02s).
+>   The three 400s are by design (Change Analysis / Performance need explicit
+>   subscriptions; Service Health reports its own failed read as the app identity).
+>   Recommendation to Ravi: option **(a), no paging** — what remains is ~1.1MB gzip download
+>   and browser memory, not waiting. Awaiting his confirmation.
+> - Still open: items 1 (decision only), 5, 9 (need Ravi). **Item 8 answered** (read-only, 1 Oct 03:25 IST):
 >   `costs_202607` is 20,064MB of heap for 5.02M rows (4,188 B/row) against 1,834 and 1,807
 >   B/row for August and September, with identical sampled row widths (~1,654B, Tags ~980B).
 >   Its counters show why: **11.64M rows inserted and 5.81M deleted** — July was imported
@@ -542,7 +549,7 @@ re-run since. See §3–§5.
 
 | # | Step | Waits on |
 |---|---|---|
-| 1 | Measure `f1b2446`'s repeat views on live, then decide paging: stop / slim / page | **Ravi**: admin password (§0.7), then the decision |
+| 1 | Measure `f1b2446`'s repeat views on live, then decide paging: stop / slim / page | **Measured** (all < 0.6s on spend tabs); **Ravi**: confirm (a) stop |
 | 2 | Insights: replace its 31s `tags` source with a small aggregate for the 3 numbers it reads | **Done** `8cdae1a`, deployed |
 | 3 | Re-run the full suite at `f1b2446` (~14 min, `-n 4`) | **Done** (at `ac9bf8e`: 2243 passed, 0 failed) |
 | 4 | Move the write-time body check (~2.3s on Resources) off the event loop | **Done** `54afda3`, deployed |

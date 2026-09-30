@@ -1,9 +1,247 @@
 [
   {
-    "path": "/api/dashboard/uptime?days=30",
-    "cold": 72.037,
-    "warm": 0.362,
+    "path": "/api/auth/me",
+    "cold": 0.086,
+    "warm": 0.053,
     "status": 200,
-    "bytes": 5804591
+    "bytes": 208
+  },
+  {
+    "path": "/api/health",
+    "cold": 0.053,
+    "warm": 0.05,
+    "status": 200,
+    "bytes": 292
+  },
+  {
+    "path": "/api/subscriptions",
+    "cold": 0.282,
+    "warm": 0.233,
+    "status": 200,
+    "bytes": 9946
+  },
+  {
+    "path": "/api/onboarding",
+    "cold": 0.114,
+    "warm": 0.065,
+    "status": 200,
+    "bytes": 373
+  },
+  {
+    "path": "/api/warehouse",
+    "cold": 0.228,
+    "warm": 0.209,
+    "status": 200,
+    "bytes": 1083
+  },
+  {
+    "path": "/api/currency",
+    "cold": 0.055,
+    "warm": 0.058,
+    "status": 200,
+    "bytes": 390
+  },
+  {
+    "path": "/api/reporting-period",
+    "cold": 0.148,
+    "warm": 0.134,
+    "status": 200,
+    "bytes": 442
+  },
+  {
+    "path": "/api/dashboard/sections",
+    "cold": 0.322,
+    "warm": 0.098,
+    "status": 200,
+    "bytes": 1664
+  },
+  {
+    "path": "/api/filters?days=30",
+    "cold": 0.095,
+    "warm": 0.059,
+    "status": 200,
+    "bytes": 39856
+  },
+  {
+    "path": "/api/capabilities",
+    "cold": 0.806,
+    "warm": 0.068,
+    "status": 200,
+    "bytes": 11443
+  },
+  {
+    "path": "/api/dashboard/anomalies?days=30",
+    "cold": 0.102,
+    "warm": 0.09,
+    "status": 200,
+    "bytes": 4670
+  },
+  {
+    "path": "/api/dashboard/change-analysis?days=30",
+    "cold": 0.112,
+    "warm": 0.09,
+    "status": 400,
+    "bytes": 61
+  },
+  {
+    "path": "/api/dashboard/performance?days=30",
+    "cold": 0.098,
+    "warm": 0.091,
+    "status": 400,
+    "bytes": 61
+  },
+  {
+    "path": "/api/dashboard/azure-updates",
+    "cold": 0.955,
+    "warm": 0.097,
+    "status": 200,
+    "bytes": 175692
+  },
+  {
+    "path": "/api/dashboard/service-health",
+    "cold": 0.048,
+    "warm": 0.047,
+    "status": 400,
+    "bytes": 516
+  },
+  {
+    "path": "/api/anomalies/alerts",
+    "cold": 0.724,
+    "warm": 1.024,
+    "status": 200,
+    "bytes": 1491
+  },
+  {
+    "path": "/api/dashboard/savings?days=30",
+    "cold": 0.09,
+    "warm": 0.089,
+    "status": 200,
+    "bytes": 25971
+  },
+  {
+    "path": "/api/dashboard/savings/progress?days=30",
+    "cold": 0.092,
+    "warm": 0.083,
+    "status": 200,
+    "bytes": 1961
+  },
+  {
+    "path": "/api/dashboard/recommendations?days=30",
+    "cold": 0.058,
+    "warm": 0.055,
+    "status": 200,
+    "bytes": 618
+  },
+  {
+    "path": "/api/dashboard/waste?days=30",
+    "cold": 0.09,
+    "warm": 0.091,
+    "status": 200,
+    "bytes": 19729
+  },
+  {
+    "path": "/api/dashboard/shutdown?days=30",
+    "cold": 0.095,
+    "warm": 0.093,
+    "status": 200,
+    "bytes": 254
+  },
+  {
+    "path": "/api/dashboard/commitments?days=30",
+    "cold": 0.086,
+    "warm": 0.141,
+    "status": 200,
+    "bytes": 61334
+  },
+  {
+    "path": "/api/dashboard/rightsizing?days=30",
+    "cold": 0.064,
+    "warm": 0.101,
+    "status": 200,
+    "bytes": 921
+  },
+  {
+    "path": "/api/dashboard/hybrid-benefit?days=30",
+    "cold": 5.379,
+    "warm": 0.079,
+    "status": 200,
+    "bytes": 200
+  },
+  {
+    "path": "/api/dashboard/rates?days=30",
+    "cold": 1.242,
+    "warm": 0.098,
+    "status": 200,
+    "bytes": 7189
+  },
+  {
+    "path": "/api/dashboard/advisor?days=30",
+    "cold": 0.091,
+    "warm": 0.051,
+    "status": 200,
+    "bytes": 3412
+  },
+  {
+    "path": "/api/dashboard/governance?days=30",
+    "cold": 0.098,
+    "warm": 0.054,
+    "status": 200,
+    "bytes": 17057
+  },
+  {
+    "path": "/api/dashboard/esu?days=30",
+    "cold": 0.589,
+    "warm": 0.099,
+    "status": 200,
+    "bytes": 496
+  },
+  {
+    "path": "/api/dashboard/health",
+    "cold": 0.084,
+    "warm": 0.084,
+    "status": 200,
+    "bytes": 2889
+  },
+  {
+    "path": "/api/dashboard/audit?days=30",
+    "cold": 0.098,
+    "warm": 0.083,
+    "status": 200,
+    "bytes": 21599
+  },
+  {
+    "path": "/api/report/options?days=30",
+    "cold": 0.338,
+    "warm": 0.265,
+    "status": 200,
+    "bytes": 388
+  },
+  {
+    "path": "/api/archive?limit=200",
+    "cold": 2.102,
+    "warm": 0.186,
+    "status": 200,
+    "bytes": 367
+  },
+  {
+    "path": "/api/cost-data/subscriptions",
+    "cold": 0.047,
+    "warm": 0.046,
+    "status": 200,
+    "bytes": 112
+  },
+  {
+    "path": "/api/schedules",
+    "cold": 8.346,
+    "warm": 0.062,
+    "status": 200,
+    "bytes": 11155
+  },
+  {
+    "path": "/api/insights",
+    "cold": 0.089,
+    "warm": 0.108,
+    "status": 200,
+    "bytes": 3386
   }
 ]
