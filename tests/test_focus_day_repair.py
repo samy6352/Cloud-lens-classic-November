@@ -60,7 +60,7 @@ def _pending(wh):
 
 
 def _untouched_days(wh, excluded):
-    from app import billing_serving, derived, resource_tags
+    from app import billing_serving, derived, resource_ids, resource_tags
     from app.warehouse import DERIVED_MODULES
 
     result = {}
@@ -71,7 +71,7 @@ def _untouched_days(wh, excluded):
             period = '"ChargePeriodStart"'
             # Month-grain tables repair the whole month that contains a corrected day:
             # a month's ranking, or a resource's latest tags, depends on every day in it.
-            if module in (billing_serving, resource_tags):
+            if module in (billing_serving, resource_tags, resource_ids):
                 dates = sorted({day.replace(day=1) for day in excluded})
                 period = 'date_trunc(\'month\', "ChargePeriodStart")::date'
             result[module.TABLE] = con.execute(

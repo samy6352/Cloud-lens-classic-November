@@ -36,7 +36,8 @@ class Resources:
 
         days = reporting.period_days(days)
         with reporting.comparison_history(), \
-                self.wh.reader(scope, currency, filters, usage=("tags",)) as r:
+                self.wh.reader(scope, currency, filters,
+                               usage=("tags", "resource_costs", "resource_ids")) as r:
             hi, start, prev = reporting.window(r, days)
             if not hi:
                 return {"empty": True, "days": days, "resources": []}
@@ -47,13 +48,25 @@ class Resources:
             tag_source = getattr(r, "tags", None)
             source = getattr(r, "named", "costs") if tag_source else "costs"
             agg = getattr(r, "agg", "costs")
+            # Fastest of all: the same per-resource money keyed by a 16-byte hash of the
+            # id rather than the ~150-byte id itself, with the id looked up afterwards for
+            # the rows returned. Grouping 5.4M rows by the id text failed the live server's
+            # 180s bound; by the hash it took 13s. Used only when both stored tables are
+            # current for this connection -- otherwise the query above answers.
+            hashed = bool(tag_source and getattr(r, "resource_costs", None)
+                          and getattr(r, "resource_ids", None))
+            if hashed:
+                source = r.resource_costs
+            key = '"ResourceHash"' if hashed else 'LOWER(TRIM("ResourceId"))'
             combined = f'"ChargePeriodStart" > {prev} AND "ChargePeriodStart" <= DATE \'{hi}\''
             period = f'"ChargePeriodStart" > {start}'
             previous = f'"ChargePeriodStart" > {prev} AND "ChargePeriodStart" <= {start}'
             resource_identity = (
-                'LOWER(TRIM("ResourceId")) AS id, LOWER(COALESCE("SubAccountId", \'\')) '
+                f'{key} AS id, LOWER(COALESCE("SubAccountId", \'\')) '
                 'AS subscription_id, COALESCE(NULLIF(NULLIF(UPPER(TRIM("BillingCurrency")), '
                 '\'\'), \'UNKNOWN\'), \'unknown\') AS currency')
+            has_id = ('' if hashed else
+                      'AND "ResourceId" IS NOT NULL AND TRIM("ResourceId") <> \'\' ')
             # Ranked per service rather than per row: every ranking key but the date is a
             # per-service figure, so the first-ranked service is the same, and the window
             # function sorts services instead of every charge.
@@ -72,7 +85,7 @@ class Resources:
                 'MIN("ChargePeriodStart") AS first_seen, MAX("ChargePeriodStart") AS last_seen'
                 f'{inline_tags} '
                 f'FROM {source} WHERE {combined} '
-                'AND "ResourceId" IS NOT NULL AND TRIM("ResourceId") <> \'\' '
+                f'{has_id}'
                 'GROUP BY 1, 2, 3, "ServiceName", "ServiceFamily"), '
                 'ranked AS (SELECT *, row_number() OVER (PARTITION BY id, subscription_id, currency '
                 'ORDER BY service_current DESC, abs(service_cost) DESC, '
@@ -91,14 +104,30 @@ class Resources:
                 'AS service_names '
                 'FROM ranked LEFT JOIN names ON name_sub = subscription_id '
                 'GROUP BY id, subscription_id, currency '
+                # At the row cap, ties on money are broken by the hash on the fast path and
+                # by the id otherwise; both are deterministic, and neither decides anything
+                # a reader of a truncated list could rely on.
                 'ORDER BY cost DESC, prior_cost DESC, id, subscription_id, currency '
                 f'LIMIT {MAX_RESOURCES + 1})')
+            if hashed:
+                # The ids for the returned rows only, through the hash index. Any row for
+                # the hash will do: it is the hash of that very id.
+                top += (
+                    ', named_top AS (SELECT top.*, ids."ResourceKey" AS resource_key FROM top '
+                    'LEFT JOIN LATERAL (SELECT "ResourceKey" FROM '
+                    f'{r.resource_ids} WHERE "ResourceHash" = top.id '
+                    'AND LOWER(COALESCE("SubAccountId", \'\')) = top.subscription_id '
+                    'LIMIT 1) AS ids ON TRUE), '
+                    'top_ids AS (SELECT resource_key AS id, name, resource_group, subscription, '
+                    'subscription_id, service, family, region, currency, cost, prior_cost, '
+                    'first_seen, last_seen, service_names FROM named_top)')
+            base = "top_ids" if hashed else "top"
             # Tags for the returned resources only, from the monthly tag summary; the
             # detail-table fallback carries them inline instead.
             finish = (
-                ' SELECT top.*, COALESCE(tg.tags, \'\') AS tags FROM top '
+                f' SELECT {base}.*, COALESCE(tg.tags, \'\') AS tags FROM {base} '
                 + resource_tags.lateral_sql(
-                    tag_source, "top.id", "top.currency", prev, str(hi)[:10],
+                    tag_source, f"{base}.id", f"{base}.currency", prev, str(hi)[:10],
                     "COALESCE(NULLIF(NULLIF(UPPER(TRIM({c})), ''), 'UNKNOWN'), 'unknown')")
                 if tag_source else ' SELECT * FROM top')
             rows = r.rows(

@@ -42,6 +42,8 @@ from . import (
     fx_rollup,
     hourly_usage,
     presence,
+    resource_costs,
+    resource_ids,
     resource_tags,
     rollup,
     schema_v2,
@@ -59,7 +61,7 @@ log = logging.getLogger("cloudlens.warehouse")
 # by none of them but trusted by the reader served an empty relation as truth.
 DERIVED_MODULES = (
     rollup, presence, billing_rollup, billing_serving, commitment_benefits, spot_rates,
-    hourly_usage, usage_signals, resource_tags)
+    hourly_usage, usage_signals, resource_tags, resource_costs, resource_ids)
 if fx_rollup.ENABLED:
     DERIVED_MODULES += (fx_rollup,)
 
@@ -69,6 +71,8 @@ USAGE_MODULES = {
     "hourly": hourly_usage,
     "signals": usage_signals,
     "tags": resource_tags,
+    "resource_costs": resource_costs,
+    "resource_ids": resource_ids,
 }
 
 ARM = "https://management.azure.com"
@@ -504,6 +508,9 @@ class Reader:
         self.hourly = usage.get("hourly")
         self.signals = usage.get("signals")
         self.tags = usage.get("tags")
+        # Stored-only: set when the stored table answers this connection, else None.
+        self.resource_costs = usage.get("resource_costs")
+        self.resource_ids = usage.get("resource_ids")
 
     @property
     def aggregated(self) -> bool:
@@ -685,12 +692,10 @@ class Warehouse:
                            if present else None)
                 missing_names = {m.TABLE for m in missing}
                 if pending is not None and any(
-                        getattr(m, "SOURCE_TABLE", None)
-                        and (m in missing or m.SOURCE_TABLE in missing_names)
+                        m in present and getattr(m, "SOURCE_TABLE", None) in missing_names
                         for m in DERIVED_MODULES):
-                    # A dependent table is built from its source within one rebuild call,
-                    # so a dependency that straddles the missing/present split cannot be
-                    # served by the two-part path. Rebuild everything instead.
+                    # A current table whose source is being rebuilt from scratch cannot be
+                    # repaired by period against a source that is not yet there.
                     pending = None
                 transaction = jobs.RollupTransaction(con)
                 # Every table in one call, so their contents describe the same
@@ -705,17 +710,19 @@ class Warehouse:
                 else:
                     built = missing
                     counts = {rollup.TABLE: 0}
-                    if missing:
-                        log.info("warehouse: building %s, new since the last stamp",
-                                 ", ".join(m.TABLE for m in missing))
-                        counts.update(derived.rebuild(
-                            transaction, self._rollup_schema, missing, self._pg_table,
-                            cleanup=False))
+                    # The current tables first, so a new table that reads one of them is
+                    # built from its repaired contents rather than the pre-repair ones.
                     if pending:
                         counts.update(derived.rebuild(
                             transaction, self._rollup_schema, present, self._pg_table,
                             pending[0] if len(pending) == 1 else None, cleanup=False,
                             **({"windows": pending} if len(pending) > 1 else {})))
+                    if missing:
+                        log.info("warehouse: building %s, new since the last stamp",
+                                 ", ".join(m.TABLE for m in missing))
+                        counts.update(derived.rebuild(
+                            transaction, self._rollup_schema, missing, self._pg_table,
+                            cleanup=False, published=[m.TABLE for m in present]))
         except Exception as exc:  # noqa: BLE001
             log.warning("warehouse: could not rebuild the rollup (%s); "
                         "the previous ready generation is retained", exc)
@@ -1046,13 +1053,30 @@ class Warehouse:
         Every one is shadowed, including on the unscoped path: the published tables hold
         every subscription and may be behind the detail table, so an unqualified read
         must always meet either a checked table or the same grain computed from `costs`.
+
+        A `STORED_ONLY` summary is the exception to the second half. Its grain computed
+        from `costs` per request would cost more than the query it exists to replace, so
+        it is shadowed only when the stored table is current and exactly answers this
+        connection, and is otherwise left absent for the caller to fall back on its own.
         """
+        available: dict[str, str] = {}
         for name in usage:
             module = USAGE_MODULES[name]
+            if getattr(module, "STORED_ONLY", False):
+                if (rate is None and module.serves_filters(filters)
+                        and self._rollup_fresh(con, module.TABLE)):
+                    narrowed = scope_where if module is resource_ids else where
+                    con.execute(f'CREATE TEMP VIEW {module.TABLE} AS SELECT * '
+                                f'FROM "{self._rollup_schema}".{module.TABLE} '
+                                f'{environment.stored_where(narrowed)}')
+                    available[name] = module.TABLE
+                continue
             if module is resource_tags:
                 self._shadow_resource_tags(con, scope_where, rate, target)
             else:
                 self._shadow_auxiliary_rollup(con, where, rate, filters, module)
+            available[name] = module.TABLE
+        con.usage_available = available
 
     def _shadow_resource_tags(self, con: Any, scope_where: str, rate: float | None,
                               target: str) -> None:
@@ -1295,7 +1319,7 @@ class Warehouse:
                     bill_stored=con.bill_stored, bill_serving=con.bill_serving,
                     bill_indexed=billing_rollup.TABLE in indexed,
                     res_ordered=presence.TABLE in indexed,
-                    usage={name: USAGE_MODULES[name].TABLE for name in usage})
+                    usage=dict(getattr(con, "usage_available", {})))
         finally:
             con.close()
 

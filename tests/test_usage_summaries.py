@@ -133,6 +133,7 @@ def _plain(monkeypatch, wh):
             r.agg = r.res = r.named = "costs"
             r.hourly = "costs" if r.hourly else None
             r.signals = None
+            r.resource_costs = r.resource_ids = None
             if r.tags:
                 r._con.execute(
                     f"CREATE TEMP VIEW plain_tags AS {resource_tags.select_sql('costs')}")
@@ -268,3 +269,86 @@ def test_a_changed_build_filter_rebuilds_that_summary(wh, monkeypatch):
         recorded = con.execute("SELECT value FROM meta WHERE key = ?",
                                ["derived_layout:usage_signals"]).fetchone()[0]
     assert recorded == "changed-for-test"
+
+
+RESOURCE_USAGE = ("tags", "resource_costs", "resource_ids")
+
+
+def test_resources_ranks_on_the_hashed_tables_when_they_answer(wh):
+    with wh.reader(scope=SUBS, usage=RESOURCE_USAGE) as r:
+        assert (r.resource_costs, r.resource_ids) == ("resource_costs", "resource_ids")
+        assert r.rows('SELECT count(*) AS n FROM resource_costs')[0]["n"] > 0
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"filters": {"charge": ["Usage"]}},  # not a column of the hashed grain
+    {"currency": "INR"},                 # money there is only valid unconverted
+])
+def test_hashed_resource_tables_step_aside_when_they_cannot_answer(wh, monkeypatch, kwargs):
+    from app import currency
+
+    monkeypatch.setattr(currency, "rate_to", lambda target: 83.0)
+    with wh.reader(scope=SUBS, usage=RESOURCE_USAGE, **kwargs) as r:
+        assert r.resource_costs is None
+
+
+def test_hashed_resource_tables_step_aside_when_stale(wh):
+    from app import jobs
+
+    with wh.connect() as con:
+        con.execute("BEGIN")
+        jobs.unstamp(con, ["resource_costs"])
+        con.execute("COMMIT")
+    with wh.reader(scope=SUBS, usage=RESOURCE_USAGE) as r:
+        assert r.resource_costs is None, "an unstamped table must never be read"
+    # And the tab still answers, from its own query.
+    assert _resources(wh, SUBS)["resources"]
+
+
+def test_hashed_resource_tables_cannot_see_past_their_scope(wh):
+    with wh.reader(scope=SUBS[:1], usage=RESOURCE_USAGE) as r:
+        for table in ("resource_costs", "resource_ids"):
+            subs = {row["s"] for row in r.rows(
+                f'SELECT DISTINCT lower("SubAccountId") AS s FROM {table}')}
+            assert subs == {SUBS[0].lower()}, table
+
+
+def test_hashed_resource_tables_match_their_grain_over_costs(wh):
+    from app import resource_costs, resource_ids
+
+    with wh.connect(read_only=True) as con:
+        for module in (resource_costs, resource_ids):
+            # Sums are re-added from the per-resource summary, so compare money to the
+            # cent-fraction rather than to the last bit of a double.
+            cols = ", ".join(
+                f'round(CAST("{c}" AS numeric), 6)' if c in module.MEASURES else f'"{c}"'
+                for c in module.DIMENSIONS + module.MEASURES)
+            stored = f'SELECT {cols} FROM "{wh._rollup_schema}".{module.TABLE}'
+            computed = f"SELECT {cols} FROM ({module.select_sql('costs')}) AS c"
+            for a, b in ((stored, computed), (computed, stored)):
+                extra = con.execute(f"SELECT count(*) FROM ({a} EXCEPT ALL {b}) AS d").fetchone()[0]
+                assert extra == 0, f"{module.TABLE} disagrees with costs"
+
+
+def test_hashed_resource_tables_are_built_from_the_published_presence(wh):
+    from app import derived, jobs, presence, resource_costs, resource_ids
+
+    schema = wh._rollup_schema
+    with wh.connect() as con:
+        before = derived.active_table(con, schema, presence)
+        con.execute("BEGIN")
+        jobs.unstamp(con, [resource_costs.TABLE, resource_ids.TABLE])
+        for module in (resource_costs, resource_ids):
+            con.execute(f'DROP VIEW "{schema}".{module.TABLE}')
+            for side in derived.SIDES:
+                con.execute(f'DROP TABLE IF EXISTS "{schema}".{module.TABLE}{side}')
+        con.execute("COMMIT")
+    wh.refresh_rollup(strict=True, incremental=True)
+
+    with wh.connect(read_only=True) as con:
+        assert derived.active_table(con, schema, presence) == before, "presence was rebuilt"
+        for module in (resource_costs, resource_ids):
+            assert jobs.rollup_current(con, module.TABLE)
+            assert con.execute(
+                f'SELECT count(*) FROM "{schema}".{module.TABLE}').fetchone()[0] > 0
+    assert jobs.derived_complete()

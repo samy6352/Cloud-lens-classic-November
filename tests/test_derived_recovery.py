@@ -83,13 +83,13 @@ def assert_current(wh):
 def assert_windows(calls, windows):
     from datetime import timedelta
 
-    from app import billing_serving, jobs, resource_tags, schema_v2
+    from app import billing_serving, jobs, resource_ids, resource_tags, schema_v2
     from app.warehouse import DERIVED_MODULES
 
     expected = []
     for module in DERIVED_MODULES:
         periods = windows
-        if module in (billing_serving, resource_tags) and windows != [None]:
+        if module in (billing_serving, resource_tags, resource_ids) and windows != [None]:
             periods = jobs.merge_windows([
                 (lo.replace(day=1), schema_v2.next_month(hi - timedelta(days=1)))
                 for lo, hi in windows])
@@ -159,7 +159,7 @@ def test_rolled_back_write_does_not_dirty_or_advance_the_generation(loaded):
 
 
 @pytest.mark.parametrize("uncertainty", ["unknown-write", "missing-ledger", "stale-ledger",
-                                          "layout-change", "missing-table"])
+                                          "layout-change"])
 def test_uncertain_coverage_requires_a_full_rebuild(loaded, monkeypatch, uncertainty):
     from app import jobs
 
@@ -171,12 +171,30 @@ def test_uncertain_coverage_requires_a_full_rebuild(loaded, monkeypatch, uncerta
             jobs._write_dirty(con, 999, 0, [MAR])
         elif uncertainty == "layout-change":
             con.execute("UPDATE meta SET value='older' WHERE key=?", [jobs.ROLLUP_LAYOUT_KEY])
-        elif uncertainty == "missing-table":
-            con.execute("UPDATE meta SET value='costs_rollup' WHERE key=?", [jobs.ROLLUP_TABLES_KEY])
     correct(loaded, MAR)
     calls = record_stages(monkeypatch)
     asyncio.run(loaded.refresh_rollup_async(MAR))
     assert_windows(calls, [None])
+    assert_current(loaded)
+
+
+def test_tables_missing_from_the_stamp_are_rebuilt_and_the_stamped_ones_repaired(
+        loaded, monkeypatch):
+    """A withdrawn table has no trusted contents, so it is built in full; a table still
+    on the stamp has a complete ledger, so only the periods written since are redone.
+    Rebuilding every table because one was withdrawn made adding a summary to a large
+    estate a full rebuild of everything."""
+    from app import jobs, rollup
+    from app.warehouse import DERIVED_MODULES
+
+    correct(loaded, JAN)
+    with loaded.connect() as con:
+        con.execute("UPDATE meta SET value='costs_rollup' WHERE key=?", [jobs.ROLLUP_TABLES_KEY])
+    correct(loaded, MAR)
+    calls = record_stages(monkeypatch)
+    asyncio.run(loaded.refresh_rollup_async(MAR))
+    assert calls == [(rollup.TABLE, JAN), (rollup.TABLE, MAR)] + [
+        (m.TABLE, None) for m in DERIVED_MODULES if m is not rollup]
     assert_current(loaded)
 
 
@@ -278,9 +296,10 @@ def test_recreated_relation_cannot_inherit_readiness(loaded, monkeypatch, damage
             assert not jobs.rollup_complete(con)
         asyncio.run(restarted.refresh_rollup_async(MAR))
         # The damaged table in full; the others, whose contents survived, only the period
-        # written since -- not a rebuild of every table's whole history.
-        assert calls == [(rollup.TABLE, None)] + [
-            (m.TABLE, MAR) for m in DERIVED_MODULES if m is not rollup]
+        # written since -- not a rebuild of every table's whole history. The surviving
+        # tables are repaired first, so a rebuilt table that reads one sees it repaired.
+        assert calls == [
+            (m.TABLE, MAR) for m in DERIVED_MODULES if m is not rollup] + [(rollup.TABLE, None)]
         assert_current(restarted)
         with restarted.connect(read_only=True) as con:
             assert con.execute('SELECT count(DISTINCT "ChargePeriodStart") '

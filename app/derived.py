@@ -405,7 +405,8 @@ def retire(con: Any, schema: str, module: Any) -> None:
 def rebuild(con: Any, schema: str, modules: Sequence[Any], source: str,
             window: tuple[dt.date, dt.date] | None = None, *,
             cleanup: bool = True,
-            windows: Sequence[tuple[dt.date, dt.date]] | None = None) -> dict[str, int]:
+            windows: Sequence[tuple[dt.date, dt.date]] | None = None,
+            published: Sequence[str] = ()) -> dict[str, int]:
     """Rebuild every derived table in `modules` from `source`, in one transaction.
 
     A rebuild rather than an incremental merge. These tables are derived data whose
@@ -437,6 +438,10 @@ def rebuild(con: Any, schema: str, modules: Sequence[Any], source: str,
     A module may name SOURCE_TABLE from an earlier module and expand repair
     periods through build_windows. Dependencies are prepared before use, but no
     view is published until every module is complete.
+
+    `published` names source tables that are current and not being rebuilt here, so
+    a dependent module is built from the published relation directly. That is how a
+    new dependent table joins an estate without rebuilding the table it reads.
     """
     from .jobs import merge_windows
 
@@ -453,9 +458,9 @@ def rebuild(con: Any, schema: str, modules: Sequence[Any], source: str,
         if module.TABLE in seen:
             raise ValueError(f"Duplicate derived table: {module.TABLE}")
         dependency = getattr(module, "SOURCE_TABLE", None)
-        if dependency is not None and dependency not in seen:
+        if dependency is not None and dependency not in seen and dependency not in published:
             raise ValueError(f"{module.TABLE} requires {dependency} to be built first")
-        source_ranges = effective_ranges[dependency] if dependency else ranges
+        source_ranges = effective_ranges.get(dependency, ranges)
         periods = source_ranges
         if not full and (expand := getattr(module, "build_windows", None)) is not None:
             periods = merge_windows(expand(tuple(source_ranges)))
@@ -473,7 +478,12 @@ def rebuild(con: Any, schema: str, modules: Sequence[Any], source: str,
         built = {}
         counts = {}
         for module, dependency, periods in plans:
-            module_source = f'"{schema}".{built[dependency]}' if dependency else source
+            if dependency is None:
+                module_source = source
+            elif dependency in built:
+                module_source = f'"{schema}".{built[dependency]}'
+            else:
+                module_source = f'"{schema}".{dependency}'
             with build_options(con, module):
                 for period in periods:
                     name = stage(con, schema, module, module_source, period)
