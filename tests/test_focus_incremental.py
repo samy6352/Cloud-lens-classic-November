@@ -507,8 +507,11 @@ def _mark_derived_current(memory):
     case the skip must *not* apply to.
     """
     from app import jobs
+    from app.warehouse import DERIVED_MODULES
 
-    with jobs.coherent_rollup(memory, ["costs_rollup", "resource_presence", "billing_rollup"]):
+    # The whole roster, as a real rebuild stamps it. A partial list reads as a table
+    # that has never been built, which is the case the skip must *not* apply to.
+    with jobs.coherent_rollup(memory, [module.TABLE for module in DERIVED_MODULES]):
         pass
 
 

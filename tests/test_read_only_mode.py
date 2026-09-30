@@ -146,7 +146,7 @@ def test_read_only_lifespan_starts_caches_but_no_ingest_workers(monkeypatch):
     monkeypatch.setattr(main, "auth_service", lambda: SimpleNamespace(sso=SimpleNamespace(enabled=False)))
     monkeypatch.setattr(main, "CostAgent", lambda: SimpleNamespace(model="offline", close=AsyncMock()))
     cache = SimpleNamespace(start=AsyncMock(), close=AsyncMock())
-    monkeypatch.setattr(main, "SnapshotStore", lambda *args: None)
+    monkeypatch.setattr(main, "SnapshotStore", lambda *args, **kwargs: None)
     monkeypatch.setattr(main, "SnapshotCache", lambda *args, **kwargs: cache)
     monkeypatch.setattr(main, "application_version", lambda **kwargs: "offline")
     monkeypatch.setattr(main, "_prepare_snapshot_generation", AsyncMock())

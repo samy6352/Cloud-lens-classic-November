@@ -93,21 +93,18 @@ class Resources:
                 'GROUP BY id, subscription_id, currency '
                 'ORDER BY cost DESC, prior_cost DESC, id, subscription_id, currency '
                 f'LIMIT {MAX_RESOURCES + 1})')
-            if tag_source:
-                rows = r.rows(
-                    f'{top} SELECT top.*, COALESCE(tg.tags, \'\') AS tags FROM top '
-                    + resource_tags.lateral_sql(
-                        tag_source, "top.id", "top.currency", prev, str(hi)[:10],
-                        "COALESCE(NULLIF(NULLIF(UPPER(TRIM({c})), ''), 'UNKNOWN'), 'unknown')")
-                    + ' ORDER BY cost DESC, prior_cost DESC, id, subscription_id, currency',
-                    limit=MAX_RESOURCES + 1,
-                )
-            else:
-                rows = r.rows(
-                    f'{top} SELECT * FROM top '
-                    'ORDER BY cost DESC, prior_cost DESC, id, subscription_id, currency',
-                    limit=MAX_RESOURCES + 1,
-                )
+            # Tags for the returned resources only, from the monthly tag summary; the
+            # detail-table fallback carries them inline instead.
+            finish = (
+                ' SELECT top.*, COALESCE(tg.tags, \'\') AS tags FROM top '
+                + resource_tags.lateral_sql(
+                    tag_source, "top.id", "top.currency", prev, str(hi)[:10],
+                    "COALESCE(NULLIF(NULLIF(UPPER(TRIM({c})), ''), 'UNKNOWN'), 'unknown')")
+                if tag_source else ' SELECT * FROM top')
+            rows = r.rows(
+                f'{top}{finish} ORDER BY cost DESC, prior_cost DESC, id, subscription_id, currency',
+                limit=MAX_RESOURCES + 1,
+            )
 
         truncated = len(rows) > MAX_RESOURCES
         rows = rows[:MAX_RESOURCES]

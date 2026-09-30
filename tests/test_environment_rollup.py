@@ -105,9 +105,9 @@ def migrated(wh):
             columns = con.execute(f'SELECT * FROM {module.TABLE} LIMIT 0').description
             assert columns[-1][0] == "Environment"
         for module in DERIVED_MODULES:
-            measures = ", ".join(f'sum("{name}")' for name in module.MEASURES)
+            measures = ", ".join(["count(*)", *(f'sum("{name}")' for name in module.MEASURES)])
             old_totals[module.TABLE] = con.execute(
-                f"SELECT count(*), {measures} FROM {module.TABLE}"
+                f"SELECT {measures} FROM {module.TABLE}"
             ).fetchone()
 
     with wh.reader(["sub-a"], filters={"env": ["prod"]}) as reader:
@@ -126,9 +126,9 @@ def migrated(wh):
         assert not jobs.rollup_current(con)
         assert con.execute('SELECT sum("BilledCost") FROM costs_rollup').fetchone()[0] == 977
         for module in DERIVED_MODULES:
-            measures = ", ".join(f'sum("{name}")' for name in module.MEASURES)
+            measures = ", ".join(["count(*)", *(f'sum("{name}")' for name in module.MEASURES)])
             assert con.execute(
-                f"SELECT count(*), {measures} FROM {module.TABLE}"
+                f"SELECT {measures} FROM {module.TABLE}"
             ).fetchone() == old_totals[module.TABLE]
     wh.refresh_rollup(strict=True)
     with wh.connect() as con:

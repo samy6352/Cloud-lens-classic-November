@@ -41,8 +41,10 @@ from . import schema_v2
 TABLE = "resource_tags"
 PERIOD = "ChargePeriodStart"
 DIMENSIONS = [PERIOD, "SubAccountId", "ResourceKey", "BillingCurrency"]
-# Not summed. Listed so the boot-time column check knows the table's full shape.
-MEASURES = ["TaggedOn", "Tags", "UnknownDays"]
+# Nothing here is summed, so there are no MEASURES; the columns beside the grain are
+# listed so the boot-time shape check knows the table's full set of columns.
+MEASURES: list[str] = []
+ATTRIBUTES = ["TaggedOn", "Tags", "UnknownDays"]
 
 # The identity every tab already groups by when a charge has no resource id, folded to
 # lower case and trimmed: Azure ids are case-insensitive and arrive in several casings,

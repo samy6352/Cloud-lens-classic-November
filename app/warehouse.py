@@ -1558,7 +1558,8 @@ class Warehouse:
         from . import derived, jobs
 
         for module in DERIVED_MODULES:
-            expected = set(module.DIMENSIONS) | set(getattr(module, "MEASURES", []))
+            expected = (set(module.DIMENSIONS) | set(getattr(module, "MEASURES", []))
+                        | set(getattr(module, "ATTRIBUTES", [])))
             if module is rollup:
                 expected.add("charges")
             active = derived.active_table(con, schema, module) or module.TABLE

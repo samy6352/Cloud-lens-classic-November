@@ -867,14 +867,18 @@ resource_queries = [
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     and isinstance(node.func.value, ast.Name) and node.func.value.id == "r" and node.func.attr == "rows"
 ]
-resource_sql = ast.get_source_segment(res, resource_queries[0].args[0]) if resource_queries else ""
+resource_sql = res
 check("cost and its prior-period figure come from one pass over the rows, not two queries",
-      len(resource_queries) == 1 and resource_sql.count("FROM costs") == 1
-      and re.search(r'SUM\(CASE WHEN \{period\} THEN "BilledCost" ELSE 0 END\)\s+AS cost', resource_sql)
-      and re.search(r'SUM\(CASE WHEN \{previous\} THEN "BilledCost" ELSE 0 END\)\s+AS prior_cost', resource_sql))
+      len(resource_queries) == 1 and 'FROM {source} WHERE {combined}' in resource_sql
+      and re.search(r'SUM\(CASE WHEN \{period\} THEN "BilledCost" ELSE 0 END\) AS service_cost',
+                    resource_sql)
+      and re.search(r'SUM\(CASE WHEN \{previous\} THEN "BilledCost" ELSE 0 END\) AS service_prior_cost',
+                    resource_sql)
+      and "SUM(service_cost) AS cost" in resource_sql
+      and "SUM(service_prior_cost) AS prior_cost" in resource_sql)
 check("first/last seen are bounded to the same combined window, not a full-history scan",
       '"ChargePeriodStart" > {prev} AND "ChargePeriodStart" <= DATE' in res
-      and 'FROM costs WHERE {combined}' in res
+      and 'FROM {source} WHERE {combined}' in res
       and 'MIN("ChargePeriodStart")' in res and 'MAX("ChargePeriodStart")' in res)
 check("the cost-area label reuses the taxonomy every other tab already uses",
       "from .dashboard import _group_for_family" in res)

@@ -221,7 +221,9 @@ def test_stored_summaries_match_their_grain_over_costs(wh):
 
     with wh.connect(read_only=True) as con:
         for module in (hourly_usage, usage_signals, resource_tags):
-            cols = ", ".join(f'"{c}"' for c in module.DIMENSIONS + module.MEASURES)
+            names = (module.DIMENSIONS + module.MEASURES
+                     + getattr(module, "ATTRIBUTES", []))
+            cols = ", ".join(f'"{c}"' for c in names)
             stored = f'SELECT {cols} FROM "{wh._rollup_schema}".{module.TABLE}'
             computed = f"SELECT {cols} FROM ({module.select_sql('costs')}) AS c"
             for a, b in ((stored, computed), (computed, stored)):
