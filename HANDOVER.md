@@ -38,7 +38,7 @@ Guesses say so.
    at import time. Scope isolation depends on per-connection temp views (§4).
 5. **Never edit source while pytest runs** — several tests read or `exec` source.
    Run the full suite **detached** (§1); attached runs were killed by interruptions.
-6. **`main` is 19 commits ahead of `backup/cloud-lens-v2/main`** (nothing after `e42bfef`
+6. **`main` is 20 commits ahead of `backup/cloud-lens-v2/main`** (nothing after `e42bfef`
    is pushed). `git push` needs credentials that are not cached on this machine. Ask Ravi
    before pushing.
 7. **The live admin password is never written down.** Ask Ravi and pass it only in the
