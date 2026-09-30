@@ -1,4 +1,4 @@
-# CloudLens — handover, 30 September 2026 (final, 19:05 IST)
+# CloudLens — handover, 30 September 2026 (revised 21:30 IST)
 
 Supersedes the 28 Sep handover, kept as `HANDOVER-2026-09-28.md`. Its architecture
 section (§6) and measurement traps (§3) still hold and are not repeated here; its
@@ -8,8 +8,11 @@ performance table, test list and open items are stale.
 snapshot cache in 0.1–3.9s — now including Anomalies and Billing opportunities, which were
 never cached before `e99b71c` — and since `383f72e` the server itself recomputes the views
 people use after a deploy, so the first view after a deploy is a cache hit too
-(Commitments 98.6s → 0.10s, Insights 46.6s → 0.13s). What remains: the tabs that wait on
-live Azure for anyone the warmer has not seen, and payload size.**
+(Commitments 98.6s → 0.10s, Insights 46.6s → 0.13s). The cold path for users the warmer has
+not seen has since been profiled and fixed at both ends: Commitments was never waiting on
+Azure at all but on collation and an unbounded sort (`9920e2d`), and Insights/Recommendations
+were paying a TLS handshake per subscription on the Advisor fan-out (`d3a6fcb`, 59.4s → 4.2s).
+What remains: payload size, and server-side filtering and paging.**
 
 Everything below is measured on the live Scale deployment or read from the code.
 Guesses say so.
@@ -31,7 +34,7 @@ Guesses say so.
    at import time. Scope isolation depends on per-connection temp views (§4).
 5. **Never edit source while pytest runs** — several tests read or `exec` source.
    Run the full suite **detached** (§1); attached runs were killed by interruptions.
-6. **`main` is 14 commits ahead of `backup/cloud-lens-v2/main`** (nothing after `e42bfef`
+6. **`main` is 19 commits ahead of `backup/cloud-lens-v2/main`** (nothing after `e42bfef`
    is pushed). `git push` needs credentials that are not cached on this machine. Ask Ravi
    before pushing.
 7. **The live admin password is never written down.** Ask Ravi and pass it only in the
@@ -126,6 +129,9 @@ Deployed commit: **`e99b71c`** (30 Sep, 13:26 UTC). All 11 derived tables stampe
 | `a1bc0cd` | Uptime and Tags group on byte-order keys; daily cells only for returned rows | Uptime 34.3s → 3.8s SQL, Tags 151s → 13s SQL |
 | `383f72e` | Server-side snapshot warming (§4) | First view after a deploy: Commitments 98.6s → 0.10s, Insights 46.6s → 0.13s, Recommendations 33.8s → 0.08s, Resources 31.3s → 4.6s, Tags 29.9s → 2.5s |
 | `e99b71c` | Opportunity prices count as evidence; Anomalies declares `partial_basis` | Billing opportunities 12.9s → 0.15s and Anomalies 2.2s → 0.14s on repeat (were never cached) |
+| `9920e2d` | Commitments: `COLLATE "C"` on the benefit grouping/DISTINCT keys, `LIMIT 4000` on the inventory drill-down | Inventory headline 70.6s → 7.9s, coverage benefits 65.7s → 5.7s, drill-down 34.3s → 1.65s, identical rows. Deployed and verified live |
+| `fbbf999` | Test stub identifies the benefit query by what it reads, not how it spells it | `9920e2d` changed the spelling; a stub matching on text went stale. Caught by the full suite |
+| `d3a6fcb` | One shared `httpx.AsyncClient` for all ARM calls instead of one per call | Advisor fan-out, 71 subscriptions, same 4 slots, same outcome: 59.4s → 4.2s wall, 141.3s → 13.3s summed, 2.05s → 0.18s mean per refused call |
 
 `c88bb58` (`plan.md`) is **another session's v3 plan**, not this work.
 
@@ -245,6 +251,10 @@ row with *no* currency code is data, a real code with no rate is source).
 
 ## 5. Performance — live, 30 Sep after `383f72e` and `e99b71c`
 
+**The table below is a snapshot taken at `e99b71c`. Its "Cold after deploy" column is stale
+for Commitments, Insights and Recommendations — see §5a for what `9920e2d` and `d3a6fcb`
+did to those three. Every other column still holds.**
+
 `tools\bench_tabs.py`, full runs. "Cold" = first view right after the deploy of `383f72e`,
 before any warm targets existed. "After warming" = first view on a *new* app version
 (`CLOUDLENS_BUILD_ID` bumped), measured once the server's warm pass had finished and before
@@ -271,19 +281,71 @@ anyone opened a tab. Session files `bench-deploy1-cold.txt`, `bench-deploy2-warm
 `service-health`) need parameters the bench does not send — by design.
 Repeat views of Resources/Tags are 2–4s because of payload size, not queries.
 
+### 5a. The cold path, profiled — and what the old §6 item 1 got wrong
+
+The old item 1 assumed all three slow cold tabs "wait on live Azure/Advisor/AI calls".
+**That was wrong for Commitments and only half the story for the other two.** Profiling
+statement by statement, as §1 prescribes, found two unrelated causes.
+
+**Commitments never touched Azure.** Its 98.6s was SQL, and the same `en_US.utf8` collation
+trap already recorded for Uptime and Tags: grouping and `DISTINCT` on long resource ids.
+`9920e2d` puts `COLLATE "C"` on the benefit grouping keys and bounds the inventory
+drill-down's sort with `LIMIT 4000`:
+
+| Statement | Before | After |
+|---|---|---|
+| Inventory headline | 70.6s | **7.9s** |
+| Coverage benefits | 65.7s | **5.7s** |
+| Inventory drill-down | 34.3s | **1.65s** |
+
+Rows are identical. Deployed to Scale and verified live. Note the asymmetry, because it is
+a trap: `COLLATE "C"` on the *drill-down* was measured **worse** (9.8s → 22.6s) — it changes
+the plan. The lever there is bounding the sort, not the collation.
+
+**Insights and Recommendations do wait on Azure, but not on Azure being slow.**
+`waste.advisor_recommendations` issues one ARM call per subscription — 71 on the live estate
+— through the process-wide `cost._CONCURRENCY = asyncio.Semaphore(4)`. 67 of the 71 return
+401, because the seeded HDFC subscription ids are real subscriptions in a foreign tenant.
+Measured: 157.5s of HTTP compressed into 59.3s wall, worst call waiting 55.9s for a slot.
+
+The cost was not the requests. `_fetch` opened a fresh `httpx.AsyncClient` per call, so every
+one of the 71 paid a new TCP connect and TLS handshake. `d3a6fcb` shares a single pool:
+
+| | Wall | Summed HTTP | Mean per refused call |
+|---|---|---|---|
+| A client per call | 59.4s | 141.3s | 2.05s |
+| One shared client | **4.2s** | **13.3s** | **0.18s** |
+
+Same 71 calls, same four slots, same outcome (14 recommendations, 68 refusals). The
+semaphore was deliberately **not** raised — throttling behaviour is what it exists to manage,
+and the handshake was the whole problem. Committed, **not yet deployed to Scale**, and the
+end-to-end cold tab timings have not been re-benched since.
+
+Two things were considered and rejected:
+
+- **Raising `_CONCURRENCY`.** Unnecessary once handshakes went; it would trade a solved
+  problem for a throttling risk.
+- **A negative cache for refused subscriptions.** Caching a 401/403 hides access that has
+  just been granted. Dropped.
+
+Measurement trap found the hard way: `asyncio.run()` leaves `_inflight` tasks bound to a dead
+event loop, so a second scenario in the same process measures contaminated numbers. **One
+process per scenario.**
+
 ---
 
 ## 6. Pending work — in the order I would do it
 
 Done on 30 Sep and no longer pending: server-side warming (`383f72e`), Always On enabled
-on Scale, Anomalies and Billing opportunities cached (`e99b71c`). See §3–§5.
+on Scale, Anomalies and Billing opportunities cached (`e99b71c`), the cold-path profile and
+both fixes it produced (`9920e2d`, `d3a6fcb` — §5a), and the full-suite run (below).
+See §3–§5.
 
-1. **Commitments, Insights, Recommendations are slow for anyone the warmer has not seen**
-   — a new Entra user, a new filter, a new scope: 98.6s / 46.6s / 33.8s cold. They wait on
-   live Azure/Advisor/AI calls and have never been profiled. Profile first on live, call by
-   call (`live_probe.py`-style read-only access + timing the app's real code path, §1) —
-   the collation and "discarded pass" wins were only found by timing statements. Look for
-   serial per-subscription Azure calls over 70 subscriptions, and repeated reads.
+1. **Deploy `d3a6fcb` to Scale and re-bench the cold path.** `9920e2d` is already live and
+   verified; the shared ARM client is committed but not deployed, and no end-to-end cold
+   timing exists for Insights/Recommendations after it. Bench the three tabs in §5a on a
+   fresh `CLOUDLENS_BUILD_ID` before the warmer has seen the user, and replace the stale
+   column in §5.
 2. **Server-side filtering and paging** (approved by Ravi: "summary tables first, then
    this"). Uptime, Tags, Resources, Billing return KPIs + chart data + one page (~50 rows);
    filters/sort/page as query params; same look and feel; update `tests/browser_*.js` and
@@ -294,14 +356,19 @@ on Scale, Anomalies and Billing opportunities cached (`e99b71c`). See §3–§5.
    both.
 4. **Verify Entra sign-in warming on live** (§4): after a deploy, sign in via SSO, confirm a
    `sign-in` pass runs for that oid (its targets' `computed` moves) and the next views hit.
-5. **Run the full suite detached** (§1) — not run since `383f72e`. Expected: only the
-   7 pre-existing failures (identical set before and after the 28–30 Sep work):
+5. **Full suite: run on 30 Sep at `d3a6fcb`. 2220 passed, 7 failed, 10 skipped, 1 error,
+   14m13s with `-n 4`.** The 7 are exactly the pre-existing set listed below — confirmed by
+   re-running them against a clean tree with `app/cost.py` stashed, where all 7 fail
+   identically. They are **not** caused by any 28–30 Sep work and remain unfixed:
    `test_budget_reading`, `test_datastore_safety::test_summary_does_not_label_unknown_plus_usd_as_single_currency`,
    `test_overview`, `test_postgres::test_rows_written_by_copy_come_back_intact`,
    `test_postgres::test_duplicate_spellings_preserve_charges_pending_authoritative_reingest`,
    `test_summary_pending::test_warehouse_summary_returns_pending_after_an_exists_probe`,
    `test_visuals` (399/400: "the server hands over the parsed filter for that link").
-   Targeted runs so far: `383f72e` 27 new + 449 related pass; `e99b71c` 388 + 114 pass.
+   The 1 error, `test_fx_rollup::test_failed_build_preserves_native_statistics`, is
+   ordering-dependent: it passes when run on its own. Whoever picks these up should start
+   with `test_postgres` — `summary()["rows"]` comes back `None` where 2 is expected, which
+   looks like one cause behind several of the seven.
 6. `/api/schedules` is 8.2s cold and not a snapshot-cached route (0.08s repeat from its
    own cache). Small; check whether it belongs in `DEFAULT_POLICIES`.
 7. Unconfirmed: live July partition looks bloated (≈20GB heap for 5.0M rows vs ≈10GB for
@@ -320,6 +387,16 @@ on Scale, Anomalies and Billing opportunities cached (`e99b71c`). See §3–§5.
 - **Tags cells gathered *after* the top-N cut** (lateral per resource into the grouped
   days) timed out at 300s; inline `json_agg` costs only +1.5s.
 - **`COLLATE "C"` applied to the whole Uptime query** (reaching the tag lookup): 10+ min.
+- **`COLLATE "C"` on the Commitments inventory drill-down**: 9.8s → **22.6s**. It changes
+  the plan. The same collation is a large win on that tab's *grouping* keys (§5a) — it is
+  not a blanket fix. Bounding the sort (`LIMIT 4000`) is the lever there.
+- **Raising `cost._CONCURRENCY` above 4 to speed the Advisor fan-out.** Rejected: the
+  handshake per call was the cost, not the concurrency, and the semaphore exists to manage
+  throttling. Sharing one client fixed it without touching the limit (§5a).
+- **Negative-caching refused (401/403) subscriptions in the fan-out.** Rejected: it would
+  hide access that has just been granted.
+- **Two `asyncio.run()` scenarios in one process give contaminated numbers** — `_inflight`
+  tasks survive bound to a dead loop. One process per scenario.
 - **Timing right after a deploy is noisy.** Autovacuum/analyse of new tables and cold
   tab builds on 2 vCPUs tripled some timings (Resources read 30s, then 10s, for the same
   7-day query). Re-measure in isolation before believing a regression.
@@ -354,9 +431,11 @@ on Scale, Anomalies and Billing opportunities cached (`e99b71c`). See §3–§5.
 ## 9. First moves in the new chat
 
 1. `git status` (only `tools/bench-tabs-latest.json` should be dirty) and
-   `git log --oneline -8` — top should be this handover, then `e99b71c`, `383f72e`.
+   `git log --oneline -8` — top should be this handover, then `d3a6fcb`, `fbbf999`,
+   `9920e2d`, `e99b71c`, `383f72e`.
 2. Start the Scale database if stopped; confirm the firewall rule for today's IP.
 3. Ask Ravi for the live admin password (process environment only) and re-run
    `tools\bench_tabs.py` against live for today's baseline. Expect hits almost everywhere:
    the 19 warm targets were computed after the last deploy and Always On keeps them warm.
-4. Pick up §6 item 1 (profile the Azure-bound tabs), unless Ravi prefers item 2 (paging).
+4. Pick up §6 item 1 (deploy `d3a6fcb`, re-bench the cold path, replace the stale §5
+   column), unless Ravi prefers item 2 (paging).
