@@ -1,8 +1,11 @@
-# CloudLens — handover, 30 September 2026 (revised 21:30 IST)
+# CloudLens — handover, 30 September 2026 (final, 22:00 IST)
 
 Supersedes the 28 Sep handover, kept as `HANDOVER-2026-09-28.md`. Its architecture
 section (§6) and measurement traps (§3) still hold and are not repeated here; its
 performance table, test list and open items are stale.
+
+**Start here:** §0 (the rules), then §6 item 1 (the next task), then §5a (why it is the
+next task). §9 is the literal first five commands.
 
 **State: every data tab on the Scale deployment answers, repeat views come from the
 snapshot cache in 0.1–3.9s — now including Anomalies and Billing opportunities, which were
@@ -10,9 +13,10 @@ never cached before `e99b71c` — and since `383f72e` the server itself recomput
 people use after a deploy, so the first view after a deploy is a cache hit too
 (Commitments 98.6s → 0.10s, Insights 46.6s → 0.13s). The cold path for users the warmer has
 not seen has since been profiled and fixed at both ends: Commitments was never waiting on
-Azure at all but on collation and an unbounded sort (`9920e2d`), and Insights/Recommendations
-were paying a TLS handshake per subscription on the Advisor fan-out (`d3a6fcb`, 59.4s → 4.2s).
-What remains: payload size, and server-side filtering and paging.**
+Azure at all but on collation and an unbounded sort (`9920e2d`, live), and
+Insights/Recommendations were paying a TLS handshake per subscription on the Advisor
+fan-out (`d3a6fcb`, 59.4s → 4.2s, committed but **not yet deployed**). What remains:
+deploy and re-bench that fix, then payload size and server-side filtering and paging.**
 
 Everything below is measured on the live Scale deployment or read from the code.
 Guesses say so.
@@ -54,11 +58,13 @@ Venv: `C:\Users\raviverma\.venvs\cloudlenstony\Scripts\python.exe`
 $env:CLOUDLENS_PG_TEST='localhost'; $env:CLOUDLENS_PG_USER='postgres'
 $env:PGPASSWORD='6352'; $env:PGSSLMODE='disable'
 python -m pytest tests\test_usage_summaries.py -q          # targeted
+python -m pytest -q -n 4                                   # full, ~14 min
 ```
 
 - Do not pass `-p no:cacheprovider` — conftest needs `config.cache`.
-- Full suite ≈ 34–40 min serial. Launch it detached: write a small `.ps1` that sets the
-  env vars and redirects pytest to a log, then `Start-Process pwsh -File <it>`.
+- Full suite ≈ 34–40 min serial, **14m13s with `-n 4`** (measured 30 Sep at `d3a6fcb`).
+  `-n 4` is the reason it no longer needs detaching, but an attached run still dies with
+  the chat session — if you may be interrupted, redirect to a log and `Start-Process pwsh`.
 - Lint: `python -m ruff check app tests\<files>` (targets py3.11: no nested same-quote
   f-strings; SIM rules are on).
 - The local PostgreSQL is **shared with other sessions** (e.g. `D:\cloud lens v3`
@@ -113,7 +119,10 @@ carry `X-CloudLens-Cache` (`hit`/`miss`/`response-too-large`/…) and `Server-Ti
 | Data | 16.9M cost rows, 2026-07-01 → 2026-09-28, 70 subscriptions (HDFC demo) |
 | Sign-in | SSO shows only the user's own RBAC subscriptions; use local `admin` to see all 70 |
 
-Deployed commit: **`e99b71c`** (30 Sep, 13:26 UTC). All 11 derived tables stamped.
+Deployed commit: **`9920e2d`** (30 Sep — the Commitments collation/sort fix, verified live).
+All 11 derived tables stamped. **`d3a6fcb` (shared ARM client) is committed but not
+deployed**; `fbbf999` is test-only. Local `main` is therefore two code commits ahead of
+Scale, one of which matters.
 
 ---
 
@@ -338,8 +347,9 @@ process per scenario.**
 
 Done on 30 Sep and no longer pending: server-side warming (`383f72e`), Always On enabled
 on Scale, Anomalies and Billing opportunities cached (`e99b71c`), the cold-path profile and
-both fixes it produced (`9920e2d`, `d3a6fcb` — §5a), and the full-suite run (below).
-See §3–§5.
+both fixes it produced (`9920e2d`, `d3a6fcb` — §5a), and the full suite, which ran at
+`d3a6fcb`: **2220 passed, 7 failed, 10 skipped, 1 error, 14m13s with `-n 4`** (log in the
+session folder, §8). See §3–§5.
 
 1. **Deploy `d3a6fcb` to Scale and re-bench the cold path.** `9920e2d` is already live and
    verified; the shared ARM client is committed but not deployed, and no end-to-end cold
@@ -356,19 +366,18 @@ See §3–§5.
    both.
 4. **Verify Entra sign-in warming on live** (§4): after a deploy, sign in via SSO, confirm a
    `sign-in` pass runs for that oid (its targets' `computed` moves) and the next views hit.
-5. **Full suite: run on 30 Sep at `d3a6fcb`. 2220 passed, 7 failed, 10 skipped, 1 error,
-   14m13s with `-n 4`.** The 7 are exactly the pre-existing set listed below — confirmed by
-   re-running them against a clean tree with `app/cost.py` stashed, where all 7 fail
-   identically. They are **not** caused by any 28–30 Sep work and remain unfixed:
+5. **The seven pre-existing test failures, still unfixed.** Proved pre-existing on 30 Sep
+   by re-running them against a clean tree with `app/cost.py` stashed — all seven fail
+   identically, so no 28–30 Sep work caused them:
    `test_budget_reading`, `test_datastore_safety::test_summary_does_not_label_unknown_plus_usd_as_single_currency`,
    `test_overview`, `test_postgres::test_rows_written_by_copy_come_back_intact`,
    `test_postgres::test_duplicate_spellings_preserve_charges_pending_authoritative_reingest`,
    `test_summary_pending::test_warehouse_summary_returns_pending_after_an_exists_probe`,
    `test_visuals` (399/400: "the server hands over the parsed filter for that link").
-   The 1 error, `test_fx_rollup::test_failed_build_preserves_native_statistics`, is
-   ordering-dependent: it passes when run on its own. Whoever picks these up should start
-   with `test_postgres` — `summary()["rows"]` comes back `None` where 2 is expected, which
-   looks like one cause behind several of the seven.
+   Start with `test_postgres`: `summary()["rows"]` comes back `None` where 2 is expected,
+   which looks like one cause sitting behind several of the seven. Separately, the 1 error,
+   `test_fx_rollup::test_failed_build_preserves_native_statistics`, is ordering-dependent —
+   it passes on its own, so it is a test-isolation bug, not a product one.
 6. `/api/schedules` is 8.2s cold and not a snapshot-cached route (0.08s repeat from its
    own cache). Small; check whether it belongs in `DEFAULT_POLICIES`.
 7. Unconfirmed: live July partition looks bloated (≈20GB heap for 5.0M rows vs ≈10GB for
@@ -421,10 +430,13 @@ See §3–§5.
 - Prove a failure is pre-existing by running it on the base commit.
 - Commit messages explain *why*, with the numbers.
 - Session scratch (bench outputs, captured SQL, plans, probe scripts) lives in the Scout
-  session folders `…\session-state\93969277-…\files\` (up to `a1bc0cd`) and
+  session folders `…\session-state\93969277-…\files\` (up to `a1bc0cd`),
   `…\session-state\e27b8924-…\files\` (warming: `live_probe.py` prints live meta, snapshot
   and warm-target state read-only; `live_watch.py` follows a warm pass; both bench
-  outputs), not in the repo. Copy the probes into the new session's folder if useful.
+  outputs), and `…\session-state\1ccfca3b-…\files\` (the 30 Sep full-suite log
+  `suite-d3a6fcb.log` and the clean-tree baseline `suite-baseline-clean-tree.log` that
+  proves the seven failures pre-existing). Not in the repo. Copy the probes into the new
+  session's folder if useful.
 
 ---
 
@@ -432,10 +444,13 @@ See §3–§5.
 
 1. `git status` (only `tools/bench-tabs-latest.json` should be dirty) and
    `git log --oneline -8` — top should be this handover, then `d3a6fcb`, `fbbf999`,
-   `9920e2d`, `e99b71c`, `383f72e`.
-2. Start the Scale database if stopped; confirm the firewall rule for today's IP.
+   `9920e2d`, `e99b71c`, `383f72e`. Scale is running `9920e2d`, so `main` is ahead of
+   live by one code commit that matters (§2).
+2. Start the Scale database if stopped; confirm the firewall rule for today's IP (§1).
 3. Ask Ravi for the live admin password (process environment only) and re-run
    `tools\bench_tabs.py` against live for today's baseline. Expect hits almost everywhere:
    the 19 warm targets were computed after the last deploy and Always On keeps them warm.
 4. Pick up §6 item 1 (deploy `d3a6fcb`, re-bench the cold path, replace the stale §5
    column), unless Ravi prefers item 2 (paging).
+5. Before believing any number: read §7 first, and re-measure in isolation. Two of the
+   entries there are traps this session walked into and had to back out of.
