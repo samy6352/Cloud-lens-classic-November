@@ -654,7 +654,89 @@ def test_whole_request_failure_is_never_cached_as_partial():
     asyncio.run(scenario())
 
 
-def test_live_azure_views_are_cached_and_budget_views_are_named():
+def test_opportunity_prices_are_money_so_a_permission_limited_report_is_kept():
+    """Billing opportunities, as live returned it on 30 Sep: partial because Azure refused
+    reservation reads (403), and priced only in `monthly_savings`/`annual_savings`."""
+    async def scenario():
+        cache, auth, calls = make_cache(), Authorize(), []
+
+        async def origin():
+            calls.append(1)
+            return JSONResponse({
+                "status": "partial",
+                "opportunities": [{"id": "waste:old_snapshots", "monthly_savings": 0.83,
+                                   "annual_savings": 9.96, "currency": "USD"}],
+                "potential": {"monthly": 0.83, "annual": 9.96, "partial": True},
+                "commitments": {"items": [], "partial": True, "unavailable": [
+                    {"source": "/providers/Microsoft.Capacity/reservations",
+                     "reason": "Azure denied read access (403)."}]},
+            })
+
+        first = await cache.get(request(), origin, auth)
+        assert first.headers["x-cloudlens-cache"] == "miss"
+        second = await cache.get(request(), origin, auth)
+        assert second.headers["x-cloudlens-cache"] == "hit"
+        assert second.headers["x-cloudlens-coverage"] == "partial"
+        assert calls == [1]
+        await cache.close()
+
+    asyncio.run(scenario())
+
+
+def test_partial_coverage_the_data_itself_explains_is_kept_until_the_data_changes():
+    """Anomalies on an estate loaded without FOCUS day receipts: nothing to price, and
+    nothing a second read could add. Held for the full TTL; a new generation retires it."""
+    async def scenario():
+        now = [1000.0]
+        store, auth, calls = MemoryStore(), Authorize(), []
+        cache = SnapshotCache(store, version="calculation-v1",
+                              policies={PATH: Policy("warehouse", 86400, 604800)},
+                              clock=lambda: now[0])
+        body = {"anomalies": [], "count": 0, "daily": [], "partial": True,
+                "unavailable": True, "partial_basis": "data",
+                "coverage": {"verified_subscription_days": 0}}
+
+        async def origin():
+            calls.append(1)
+            return JSONResponse(body)
+
+        await cache.get(request(), origin, auth)
+        item = next(iter(store.rows.values()))
+        assert item.expires == item.created + 86400, "not the one-hour partial TTL"
+        hit = await cache.get(request(), origin, auth)
+        assert (hit.headers["x-cloudlens-cache"], hit.headers["x-cloudlens-coverage"]) == (
+            "hit", "partial")
+        assert calls == [1]
+        store.generation = "2"
+        await cache.get(request(), origin, auth)
+        await settle(cache)
+        assert len(calls) == 2, "new data is asked again"
+        await cache.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("body", [
+    {"anomalies": [], "partial": True, "unavailable": True, "partial_basis": "source"},
+    {"anomalies": [], "partial": True, "unavailable": True},
+    {"anomalies": [], "partial": True, "partial_basis": "data", "error": "receipts unreadable"},
+    {"status": "running", "partial": True, "partial_basis": "data"},
+])
+def test_only_a_clean_data_basis_makes_an_empty_partial_report_cacheable(body):
+    async def scenario():
+        cache, auth, calls = make_cache(), Authorize(), []
+
+        async def origin():
+            calls.append(1)
+            return JSONResponse(body)
+
+        await cache.get(request(), origin, auth)
+        await cache.get(request(), origin, auth)
+        assert cache.store.rows == {}
+        assert len(calls) == 2
+        await cache.close()
+
+    asyncio.run(scenario())
     from app.main import BUDGET_VIEWS
     from app.snapshot_cache import DEFAULT_POLICIES
 

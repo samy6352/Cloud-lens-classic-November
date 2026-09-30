@@ -79,6 +79,14 @@ SCORE_CAP = 50.0
 # come back acknowledged after a tuning change nobody connected to it.
 ALGORITHM = "cloudlens-weekday-mad-v1"
 
+# The two ways this report can be partial because a *read* failed rather than because of
+# what the committed data holds: the day receipts could not be read, or a real currency
+# code has no verified rate yet. Anything else partial is a property of the data, and is
+# declared as such (`partial_basis`) so the snapshot cache can keep it until the data
+# changes instead of recomputing an identical answer on every view.
+RECEIPTS_UNREADABLE = "Authoritative FOCUS day coverage is unavailable."
+NO_VERIFIED_RATE = "A verified USD exchange rate is required for monetary thresholds."
+
 # How far apart two anomalous days can sit and still be one event. A runaway job that
 # bills for three days is one thing that happened, and reporting it three times is how a
 # list of findings stops being read. Two days rather than one, because a single settled
@@ -449,7 +457,7 @@ def _coverage(con: Any, scope: list[str] | None, start: date,
                     known[sub].add(day)
         except Exception:
             log.warning("Authoritative anomaly day coverage is unavailable.")
-            reason = "Authoritative FOCUS day coverage is unavailable."
+            reason = RECEIPTS_UNREADABLE
     else:
         reason = "No subscription cohort is available to verify daily completeness."
     common = set.intersection(*known.values()) if known else set()
@@ -506,7 +514,7 @@ def analyse(scope: list[str] | None = None, days: int = 60,
             return {"anomalies": [], "count": 0, "incidents": [], "incident_count": 0,
                     "algorithm": ALGORITHM,
                     "currency": fx.currency_code(display_currency),
-                    "partial": True, "unavailable": True,
+                    "partial": True, "unavailable": True, "partial_basis": "data",
                     "coverage": {"basis": "validated_focus_day_receipts", "verified_days": 0},
                     "note": "No cost data is loaded yet, so there is nothing to compare against."}
 
@@ -539,11 +547,15 @@ def analyse(scope: list[str] | None = None, days: int = 60,
         currency = next(iter(codes)) if len(codes) == 1 and fx.currency_code(next(iter(codes))) else None
         results: list[dict[str, Any]] = []
         unavailable: dict[str, str] = {}
+        # A real currency code with no verified rate is a lookup that may succeed next time;
+        # a row with no currency code at all is the data, and no later read changes it.
+        rate_missing = False
         assessed_by_currency: dict[str, set[str]] = {}
         for code in sorted(codes):
             scale = fx.rate_to(code) if fx.currency_code(code) else None
             if scale is None or not math.isfinite(scale) or scale <= 0:
-                unavailable[code or "unknown"] = "A verified USD exchange rate is required for monetary thresholds."
+                unavailable[code or "unknown"] = NO_VERIFIED_RATE
+                rate_missing = rate_missing or bool(fx.currency_code(code))
                 continue
             assessed: set[str] = set()
             for dim in dimensions:
@@ -637,6 +649,8 @@ def analyse(scope: list[str] | None = None, days: int = 60,
         for code in codes if code not in unavailable and code
     }
     incidents = collapse_incidents(merged)
+    partial = bool(unavailable) or not bool(codes) or coverage_partial
+    read_failed = coverage["reason"] == RECEIPTS_UNREADABLE or rate_missing
     return {
         "anomalies": merged[:top],
         "count": len(merged),
@@ -654,8 +668,12 @@ def analyse(scope: list[str] | None = None, days: int = 60,
         "impact_by_currency": impact_by_currency,
         "currency": currency,
         "mixed_currency": len(codes) > 1,
-        "partial": bool(unavailable) or not bool(codes) or coverage_partial,
+        "partial": partial,
         "unavailable": not bool(codes) or len(unavailable) == len(codes),
+        # Why it is partial: "data" when the committed rows and their day receipts are all
+        # this answer can ever say until they change; "source" when a read failed and asking
+        # again may say more.
+        "partial_basis": ("source" if read_failed else "data") if partial else None,
         "unavailable_currencies": unavailable,
         "coverage": coverage,
         "coverage_reason": coverage["reason"] or (

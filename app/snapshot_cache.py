@@ -10,6 +10,8 @@ runs in threads; no Redis, browser persistence or Azure calls live in this modul
 Normal expired reads use stale-while-revalidate. Explicit force/refresh/fresh
 requests await source completion. Coverage is independent of freshness: completed
 partial reports retain their original evidence and X-CloudLens-Coverage=partial.
+A report whose partial coverage is a property of the committed data declares
+`"partial_basis": "data"` and is kept like any complete answer until the data changes.
 Poll using ETag plus As-Of/Stale/Revalidating headers, including on HTTP 304.
 
 AI Billing alone reuses a whole report until the scoped imported data day changes
@@ -97,6 +99,10 @@ _JOB_FIELDS = frozenset({
 _EVIDENCE_FIELDS = frozenset({
     "cost", "total", "total_cost", "billed_cost", "amount", "value", "input", "output",
     "input_tokens", "output_tokens", "saving", "savings",
+    # Billing opportunities prices every row this way. Without these its partial report --
+    # partial because Azure refuses reservation reads (403) -- looked like it carried no money
+    # and was recomputed on every view (12.9s on live, 30 Sep).
+    "monthly_savings", "annual_savings",
 })
 _ROW_FIELDS = frozenset({
     "resources", "services", "models", "rows", "items", "opportunities", "recommendations",
@@ -617,6 +623,11 @@ def _cacheable_report(value: Any) -> bool:
         return False
     if isinstance(value, dict) and any(value.get(key) for key in ("error", "errors", "problem")):
         return False
+    # A report may declare that its partial coverage is what the committed data says --
+    # missing day receipts, no rows yet -- rather than a failed read. Asking again cannot
+    # change that answer; a new data generation can, and the generation fence retires it.
+    if isinstance(value, dict) and value.get("partial_basis") == "data":
+        return True
     # Partial means evidence coverage, not an unfinished request. Keep all original
     # unknowns/notices/statuses; only failure-shaped empty reports are rejected.
     return not _partial_evidence(value) or _has_evidence(value)

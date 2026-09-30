@@ -217,9 +217,25 @@ def test_anomalies_require_authoritative_subscription_day_coverage(postgres_ware
         assert result["count"] == 0 and result["partial"]
         assert result["unavailable"] == (mode in {"no_receipts", "no_baseline"})
         assert result["coverage_reason"]
+    # Every mode here is a property of the committed rows and receipts, never a failed read.
+    assert result["partial_basis"] == ("data" if result["partial"] else None)
     if mode in {"gap", "partial_subscription", "unknown_currency"}:
         assert missing in result["coverage"]["unverified_days"]
         assert missing not in {row["day"] for row in result["daily"]}
+
+
+def test_anomalies_mark_a_missing_exchange_rate_as_a_failed_read(postgres_warehouse, monkeypatch):
+    from app import anomalies, currency
+
+    days = [(date(2026, 7, 17) + timedelta(days=i)).isoformat() for i in range(60)]
+    put(postgres_warehouse, [{"SubAccountId": SUB_A, "ChargePeriodStart": day,
+                              "BilledCost": 20.0, "BillingCurrency": "USD"} for day in days])
+    certify(postgres_warehouse)
+    monkeypatch.setattr(currency, "rate_to", lambda code: None)
+    result = anomalies.analyse([SUB_A], 7, ("ServiceName",))
+    assert result["partial"] and result["unavailable"]
+    assert result["unavailable_currencies"] == {"USD": anomalies.NO_VERIFIED_RATE}
+    assert result["partial_basis"] == "source"
 
 
 def test_cost_join_retains_same_resource_multiple_currencies(postgres_warehouse):
