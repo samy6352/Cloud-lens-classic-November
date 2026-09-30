@@ -208,6 +208,10 @@ DEFAULT_POLICIES = {
     # "no budgets" can never outlive the create that disproves it.
     "/api/budgets": MONITOR,
     "/api/insights": MONITOR,
+    # Deliberately absent: `/api/schedules` (8.2s cold on Scale). Its answer carries live
+    # export-sync progress and the viewer's own write rights, both changed by a create or
+    # delete that would not change a snapshot key; its own listing cache already answers
+    # repeats in 0.08s.
 }
 
 
