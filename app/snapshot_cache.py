@@ -765,6 +765,39 @@ def _complete(body: bytes) -> bool:
         return False
 
 
+def _eligible(response: Response, limit: int, old_body: bytes | None, full_ttl: float,
+              data_day: str | None) -> tuple[bytes | None, float, bool]:
+    """What of an origin answer may be stored, for how long, and whether it is pending.
+
+    Returns `(body, ttl, pending)`. Synchronous and CPU-bound, so the caller runs it on a
+    worker thread. Stamps a daily policy's `data_day` into the response it is given, which
+    is safe there: nothing else holds the response until this returns.
+    """
+    body = _body(response, limit)
+    ttl = full_ttl
+    if body is None and not _pending_body(response, limit):
+        # A complete answer about incomplete evidence -- one subscription
+        # throttled, some days not yet verified -- is still the answer the
+        # next viewer would get after waiting the full origin time, so it is
+        # kept briefly rather than recomputed on every view. Measured on the
+        # 16.9M-row estate: Commitments 98s and Waste 6s on *every* load, because
+        # each always reported partial coverage somewhere. It never replaces a
+        # complete snapshot: the last good answer is worth more than a new
+        # partial one, and the failure path keeps serving it.
+        partial = _partial_body(response, limit)
+        if partial is not None and not (old_body is not None and _complete(old_body)):
+            body, ttl = partial, min(full_ttl, PARTIAL_TTL)
+    if body is not None and data_day:
+        value = json.loads(body)
+        value["snapshot"] = {"cadence": "data-day", "data_day": data_day}
+        response.body = json.dumps(value, separators=(",", ":"), ensure_ascii=True).encode()
+        response.headers["Content-Length"] = str(len(response.body))
+        body = (_body(response, limit) if ttl == full_ttl
+                else _partial_body(response, limit))
+    pending = body is None and _pending_body(response, limit)
+    return body, ttl, pending
+
+
 def _pending_body(response: Response, limit: int) -> bool:
     body = getattr(response, "body", None)
     if (response.status_code != 200 or not isinstance(body, bytes) or len(body) > limit
@@ -1193,29 +1226,17 @@ class SnapshotCache:
                 if response.status_code in {401, 403}:
                     await self._db(self.store.discard, key, partition)
                     return response
-                body = _body(response, self.store.max_payload)
                 ttl = policy.ttl
-                if body is None and not _pending_body(response, self.store.max_payload):
-                    # A complete answer about incomplete evidence -- one subscription
-                    # throttled, some days not yet verified -- is still the answer the
-                    # next viewer would get after waiting the full origin time, so it is
-                    # kept briefly rather than recomputed on every view. Measured on the
-                    # 16.9M-row estate: Commitments 98s and Waste 6s on *every* load, because
-                    # each always reported partial coverage somewhere. It never replaces a
-                    # complete snapshot: the last good answer is worth more than a new
-                    # partial one, and the failure path below keeps serving it.
-                    partial = _partial_body(response, self.store.max_payload)
-                    if partial is not None and not (old is not None and _complete(old.body)):
-                        body, ttl = partial, min(policy.ttl, PARTIAL_TTL)
-                if body is not None and policy.daily and context.data_day:
-                    value = json.loads(body)
-                    value["snapshot"] = {"cadence": "data-day", "data_day": context.data_day}
-                    response.body = json.dumps(value, separators=(",", ":"), ensure_ascii=True).encode()
-                    response.headers["Content-Length"] = str(len(response.body))
-                    body = (_body(response, self.store.max_payload) if ttl == policy.ttl
-                            else _partial_body(response, self.store.max_payload))
+                # Parsing and scanning the answer is CPU-bound and scales with its size:
+                # 3.3s for a 15MB Resources body, and a partial answer re-reads the old
+                # one too. On the event loop that stalled every other request, cache hits
+                # included, for the length of each cold compute's check.
+                body, ttl, pending = await asyncio.to_thread(
+                    _eligible, response, self.store.max_payload,
+                    old.body if old is not None else None, policy.ttl,
+                    context.data_day if policy.daily else None)
                 if body is None:
-                    if _pending_body(response, self.store.max_payload):
+                    if pending:
                         return self._source_state(response, "source-pending", generation)
                     # Size is its own diagnosis. Saying "incomplete" about a complete
                     # answer sends the next person to read the query rather than the

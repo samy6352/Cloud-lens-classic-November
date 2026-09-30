@@ -552,6 +552,41 @@ def test_hit_on_a_snapshot_stored_before_prepared_bytes_existed_behaves_as_befor
     asyncio.run(scenario())
 
 
+def test_write_time_eligibility_check_runs_off_the_event_loop(monkeypatch):
+    """Parsing and scanning a cold answer is seconds of CPU on a large one; on the loop it
+    stalled every concurrent request. The check must run on a worker thread and still
+    decide exactly as before."""
+    import threading
+
+    import app.snapshot_cache as snapshot_cache
+
+    threads = []
+    original = snapshot_cache._eligible
+
+    def spy(*args, **kwargs):
+        threads.append(threading.current_thread())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(snapshot_cache, "_eligible", spy)
+
+    async def scenario():
+        cache, auth = make_cache(), Authorize()
+        cache.store.max_payload = 10 ** 7
+
+        async def origin():
+            return JSONResponse(BIG)
+
+        await cache.start()
+        loop_thread = threading.current_thread()
+        first = await cache.get(request(), origin, auth)
+        assert json.loads(first.body) == BIG
+        assert threads and all(t is not loop_thread for t in threads)
+        assert len(cache.store.rows) == 1, "a complete answer is still stored"
+        await cache.close()
+
+    asyncio.run(scenario())
+
+
 def test_small_answer_is_not_stored_twice():
     async def scenario():
         cache, auth = make_cache(), Authorize()
