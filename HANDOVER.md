@@ -4,6 +4,41 @@ Supersedes the 28 Sep handover, kept as `HANDOVER-2026-09-28.md`. Its architectu
 section (§6) and measurement traps (§3) still hold and are not repeated here; its
 performance table, test list and open items are stale.
 
+> **Update, 1 Oct ~03:30 IST — read this before the rest.** Items 2, 3, 4, 6 and 7 of §6
+> are done, pushed to `backup/cloud-lens-v2/main` and deployed to Scale (`ac9bf8e`,
+> RuntimeSuccessful, warm pass 21:34–21:38 UTC). Full suite at `ac9bf8e`: **2243 passed,
+> 0 failed, 10 skipped** (12m18s, `-n 4`); the ordering-dependent `test_fx_rollup` error
+> did not recur.
+>
+> - `8cdae1a` Insights reads untagged spend from `tags.untagged_summary` (same ranking, cut,
+>   currency and tag lookup as `cost_by_tag`; tests hold them equal). Standalone on live
+>   **31s → 5.9s** (one 5.0s query). Inside Insights the source still reads 26.7s because
+>   eight sources share the 2-vCPU database at once; the ceiling is now `waste` (20.0s) and
+>   `rightsizing` (19.1s), as predicted.
+> - `54afda3` Write-time eligibility check (`_eligible`) on a worker thread: longest
+>   event-loop stall on the real 15.3MB Resources body **1,766ms → 247ms**.
+> - `a171364` The seven old failures were all harness drift (deferred `summary()`, a
+>   hard-coded date, a missing `log` global, a fake reader without `budget_ms`, renamed
+>   variables in a source check). No product change.
+> - `ac9bf8e` `/api/schedules` deliberately stays out of `DEFAULT_POLICIES` (live sync
+>   progress and per-viewer write rights; its own ARM cache answers repeats in 0.08s).
+> - Warm-pass after the deploy showed Resources 30.1s → 45.7s: **not a regression**. MCAPS
+>   had stopped the database (00:35 IST, principal `da847d8c…`, §1) and it was started just
+>   before the deploy, so buffers were cold; Resources' SQL re-measured standalone on live
+>   is 17.8–18.3s, as before. Re-read `warm_compare` after the next deploy on a warm DB.
+> - **§1 was wrong:** `Warehouse()` *does* run DDL on construction (`_init_schema`), and
+>   `CLOUDLENS_READ_INDEXES=true` (from the local `.env`) makes a reader
+>   `CREATE INDEX` on `resource_presence_a`. A profile run on 1 Oct did exactly that on live
+>   for ~6 min, blocking one app query; it was cancelled (rolled back, no index left). Live
+>   profiling now uses `…\79e1dc8d-…\files\live_tags_profile.py`: live's own app settings
+>   only, `_init_schema` skipped, and a client-side guard refusing any non-`TEMP` write.
+> - **Local database:** v3 now owns a plain `public.resource_ids` and v2's
+>   `resource_costs` is gone, so a local v2 fails at boot (`"resource_ids" is not a view`,
+>   rolled back, nothing damaged). Local benches skip `_ensure_derived`; decide with Ravi
+>   whether to give v2 and v3 separate databases.
+> - Still open: items 1, 5, 9 (need Ravi) and 8 (July partition; now unblocked while the DB
+>   is up — read-only catalog probe).
+
 **Start here:** §0 (the rules), then §6 (the pending list, with what each item waits on),
 then §5b (why paging is no longer the obvious next step). §9 is the literal first moves.
 Nothing is in flight: no background job, test run or deploy was left running, `main` is
@@ -122,9 +157,11 @@ carry `X-CloudLens-Cache` (`hit`/`miss`/`response-too-large`/…) and `Server-Ti
 - Firewall rule `ScoutSeed-20260928` covers `223.181.21.208`; add one if the IP changed.
 - Password = `az account get-access-token --resource https://ossrdbms-aad.database.windows.net`,
   user `raviverma_microsoft.com#EXT#@fdpo.onmicrosoft.com`, db `cloudlens`, `sslmode=require`.
-- `Warehouse()` does no DDL on construction and a reader only creates temp views, so the
-  app's real code path can be profiled against live with `CLOUDLENS_READ_ONLY=true` and
-  the `PG*` vars pointed at it. Patch `psycopg.Cursor.execute` to time statements.
+- `Warehouse()` **runs DDL on construction** (`_init_schema`: CREATE TABLE/INDEX, derived
+  checks) whatever `CLOUDLENS_READ_ONLY` says, and `CLOUDLENS_READ_INDEXES=true` makes a
+  reader build indexes. Against live, skip `_init_schema`, use live's own app settings (not
+  the local `.env`), and refuse non-`TEMP` writes client-side — see the 1 Oct update above.
+  Readers still need a writable session for their temp views.
 - App SQL is a portable dialect; run it by hand through `sqldialect.to_postgres(sql, bind=False)`.
 
 ---
@@ -142,7 +179,8 @@ carry `X-CloudLens-Cache` (`hit`/`miss`/`response-too-large`/…) and `Server-Ti
 | Sign-in | SSO shows only the user's own RBAC subscriptions; use local `admin` to see all 70 |
 | App identity | `cloudlens-id-scale` (user-assigned): Reader + Cost Management Reader on **one** subscription, the one hosting `CloudLens-Scale`. Local `admin` has no delegated token, so its live Azure calls (Advisor, Resource Graph, Monitor) go out as this identity and cover that one subscription — not the 70 in the warehouse |
 
-Deployed commit: **`f1b2446`** (30 Sep 18:18 UTC, `az webapp deploy`, RuntimeSuccessful;
+Deployed commit: **`ac9bf8e`** (30 Sep ~21:33 UTC = 1 Oct ~03:03 IST, RuntimeSuccessful;
+see the update at the top). Previously **`f1b2446`** (30 Sep 18:18 UTC, `az webapp deploy`, RuntimeSuccessful;
 warm pass claimed 18:18:06, all 17 targets recomputed by 18:21:40; the migration added
 `private_snapshots.coverage` and `.body_gzip`, and all 17 rewritten rows carry them —
 Resources 14.6MB stored with a 1.10MB gzip copy, Tags 10.0MB/1.43MB, Uptime 7.5MB/0.67MB).
@@ -496,12 +534,12 @@ re-run since. See §3–§5.
 | # | Step | Waits on |
 |---|---|---|
 | 1 | Measure `f1b2446`'s repeat views on live, then decide paging: stop / slim / page | **Ravi**: admin password (§0.7), then the decision |
-| 2 | Insights: replace its 31s `tags` source with a small aggregate for the 3 numbers it reads | Nothing — ready |
-| 3 | Re-run the full suite at `f1b2446` (~14 min, `-n 4`) | Nothing — ready |
-| 4 | Move the write-time body check (~2.3s on Resources) off the event loop | Nothing — ready |
+| 2 | Insights: replace its 31s `tags` source with a small aggregate for the 3 numbers it reads | **Done** `8cdae1a`, deployed |
+| 3 | Re-run the full suite at `f1b2446` (~14 min, `-n 4`) | **Done** (at `ac9bf8e`: 2243 passed, 0 failed) |
+| 4 | Move the write-time body check (~2.3s on Resources) off the event loop | **Done** `54afda3`, deployed |
 | 5 | Verify Entra sign-in warming on live; first end-to-end test of `d3a6fcb` | **Ravi**: one SSO sign-in after a deploy |
-| 6 | Seven pre-existing test failures + one ordering-dependent error | Nothing — ready |
-| 7 | `/api/schedules` 8.2s cold and uncached — cache it or not | Nothing — ready |
+| 6 | Seven pre-existing test failures + one ordering-dependent error | **Done** `a171364` (error did not recur) |
+| 7 | `/api/schedules` 8.2s cold and uncached — cache it or not | **Done** `ac9bf8e`: not cached, reason recorded |
 | 8 | Possibly bloated July partition (~20GB vs ~10GB for August) | Nothing — ready |
 | 9 | Carried: `stash@{0}` Environment filter, browser-suite clean pass, two UI decisions; Tags/Uptime ignore the global filter bar | **Ravi**, for the UI decisions |
 
