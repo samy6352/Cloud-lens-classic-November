@@ -1,11 +1,13 @@
-# CloudLens — handover, 30 September 2026 (final, 23:55 IST)
+# CloudLens — handover, 30 September → 1 October 2026 (final, 00:15 IST)
 
 Supersedes the 28 Sep handover, kept as `HANDOVER-2026-09-28.md`. Its architecture
 section (§6) and measurement traps (§3) still hold and are not repeated here; its
 performance table, test list and open items are stale.
 
-**Start here:** §0 (the rules), then §6 item 1 (a decision for Ravi, with the evidence),
+**Start here:** §0 (the rules), then §6 (the pending list, with what each item waits on),
 then §5b (why paging is no longer the obvious next step). §9 is the literal first moves.
+Nothing is in flight: no background job, test run or deploy was left running, `main` is
+pushed, and Scale runs `main`'s code.
 
 **State: every data tab on the Scale deployment answers, repeat views come from the
 snapshot cache — now including Anomalies and Billing opportunities, which were
@@ -51,7 +53,13 @@ Guesses say so.
    **Still ask Ravi before every push.**
 7. **The live admin password is never written down.** Ask Ravi and pass it only in the
    process environment. It was typed into the 30 Sep chat, so Ravi was asked to rotate it —
-   if the old one still works, remind him.
+   if the old one still works, remind him. Preferred hand-over, so it never appears in chat:
+   Ravi sets it himself as a user environment variable
+   (`[Environment]::SetEnvironmentVariable('CLOUDLENS_LIVE_ADMIN_PASSWORD', '<pw>', 'User')`
+   in his own terminal), the bench process copies it into `AUTH_PASSWORD`
+   (`$env:AUTH_PASSWORD = [Environment]::GetEnvironmentVariable('CLOUDLENS_LIVE_ADMIN_PASSWORD','User')`
+   — `bench_tabs.py` reads `.env` with `setdefault`, so the process value wins), and Ravi
+   removes the variable afterwards. It sits in plain text under `HKCU\Environment` while set.
 
 ---
 
@@ -77,6 +85,12 @@ python -m pytest -q -n 4                                   # full, ~14 min
   f-strings; SIM rules are on).
 - The local PostgreSQL is **shared with other sessions** (e.g. `D:\cloud lens v3`
   runs its own suites and rebuilds). Check `pg_stat_activity` before timing anything.
+- **Table-name collision with v3 (from code reading, not checked in the database).** v3's
+  `resource_ranks.py` drops and renames a plain `public.resource_ids`; v2 publishes its own
+  `resource_ids` as a view over `resource_ids_a`/`_b` and adopts a plain table of that name
+  as `_a` (`derived.py:195-236`). Either start order is hazardous on the shared local
+  database: run `\d+ public.resource_ids` before starting both apps, and rename v3's tables
+  if its ranking design is ever ported here. Scale is unaffected (no v3 there).
 
 **Deploy** (≈ 3 min, then background derived builds):
 
@@ -479,6 +493,24 @@ session folder, §8). `f1b2446` was validated with `test_snapshot_cache.py` (141
 PostgreSQL) and the warming/cache/asset suites (101 passed); the full suite has not been
 re-run since. See §3–§5.
 
+| # | Step | Waits on |
+|---|---|---|
+| 1 | Measure `f1b2446`'s repeat views on live, then decide paging: stop / slim / page | **Ravi**: admin password (§0.7), then the decision |
+| 2 | Insights: replace its 31s `tags` source with a small aggregate for the 3 numbers it reads | Nothing — ready |
+| 3 | Re-run the full suite at `f1b2446` (~14 min, `-n 4`) | Nothing — ready |
+| 4 | Move the write-time body check (~2.3s on Resources) off the event loop | Nothing — ready |
+| 5 | Verify Entra sign-in warming on live; first end-to-end test of `d3a6fcb` | **Ravi**: one SSO sign-in after a deploy |
+| 6 | Seven pre-existing test failures + one ordering-dependent error | Nothing — ready |
+| 7 | `/api/schedules` 8.2s cold and uncached — cache it or not | Nothing — ready |
+| 8 | Possibly bloated July partition (~20GB vs ~10GB for August) | Nothing — ready |
+| 9 | Carried: `stash@{0}` Environment filter, browser-suite clean pass, two UI decisions; Tags/Uptime ignore the global filter bar | **Ravi**, for the UI decisions |
+
+At the close of 30 Sep, Ravi was offered: start the unblocked work (3 in the background,
+then 2 and 4), measure live first (1), or stop. He asked for this handover instead, so no
+choice was made — ask him which, recommending the unblocked work if he has no preference.
+
+Details, in the same order:
+
 1. **Decide paging with Ravi — it is now a product decision, not a speed fix.** First
    measure what `f1b2446` did end to end: ask Ravi for the admin password (process
    environment only) and run `tools\bench_tabs.py spend` against live; before it,
@@ -579,12 +611,13 @@ re-run since. See §3–§5.
 - Prove a failure is pre-existing by running it on the base commit.
 - Commit messages explain *why*, with the numbers.
 - Session scratch (bench outputs, captured SQL, plans, probe scripts) lives in the Scout
-  session folders `…\session-state\93969277-…\files\` (up to `a1bc0cd`),
-  `…\session-state\e27b8924-…\files\` (warming: `live_probe.py` prints live meta, snapshot
+  session folders under `C:\Users\raviverma\.scout\copilot\session-state\`
+  (`…` below): `…\93969277-…\files\` (up to `a1bc0cd`),
+  `…\e27b8924-…\files\` (warming: `live_probe.py` prints live meta, snapshot
   and warm-target state read-only; `live_watch.py` follows a warm pass; both bench
-  outputs), and `…\session-state\1ccfca3b-…\files\` (the 30 Sep full-suite log
+  outputs), `…\1ccfca3b-…\files\` (the 30 Sep full-suite log
   `suite-d3a6fcb.log` and the clean-tree baseline `suite-baseline-clean-tree.log` that
-  proves the seven failures pre-existing), and `…\session-state\81c61fc4-…\files\` (the
+  proves the seven failures pre-existing), and `…\81c61fc4-…\files\` (the
   `d3a6fcb` and `f1b2446` deploys: `cloudlens-d3a6fcb.zip`, `cloudlens-f1b2446.zip` as
   deployed; `warm_compare.py`, which snapshots `snapshot_warm_targets`, follows a warm pass
   and compares two passes, read-only; `warm-before/after-*.json`, the passes in §5a/§5;
@@ -604,17 +637,17 @@ re-run since. See §3–§5.
 ## 9. First moves in the new chat
 
 1. `git status` (only `tools/bench-tabs-latest.json` should be dirty) and
-   `git log --oneline -8` — top should be this handover, then `f1b2446`, `34ba93d`,
-   `e971ed2`, `399894c`. Scale runs `f1b2446`: the same application code as `main` (§2).
+   `git log --oneline -8` — top should be this handover, then `16a6807`, `e60a263`,
+   `f1b2446`, `34ba93d`. Scale runs `f1b2446`: the same application code as `main` (§2).
+   `git rev-list --count backup/cloud-lens-v2/main..main` shows what is unpushed (§0.6).
 2. Start the Scale database if stopped; confirm the firewall rule for today's IP (§1).
 3. Baseline without the password: `warm_compare.py snap` (§8) records every warm target's
-   server compute time and whether the last pass finished. Then ask Ravi for the live admin
-   password (process environment only) and run `tools\bench_tabs.py spend` — the first live
-   measurement of `f1b2446`'s repeat views (§6 item 1). Expect hits almost everywhere: 17 of
-   the 19 warm targets were recomputed after the last deploy (Budgets and ESU sit below the
-   1s floor) and Always On keeps them warm.
-4. Put §6 item 1 to Ravi with those numbers — stop, slim, or page — before writing any
-   paging code. If he prefers something smaller first, item 2 (Insights' tags source) is
-   ready to start.
+   server compute time and whether the last pass finished. Expect hits almost everywhere:
+   17 of the 19 warm targets were recomputed after the last deploy (Budgets and ESU sit
+   below the 1s floor) and Always On keeps them warm.
+4. Ask Ravi which path (the choice left open at the end of §6's table): the unblocked work
+   (item 3 in the background, then 2 and 4), or the live measurement first (item 1 — he
+   sets the password as in §0.7; then `tools\bench_tabs.py spend`, the first live number
+   for `f1b2446`), and after it stop / slim / page. No paging code before that decision.
 5. Before believing any number: read §7 first, and re-measure in isolation. Three of the
    entries there are traps this session walked into and had to back out of.
