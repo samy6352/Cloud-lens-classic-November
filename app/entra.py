@@ -551,6 +551,15 @@ class EntraSSO:
         if sid:
             self._sessions.pop(sid, None)
 
+    def live_session(self, oid: str, tenant: str) -> Session | None:
+        """This person's most recently used session, if one is signed in and usable."""
+        if not oid:
+            return None
+        live = [session for session in list(self._sessions.values())
+                if session.oid == oid and session.tenant == tenant
+                and not session.expired and not session.reauth_required]
+        return max(live, key=lambda session: session.seen, default=None)
+
     def _sweep(self) -> None:
         now = time.time()
         for state, pending in list(self._pending.items()):

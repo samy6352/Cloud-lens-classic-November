@@ -106,6 +106,9 @@ param autoRefresh bool = true
 @description('Warm recently used, private dashboard snapshots after a data generation changes.')
 param snapshotWarmingEnabled bool = true
 
+@description('Recompute views people used, as them, after a deploy, a data publish or the UTC day boundary.')
+param snapshotServerWarmingEnabled bool = true
+
 @description('Allow username/password sign-in alongside Entra. Production runs with this enabled.')
 param authAllowLocal bool = false
 
@@ -695,6 +698,10 @@ resource webApp 'Microsoft.Web/sites@2023-12-01' = {
         {
           name: 'SNAPSHOT_WARMING_ENABLED'
           value: snapshotWarmingEnabled ? 'true' : 'false'
+        }
+        {
+          name: 'SNAPSHOT_SERVER_WARMING_ENABLED'
+          value: snapshotServerWarmingEnabled ? 'true' : 'false'
         }
         {
           name: 'WEBSITE_WARMUP_PATH'

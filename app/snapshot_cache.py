@@ -15,6 +15,10 @@ Poll using ETag plus As-Of/Stale/Revalidating headers, including on HTTP 304.
 AI Billing alone reuses a whole report until the scoped imported data day changes
 (or explicit retry/retention expiry). Same-day corrections do not repeat telemetry
 reads. Source-revision write fences, private keys and coverage rules still apply.
+
+Views people use are also recorded as warm targets (identity, path, normalised query and
+cost; never a credential) so `snapshot_warmer` can compute them again after a deploy,
+publish or UTC day boundary through `SnapshotCache.warm`, before anyone asks.
 """
 from __future__ import annotations
 
@@ -34,6 +38,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 from fastapi import HTTPException
 from fastapi.routing import APIRoute, request_response
@@ -62,6 +67,12 @@ ROLLUP_REVISION_KEY = "data_rollup_generation"
 # Keep job lock ordering; the source-row lock below supplies the revision fence.
 PUBLICATION_LOCK = 741209031
 _CACHE_LOCK = 741209032
+# Set only by the in-process warmer (`snapshot_warmer`). ASGI servers build the scope from
+# the wire, so no HTTP client can put this key there.
+WARM_SCOPE_KEY = "cloudlens.snapshot_warm"
+WARM_CLAIM_KEY = "snapshot_warm_claim"
+# A view served from cache is recorded as used at most this often per process.
+_TOUCH_INTERVAL = 3600.0
 log = logging.getLogger("cloudlens.snapshot_cache")
 _FORCE_FLAGS = frozenset({"force", "refresh", "fresh"})
 _SECRET_KEYS = frozenset({
@@ -235,6 +246,35 @@ def cache_family_key(request: Request, context: CacheContext, version: str,
                     context.fx_version, version, policy.source])
 
 
+def warm_query(request: Request) -> str:
+    """The query a view is replayed with: the cache key's own normalisation, re-encoded."""
+    return urlencode([(name, value)
+                      for name, values in sorted(_normalised_query(request).items())
+                      for value in values])
+
+
+def warm_target_key(principal: str, tenant: str, path: str, query: str) -> str:
+    # Identity rather than partition: a partition also carries the budget revision and the
+    # account secret, and a view must stay one target when either of those moves.
+    return _digest(["warm-target-v1", principal, tenant, path, query])
+
+
+@dataclass(frozen=True)
+class WarmTarget:
+    """A view somebody used, stored so the server can compute it again before they return.
+
+    Holds who (stable principal and tenant, never a credential), which path and which
+    normalised query -- the same values a cache key is built from -- plus what it last cost.
+    """
+    key: str
+    principal: str
+    tenant: str
+    path: str
+    query: str
+    seconds: float = 0.0
+    used: float = 0.0
+
+
 def read_generation(con, scope: tuple[str, ...] | None = None) -> str:
     """Global committed-cost revision; scope still partitions each private cache key."""
     from . import jobs
@@ -283,7 +323,8 @@ class SnapshotStore:
     def __init__(self, connect: Callable, *, generation: Callable = read_generation,
                  max_entries: int = 512, max_bytes: int = 64 * 1024 * 1024,
                  max_payload: int = 8 * 1024 * 1024,
-                 lock_timeout_ms: int | None = None):
+                 lock_timeout_ms: int | None = None, max_targets: int = 1000,
+                 target_retention: float = _DEFAULT_RETENTION):
         """`max_payload` bounds one entry; `max_bytes` bounds the whole store.
 
         8MB rather than 2MB because the total is what actually protects memory --
@@ -296,12 +337,13 @@ class SnapshotStore:
         """
         lock_timeout_ms = (_positive_int_env("SNAPSHOT_LOCK_TIMEOUT_MS", 2000)
                            if lock_timeout_ms is None else lock_timeout_ms)
-        if min(max_entries, max_bytes, max_payload, lock_timeout_ms) < 1:
+        if min(max_entries, max_bytes, max_payload, lock_timeout_ms, max_targets) < 1:
             raise ValueError("Snapshot bounds must be positive.")
         self.connect, self.generation = connect, generation
         self.max_entries, self.max_bytes = max_entries, max_bytes
         self.max_payload = min(max_payload, max_bytes)
         self.lock_timeout = f"{lock_timeout_ms}ms"
+        self.max_targets, self.target_retention = max_targets, target_retention
 
     def initialize(self):
         with self.connect() as con:
@@ -322,6 +364,13 @@ class SnapshotStore:
                 con.execute(
                     "CREATE INDEX IF NOT EXISTS private_snapshots_family_idx "
                     "ON private_snapshots (family_key,partition_hash,created DESC)")
+                con.execute("""CREATE TABLE IF NOT EXISTS snapshot_warm_targets (
+                    target_key TEXT PRIMARY KEY, principal TEXT NOT NULL,
+                    tenant TEXT NOT NULL, path TEXT NOT NULL, query TEXT NOT NULL,
+                    seconds DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    used DOUBLE PRECISION NOT NULL,
+                    computed DOUBLE PRECISION NOT NULL DEFAULT 0
+                )""")
                 con.execute("COMMIT")
             except BaseException:
                 con.execute("ROLLBACK")
@@ -336,6 +385,15 @@ class SnapshotStore:
             "SUM(byte_size) OVER (ORDER BY created DESC,cache_key) AS total_bytes "
             "FROM private_snapshots) AS ranked WHERE position>? OR total_bytes>?)",
             [self.max_entries, self.max_bytes])
+        # A target lives as long as somebody keeps looking at it; warming never renews it.
+        con.execute("DELETE FROM snapshot_warm_targets WHERE used<=?",
+                    [now - self.target_retention])
+        con.execute(
+            "DELETE FROM snapshot_warm_targets WHERE target_key IN ("
+            "SELECT target_key FROM (SELECT target_key,"
+            "ROW_NUMBER() OVER (ORDER BY used DESC,target_key) AS position "
+            "FROM snapshot_warm_targets) AS ranked WHERE position>?)",
+            [self.max_targets])
 
     def prune(self, now: float):
         with self.connect() as con:
@@ -434,6 +492,51 @@ class SnapshotStore:
         with self.connect() as con:
             con.execute("DELETE FROM private_snapshots WHERE cache_key=? AND partition_hash=?",
                         [key, partition])
+
+    def record_target(self, target: WarmTarget, now: float, seconds: float, used: bool):
+        """Remember a computed view. Only a person's use (`used`) creates or renews one."""
+        with self.connect() as con:
+            if used:
+                con.execute(
+                    "INSERT INTO snapshot_warm_targets "
+                    "(target_key,principal,tenant,path,query,seconds,used,computed) "
+                    "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(target_key) DO UPDATE SET "
+                    "seconds=excluded.seconds,used=excluded.used,computed=excluded.computed",
+                    [target.key, target.principal, target.tenant, target.path, target.query,
+                     seconds, now, now])
+            else:
+                con.execute(
+                    "UPDATE snapshot_warm_targets SET seconds=?,computed=? WHERE target_key=?",
+                    [seconds, now, target.key])
+
+    def touch_target(self, key: str, now: float):
+        with self.connect() as con:
+            con.execute("UPDATE snapshot_warm_targets SET used=? WHERE target_key=? AND used<?",
+                        [now, key, now])
+
+    def warm_targets(self, since: float, min_seconds: float, limit: int) -> list[WarmTarget]:
+        with self.connect() as con:
+            rows = con.execute(
+                "SELECT target_key,principal,tenant,path,query,seconds,used "
+                "FROM snapshot_warm_targets WHERE used>? AND seconds>=? "
+                "ORDER BY used DESC,target_key LIMIT ?",
+                [since, min_seconds, limit]).fetchall()
+        return [WarmTarget(*row) for row in rows]
+
+    def claim_warm(self, token: str) -> bool:
+        """True for exactly one caller per token, across workers and instances."""
+        with self.connect() as con:
+            row = con.execute(
+                "INSERT INTO meta (key,value,updated_at) VALUES (?,?,now()) "
+                "ON CONFLICT (key) DO UPDATE SET value=excluded.value,"
+                "updated_at=excluded.updated_at "
+                "WHERE meta.value IS NULL OR meta.value<>excluded.value RETURNING key",
+                [WARM_CLAIM_KEY, token]).fetchone()
+        return row is not None
+
+    def current_generation(self) -> str:
+        with self.connect() as con:
+            return self.generation(con, None)
 
 
 def _safe_content(value: Any) -> bool:
@@ -635,13 +738,17 @@ class SnapshotCache:
     def __init__(self, store: SnapshotStore, *, version: str,
                  policies: dict[str, Policy] | None = None, concurrency: int = 4,
                  max_inflight: int = 32, origin_timeout: float = 120,
-                 clock: Callable[[], float] = time.time):
+                 clock: Callable[[], float] = time.time, warm_min_seconds: float = 1.0):
         if concurrency < 1 or max_inflight < concurrency or origin_timeout <= 0 or not version:
             raise ValueError("Invalid snapshot cache configuration.")
+        if not math.isfinite(warm_min_seconds) or warm_min_seconds < 0:
+            raise ValueError("warm_min_seconds must be a finite, non-negative number.")
         self.store, self.version = store, version
         self.policies = dict(DEFAULT_POLICIES if policies is None else policies)
         self.clock, self.origin_timeout = clock, origin_timeout
         self.max_inflight = max_inflight
+        # Views cheaper than this are not worth a server computing ahead of time.
+        self.warm_min_seconds = warm_min_seconds
         self._slots = asyncio.Semaphore(concurrency)
         self._tasks: dict[tuple[str, str], asyncio.Task] = {}
         self._db_tasks: set[asyncio.Task] = set()
@@ -649,6 +756,7 @@ class SnapshotCache:
         self._maintenance: asyncio.Task | None = None
         self._maintenance_error = ""
         self._failures: OrderedDict[str, _Failure] = OrderedDict()
+        self._touched: OrderedDict[str, float] = OrderedDict()
         self._closed = False
 
     async def start(self):
@@ -731,6 +839,47 @@ class SnapshotCache:
             error = task.exception()
             if error is not None and not isinstance(error, SnapshotBusy):
                 self._log_failure("database", None, error)
+
+    def _background_db(self, function, *args):
+        """Bookkeeping a response must not wait for; still drained before shutdown."""
+        task = asyncio.create_task(asyncio.to_thread(function, *args))
+        self._db_tasks.add(task)
+        task.add_done_callback(self._db_finished)
+
+    def _target(self, request, context) -> WarmTarget | None:
+        # A session-derived principal (Entra without an object id) cannot be signed in as
+        # again, so it is never a target.
+        if context.principal.startswith("session:"):
+            return None
+        query = warm_query(request)
+        return WarmTarget(warm_target_key(context.principal, context.tenant,
+                                          request.url.path, query),
+                          context.principal, context.tenant, request.url.path, query)
+
+    def _note_use(self, request, context):
+        touch = getattr(self.store, "touch_target", None)
+        if touch is None or request.scope.get(WARM_SCOPE_KEY):
+            return
+        target = self._target(request, context)
+        if target is None:
+            return
+        now = self.clock()
+        last = self._touched.get(target.key)
+        if last is not None and now - last < _TOUCH_INTERVAL:
+            return
+        self._touched[target.key] = now
+        self._touched.move_to_end(target.key)
+        while len(self._touched) > 4096:
+            self._touched.popitem(last=False)
+        self._background_db(touch, target.key, now)
+
+    def _record_target(self, request, context, seconds, warming):
+        record = getattr(self.store, "record_target", None)
+        if record is None or (not warming and seconds < self.warm_min_seconds):
+            return
+        target = self._target(request, context)
+        if target is not None:
+            self._background_db(record, target, self.clock(), seconds, not warming)
 
     async def close(self):
         self._closed = True
@@ -831,6 +980,7 @@ class SnapshotCache:
                                              "X-CloudLens-Revalidating": "true",
                                              "X-CloudLens-Source-State": "pending",
                                              "Retry-After": "3"})
+            self._note_use(request, context)
             return self._source_state(
                 self._response(request, item, stale=True, revalidating=True),
                 "source-pending", generation)
@@ -859,6 +1009,7 @@ class SnapshotCache:
             owns_origin = True
         if item and not force:
             await self._authorize(request, authorize, partition, context)
+            self._note_use(request, context)
             return self._response(request, item, stale=stale or force,
                                   revalidating=bool(task and not task.done()))
         if task is None:
@@ -868,6 +1019,9 @@ class SnapshotCache:
         result = await asyncio.shield(task)
         await self._authorize(request, authorize, partition, context)
         if isinstance(result, Snapshot):
+            if not owns_origin:
+                # Joined a calculation somebody else -- possibly the warmer -- started.
+                self._note_use(request, context)
             return self._response(request, result, stale=False, revalidating=False,
                                   state="refresh" if force else "miss")
         if force and _source_pending(generation) and result.status_code == 200:
@@ -890,6 +1044,77 @@ class SnapshotCache:
         async with self._slots:
             return await origin()
 
+    async def warm(self, request: Request, origin: Callable[[], Awaitable[Response]],
+                   authorize: Authorizer) -> str:
+        """Compute this view now, unless its exact current answer is already stored.
+
+        For the server-side warmer, which replays views people used once a new code
+        version, data generation or UTC day has made their stored answer cold or stale.
+        It shares `get`'s task map, so a person who opens the view meanwhile joins this
+        calculation rather than starting a second, and it keeps every rule `get` applies
+        to a refresh: re-authorisation, the generation fence, failure back-off, and a
+        partial answer never replacing a complete one. Returns an outcome label.
+        """
+        policy = self.policies.get(request.url.path)
+        if (request.method != "GET" or policy is None
+                or any(name.lower() in _SECRET_KEYS for name in request.query_params)):
+            return "ineligible"
+        try:
+            context = await self._authorize(request, authorize)
+            partition = context.partition()
+        except HTTPException as exc:
+            return f"denied-{exc.status_code}"
+        key = cache_key(request, context, self.version, policy)
+        now = self.clock()
+        item, generation = await self._db(
+            self.store.load, key, partition, now, context.selected)
+        if _source_pending(generation):
+            return "source-pending"
+        if item is not None:
+            if item.error and item.retry_at > now:
+                return "backoff"
+            if self._current(item, policy, context, generation, now):
+                return "fresh"
+        old = item
+        load_family = getattr(self.store, "load_family", None)
+        if old is None and load_family is not None:
+            old = await self._db(load_family, cache_family_key(
+                request, context, self.version, policy), partition, now, context.selected)
+        task_key = (key, generation)
+        task = self._tasks.get(task_key)
+        if task is None:
+            if self._closed or len(self._tasks) >= self.max_inflight:
+                return "busy"
+            task = asyncio.create_task(self._refresh(
+                request, origin, authorize, context, key, generation, policy, old,
+                warming=True))
+            self._tasks[task_key] = task
+            task.add_done_callback(functools.partial(self._finished, task_key))
+        try:
+            result = await asyncio.shield(task)
+        except HTTPException as exc:
+            return f"failed-{exc.status_code}"
+        except TimeoutError:
+            return "timeout"
+        except Exception:  # noqa: BLE001 - `_refresh` has logged it and recorded back-off
+            return "failed"
+        if isinstance(result, Snapshot):
+            return "stored"
+        return result.headers.get("X-CloudLens-Cache") or f"status-{result.status_code}"
+
+    @staticmethod
+    def _current(item, policy, context, generation, now) -> bool:
+        """What `get` would serve as a hit without starting a refresh."""
+        if item.error:
+            return False
+        if policy.daily and context.data_day:
+            try:
+                saved = json.loads(item.body).get("snapshot", {}).get("data_day")
+            except (ValueError, UnicodeError, AttributeError):
+                return False
+            return saved == context.data_day
+        return item.generation == generation and item.expires > now
+
     def _finished(self, key, task):
         self._completion_serial += 1
         if self._tasks.get(key) is task:
@@ -897,12 +1122,14 @@ class SnapshotCache:
         if not task.cancelled():
             task.exception()  # Background exceptions are observed, never logged with secrets.
 
-    async def _refresh(self, request, origin, authorize, context, key, generation, policy, old):
+    async def _refresh(self, request, origin, authorize, context, key, generation, policy, old,
+                       warming=False):
         partition = context.partition()
         try:
             async with self._slots:
                 await self._authorize(request, authorize, partition, context)
                 started = self.clock()
+                timer = time.perf_counter()
                 calculation = calculation_context.set((key, generation))
                 try:
                     response = await asyncio.wait_for(origin(), self.origin_timeout)
@@ -974,6 +1201,7 @@ class SnapshotCache:
                     return self._unavailable(response, "write_failed")
                 if accepted:
                     self._failures.pop(key, None)
+                    self._record_target(request, context, time.perf_counter() - timer, warming)
                     return item
                 # A generation changed while the source worked. Never mark the old
                 # calculation fresh, nor allow it to replace the newer publication.
@@ -1057,6 +1285,22 @@ def install_snapshot_routes(app, cache: Callable[[], SnapshotCache | None],
         async def wrapped(_endpoint=endpoint, **kwargs):
             request = kwargs.get("request")
             instance = cache()
+            if isinstance(request, Request) and request.scope.get(WARM_SCOPE_KEY):
+                # The warmer wants the answer stored, not sent: nothing crosses the ASGI
+                # stack but an outcome label.
+                if instance is None:
+                    outcome = "unavailable"
+                elif request.url.path not in allowed:
+                    outcome = "ineligible"
+                else:
+                    try:
+                        outcome = await instance.warm(
+                            request, lambda: _endpoint(**kwargs), authorize)
+                    except Exception as exc:  # noqa: BLE001 - reported as an outcome
+                        instance._log_failure("warm", request, exc)
+                        outcome = "failed"
+                return Response(status_code=204, headers={
+                    "Cache-Control": "private, no-store", "X-CloudLens-Warm": outcome})
             if (instance is None or not isinstance(request, Request)
                     or request.url.path not in allowed):
                 return await _endpoint(**kwargs)

@@ -107,6 +107,9 @@ param autoRefresh bool = true
 @description('Warm recently used, private dashboard snapshots after a data generation changes. Bounded to three recent views per active browser.')
 param snapshotWarmingEnabled bool = true
 
+@description('Recompute views people used, as them, after a deploy, a data publish or the UTC day boundary, so the first view afterwards is a cache hit.')
+param snapshotServerWarmingEnabled bool = true
+
 @description('Allow username/password sign-in alongside Entra.')
 param authAllowLocal bool = false
 
@@ -185,6 +188,7 @@ module stack 'modules/stack.bicep' = {
     autoIngest: autoIngest
     autoRefresh: autoRefresh
     snapshotWarmingEnabled: snapshotWarmingEnabled
+    snapshotServerWarmingEnabled: snapshotServerWarmingEnabled
     authAllowLocal: authAllowLocal
     authUsers: authUsers
     pgSchema: pgSchema

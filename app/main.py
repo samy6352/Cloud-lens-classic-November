@@ -7,6 +7,7 @@ import functools
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -49,6 +50,7 @@ from .entra import needs_admin_consent as entra_needs_consent
 from .entra import normalise_email as entra_email
 from .entra import sign as entra_sign
 from .snapshot_cache import (
+    WARM_SCOPE_KEY,
     CacheContext,
     SnapshotCache,
     SnapshotStore,
@@ -56,6 +58,7 @@ from .snapshot_cache import (
     inner_cache_key,
     install_snapshot_routes,
 )
+from .snapshot_warmer import SnapshotWarmer
 from .store import PoolBusy
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -64,6 +67,7 @@ log = logging.getLogger("cloudlens")
 WEB = Path(__file__).resolve().parents[1] / "web"
 _static_assets = PrecompressedStatic(directory=WEB / "assets")
 _snapshot_cache: SnapshotCache | None = None
+_snapshot_warmer: SnapshotWarmer | None = None
 
 
 def read_only_mode() -> bool:
@@ -680,6 +684,31 @@ def snapshot_warming_enabled() -> bool:
     return value in {"true", "1"}
 
 
+def snapshot_server_warming_enabled() -> bool:
+    """The server recomputes used views after a deploy, publish or UTC day boundary.
+
+    Separate from `SNAPSHOT_WARMING_ENABLED` (the browser re-fetching what it has open):
+    this one spends server time on views nobody has asked for yet, so it is opted into.
+    """
+    value = os.getenv("SNAPSHOT_SERVER_WARMING_ENABLED", "false").strip().lower()
+    if value not in {"true", "false", "1", "0"}:
+        raise ValueError("SNAPSHOT_SERVER_WARMING_ENABLED must be true, false, 1, or 0.")
+    return value in {"true", "1"}
+
+
+def snapshot_warm_min_seconds() -> float:
+    raw = os.getenv("SNAPSHOT_WARM_MIN_SECONDS", "").strip()
+    if not raw:
+        return 1.0
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("SNAPSHOT_WARM_MIN_SECONDS must be a non-negative number of seconds.")
+    return value
+
+
 def _positive_int_env(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
@@ -708,11 +737,13 @@ def snapshot_cache_settings() -> dict[str, int]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    global _agent, _ingest_task, _overview, _snapshot_cache
+    global _agent, _ingest_task, _overview, _snapshot_cache, _snapshot_warmer
     app.state.readiness = None
     app.state.snapshot_bootstrap_ready = False
     app.state.snapshot_bootstrap_error = None
     snapshot_warming_enabled()
+    server_warming = snapshot_server_warming_enabled()
+    warm_min_seconds = snapshot_warm_min_seconds()
     if not os.getenv("PROJECT_ENDPOINT"):
         raise RuntimeError("PROJECT_ENDPOINT is not set. See README.md.")
     from . import azure_updates, backfill, currency, onboarding, service_health
@@ -747,6 +778,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 ),
                 version=application_version(build_id=os.getenv("CLOUDLENS_BUILD_ID", "")),
                 origin_timeout=snapshot_settings["origin_timeout"],
+                warm_min_seconds=warm_min_seconds,
             )
             try:
                 await _snapshot_cache.start()
@@ -757,6 +789,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     _open_snapshot_cache_later(_snapshot_cache), name="snapshot-cache-retry"))
             background.append(asyncio.create_task(
                 _prepare_snapshot_generation(warehouse, app.state), name="snapshot-bootstrap"))
+            if server_warming:
+                public = validate_public_base_url(os.getenv("PUBLIC_BASE_URL"))
+                _snapshot_warmer = SnapshotWarmer(
+                    app, lambda: _snapshot_cache, snapshot_warm_credentials,
+                    host=public.removeprefix("https://") if public else "localhost",
+                    scheme="https" if public else "http",
+                    concurrency=_positive_int_env("SNAPSHOT_WARM_CONCURRENCY", 1),
+                    limit=_positive_int_env("SNAPSHOT_WARM_LIMIT", 100),
+                    min_seconds=warm_min_seconds,
+                )
+                _snapshot_warmer.start()
         else:
             app.state.snapshot_bootstrap_ready = True
         background.append(asyncio.create_task(_refresh_overview(), name="overview-refresh"))
@@ -795,6 +838,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         app.state.readiness = None
         await readiness.close()
+        if _snapshot_warmer is not None:
+            # Before the cache: its passes run through the cache and the warehouse pool.
+            await _snapshot_warmer.close()
+            _snapshot_warmer = None
         if _snapshot_cache is not None:
             await _snapshot_cache.close()
             _snapshot_cache = None
@@ -934,9 +981,11 @@ class RequireAuth(BaseHTTPMiddleware):
         # One line per tab actually fetched from the server -- not `sections`, which repaints
         # the rail's own costs on every navigation and is not itself a view of anything, and
         # would drown the log in noise it if were counted. Never awaited: a slow or failing
-        # audit write must not be the reason a tab took longer to load.
+        # audit write must not be the reason a tab took longer to load. Nor is the server
+        # warming a view a person looking at it.
         if (request.method == "GET" and path.startswith("/api/dashboard/")
-                and path != "/api/dashboard/sections"):
+                and path != "/api/dashboard/sections"
+                and not request.scope.get(WARM_SCOPE_KEY)):
             _log_access(request.state.user, path.rsplit("/", 1)[-1])
 
         from . import reporting
@@ -1036,7 +1085,7 @@ class CacheHeaders(BaseHTTPMiddleware):
                     timing_parts.append(f"{metric};dur={max(0, duration):.1f}")
                     seen_timings.add(metric)
             response.headers["Server-Timing"] = ", ".join(timing_parts)
-            if elapsed_ms >= SLOW_API_LOG_MS:
+            if elapsed_ms >= SLOW_API_LOG_MS and not request.scope.get(WARM_SCOPE_KEY):
                 phase_log = ",".join(
                     f"{name}:{duration:.1f}" for name, duration in sorted(phases.items())
                     if name in OVERVIEW_TIMING_PHASES and isinstance(duration, (int, float)))
@@ -1301,6 +1350,41 @@ async def authorize_snapshot(request: Request) -> CacheContext:
     )
 
 
+async def snapshot_warm_credentials(principal: str, tenant: str) -> dict[str, str] | None:
+    """Request headers that sign the snapshot warmer in as a cache principal, or None.
+
+    Minted in process and never sent anywhere: the warmer hands them straight to the ASGI
+    app, which then applies the ordinary sign-in and entitlement checks. Each form below
+    rebuilds exactly the principal and partition `authorize_snapshot` derived for the
+    person's own requests, so the warmed answers land where that person will read them.
+    """
+    auth = auth_service()
+    if not auth.enabled:
+        return {} if (principal, tenant) == ("disabled:local", "local") else None
+    if tenant == "local":
+        source, _, name = principal.partition(":")
+        if source == "token":
+            for token, holder in auth.tokens.items():
+                if holder.casefold() == name:
+                    return {"authorization": f"Bearer {token}"}
+            return None
+        if source not in {"file", "env"} or (auth.sso.enabled and not auth.allow_local):
+            return None
+        auth.users.refresh_if_changed()
+        user = auth.users.get(name)
+        if user is None or user.source != source:
+            return None
+        return {"cookie": f"{COOKIE}={auth.sessions.issue(user, hours=1)}"}
+    if not auth.sso.enabled:
+        return None
+    session = auth.sso.live_session(principal, tenant)
+    if session is None:
+        # Entra sessions are held in memory; after a restart this person's views are
+        # warmed when they next sign in.
+        return None
+    return {"cookie": f"{COOKIE}={entra_sign(session.sid, auth.sessions.secret)}"}
+
+
 # The filter bar's dimensions, as they arrive on a query string.
 #
 # An allow-list rather than "anything with an f_ prefix": the key reaches a view definition, so
@@ -1557,6 +1641,10 @@ async def sso_callback(request: Request) -> Response:
         max_age=int(float(os.getenv("AUTH_SESSION_HOURS", "12")) * 3600),
         **auth.cookie_kwargs(request.url.scheme == "https"),
     )
+    if _snapshot_warmer is not None and session.oid:
+        # Entra sessions do not survive a restart, so this is the first moment since a
+        # deploy that the server can compute this person's views as them.
+        _snapshot_warmer.warm_principal_soon(session.oid, session.tenant)
     return response
 
 

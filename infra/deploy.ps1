@@ -115,6 +115,8 @@ param(
 
     [bool]$SnapshotWarmingEnabled = $true,
 
+    [bool]$SnapshotServerWarmingEnabled = $true,
+
     # Username/password sign-in alongside Entra, as production runs.
     [bool]$AuthAllowLocal = $false,
 
@@ -493,6 +495,7 @@ $templateParameters = @(
     "autoIngest=$($AutoIngest.ToString().ToLower())"
     "autoRefresh=$($AutoRefresh.ToString().ToLower())"
     "snapshotWarmingEnabled=$($SnapshotWarmingEnabled.ToString().ToLower())"
+    "snapshotServerWarmingEnabled=$($SnapshotServerWarmingEnabled.ToString().ToLower())"
     "authAllowLocal=$($AuthAllowLocal.ToString().ToLower())"
     "authUsers=$AuthUsers"
     "pgSchema=$PgSchema"
