@@ -341,7 +341,7 @@ def test_unknown_commitment_coverage_is_unavailable():
         def rows(self, sql, limit=None):
             if 'max("ChargePeriodStart")' in sql:
                 return [{"hi": "2026-09-14"}]
-            if '"BenefitName" AS name' in sql:
+            if '"BenefitName"' in sql and "AS name" in sql:
                 return []
             if "strftime" in sql:
                 return [{"month": "2026-09", "model": "", "currency": "USD", "cost": 1458.02}]
