@@ -31,6 +31,7 @@ def test_warehouse_summary_returns_pending_after_an_exists_probe(monkeypatch):
     namespace = {
         "Any": Any,
         "json": json,
+        "log": __import__("logging").getLogger("cloudlens.warehouse"),
         "rollup": SimpleNamespace(TABLE="costs_rollup",
                                   charges_sql=lambda _table: "count(*)"),
         "canonical_sub_id": lambda value: value,

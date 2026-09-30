@@ -557,8 +557,9 @@ check("a finished refresh updates the date on the button",
 # changes once a day, overnight. So it reloads itself.
 _main = open(os.path.join(HERE, "app", "main.py"), encoding="utf-8").read()
 check("the server hands over the parsed filter for that link",
-      'b["filter_exact"] = exact' in _main
-      and 'b["tag_filter"] = [[k, v] for k, v in tags or []] if exact else []' in _main)
+      'budget["filter_exact"] = exact' in _main
+      and 'budget["tag_filter"] = [[key, values] for key, values in tags or []] if exact else []'
+      in _main)
 check("the warehouse reloads itself on a schedule",
       "async def _daily_refresh" in _main)
 check("started with the app and stopped with it",

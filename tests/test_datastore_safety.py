@@ -145,6 +145,9 @@ def test_summary_does_not_label_unknown_plus_usd_as_single_currency(offline_ware
         yield offline_warehouse.Reader(memory)
 
     wh.reader = reading
+    # The rollup answers here: this test is about currency labelling, not about the
+    # deferred summary a stale rollup deliberately returns (test_summary_pending).
+    wh._rollup_fresh = lambda _con, _table: True
     result = wh.summary()
     assert result["mixed_currency"]
     assert result["currency"] is None and result["total_cost"] is None

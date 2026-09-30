@@ -132,7 +132,14 @@ class BudgetReads(unittest.IsolatedAsyncioTestCase):
         async def inline(fn, *args, **kwargs):
             return fn(*args, **kwargs)
 
+        # The period ends today, so pin today: the expected dates must not drift daily.
+        class FrozenDateTime(main.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return main.datetime(2026, 9, 29, 12, 0, tzinfo=tz)
+
         with patch.object(main, "current_user", return_value=user), \
+                patch.object(main, "datetime", FrozenDateTime), \
                 patch.object(main, "permitted", AsyncMock(return_value=["sub-a"])), \
                 patch.object(main, "as_user", acting_as), \
                 patch.object(cost, "budgets", AsyncMock(return_value={"budgets": [budget]})), \

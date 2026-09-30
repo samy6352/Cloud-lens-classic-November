@@ -205,7 +205,7 @@ def _overview_with(coverage_to, live_mtd=1234.0):
     # If it asks the warehouse for the month, it gets a zero -- exactly what the live data does
     # for a month it has no rows in. A correct implementation must not report that as the answer.
     @contextmanager
-    def reader(scope=None):
+    def reader(scope=None, **_options):
         yield SimpleNamespace(
             agg="costs_rollup",
             rows=lambda *_: [{"currency": "USD", "mtd": 0.0, "prev": 0.0}],
