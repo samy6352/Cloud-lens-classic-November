@@ -1,23 +1,27 @@
-# CloudLens — handover, 30 September 2026 (final, 22:30 IST)
+# CloudLens — handover, 30 September 2026 (final, 23:55 IST)
 
 Supersedes the 28 Sep handover, kept as `HANDOVER-2026-09-28.md`. Its architecture
 section (§6) and measurement traps (§3) still hold and are not repeated here; its
 performance table, test list and open items are stale.
 
-**Start here:** §0 (the rules), then §6 item 1 (the next task), then §5a (why it is the
-next task). §9 is the literal first five commands.
+**Start here:** §0 (the rules), then §6 item 1 (a decision for Ravi, with the evidence),
+then §5b (why paging is no longer the obvious next step). §9 is the literal first moves.
 
 **State: every data tab on the Scale deployment answers, repeat views come from the
-snapshot cache in 0.1–3.9s — now including Anomalies and Billing opportunities, which were
+snapshot cache — now including Anomalies and Billing opportunities, which were
 never cached before `e99b71c` — and since `383f72e` the server itself recomputes the views
 people use after a deploy, so the first view after a deploy is a cache hit too
-(Commitments 98.6s → 0.10s, Insights 46.6s → 0.13s). Scale now runs `d3a6fcb`, the same
+(Commitments 98.6s → 0.10s, Insights 46.6s → 0.13s). Scale now runs `f1b2446`, the same
 code as `main`. Commitments' cold path was collation and an unbounded sort (`9920e2d`,
 13.3s server compute). The shared ARM client (`d3a6fcb`) was deployed and re-measured: it
 changes nothing on Scale's own cold path, because Scale's identity sees one subscription
 and its Advisor fan-out is one call, not the 71 the 59.4s was measured on (§5a). Insights'
 cold time is its `tags` source — the full Tags tab query, 31s, run to read three numbers.
-That, then server-side filtering and paging, is what remains.**
+The 2–4s repeat views of Resources/Tags/Uptime were not payload size as such but ~1s of
+per-hit CPU re-deriving the stored body (parse + walk for one header, then gzip level 9),
+on the event loop; `f1b2446` stores both at write time — 1,329ms → 47ms per hit, measured
+locally on the real 14.6MB body (§5b). Its live end-to-end number needs the admin password.
+Server-side paging is therefore a product decision now, not a performance fix (§6 item 1).**
 
 Everything below is measured on the live Scale deployment or read from the code.
 Guesses say so.
@@ -40,7 +44,7 @@ Guesses say so.
 5. **Never edit source while pytest runs** — several tests read or `exec` source.
    Run the full suite **detached** (§1); attached runs were killed by interruptions.
 6. **`main` is pushed to `backup/cloud-lens-v2/main`** (private repo `samy6352/CloudLensv2`)
-   through this handover, 30 Sep ~22:40 IST, at Ravi's instruction. Anything newer is
+   through `34ba93d`, 30 Sep ~22:40 IST, at Ravi's instruction. Anything newer is
    unpushed — count with `git rev-list --count backup/cloud-lens-v2/main..main` rather than
    trusting a number written here. Git Credential Manager holds working credentials (that
    push needed no prompt). **Still ask Ravi before every push.**
@@ -123,9 +127,11 @@ carry `X-CloudLens-Cache` (`hit`/`miss`/`response-too-large`/…) and `Server-Ti
 | Sign-in | SSO shows only the user's own RBAC subscriptions; use local `admin` to see all 70 |
 | App identity | `cloudlens-id-scale` (user-assigned): Reader + Cost Management Reader on **one** subscription, the one hosting `CloudLens-Scale`. Local `admin` has no delegated token, so its live Azure calls (Advisor, Resource Graph, Monitor) go out as this identity and cover that one subscription — not the 70 in the warehouse |
 
-Deployed commit: **`d3a6fcb`** (30 Sep 16:41 UTC, `az webapp deploy`, RuntimeSuccessful;
-warm pass claimed 16:41:09, all 18 targets recomputed by 16:44:45). All 11 derived tables
-stamped. `fbbf999` is test-only, so Scale runs the same application code as `main`.
+Deployed commit: **`f1b2446`** (30 Sep 18:18 UTC, `az webapp deploy`, RuntimeSuccessful;
+warm pass claimed 18:18:06, all 17 targets recomputed by 18:21:40; the migration added
+`private_snapshots.coverage` and `.body_gzip`, and all 17 rewritten rows carry them —
+Resources 14.6MB stored with a 1.10MB gzip copy, Tags 10.0MB/1.43MB, Uptime 7.5MB/0.67MB).
+All 11 derived tables stamped. Scale runs the same application code as `main`.
 
 ---
 
@@ -144,6 +150,7 @@ stamped. `fbbf999` is test-only, so Scale runs the same application code as `mai
 | `9920e2d` | Commitments: `COLLATE "C"` on the benefit grouping/DISTINCT keys, `LIMIT 4000` on the inventory drill-down | Inventory headline 70.6s → 7.9s, coverage benefits 65.7s → 5.7s, drill-down 34.3s → 1.65s, identical rows. Deployed and verified live |
 | `fbbf999` | Test stub identifies the benefit query by what it reads, not how it spells it | `9920e2d` changed the spelling; a stub matching on text went stale. Caught by the full suite |
 | `d3a6fcb` | One shared `httpx.AsyncClient` for all ARM calls instead of one per call | Advisor fan-out, 71 subscriptions, same 4 slots, same outcome: 59.4s → 4.2s wall, 141.3s → 13.3s summed, 2.05s → 0.18s mean per refused call — **measured on the dev machine with the 71 ids passed in**. Deployed; no end-to-end change on Scale, whose fan-out is one call (§5a) |
+| `f1b2446` | Snapshot hits send bytes prepared at write: coverage header and a gzip copy (level 6) stored with the body; old rows served as before | One Resources repeat view, real 14.6MB body through the real route + `GZipMiddleware`, dev laptop: **1,329ms → 47ms**, same bytes and headers out (§5b). Deployed; live end-to-end repeat view not yet measured (needs the admin password) |
 
 `c88bb58` (`plan.md`) is **another session's v3 plan**, not this work.
 
@@ -209,6 +216,14 @@ its original two queries.
   differs, so the last answer is served stale while it recomputes. The UTC day boundary
   is the same via `family_key`. (Earlier notes said publish was cold; the code says not.)
 - Stored in PostgreSQL (TOAST-compressed); byte limits count the uncompressed JSON.
+- **A hit re-derives nothing** (`f1b2446`). The coverage header and a gzip copy are
+  computed once per write, in a worker thread (`_prepared`), and stored beside the body
+  (`coverage`, `body_gzip`). `_response` sends the gzip copy as-is to clients that accept
+  it; `GZipMiddleware` passes anything already carrying `Content-Encoding` through, so
+  nothing is compressed twice. Rows written before `f1b2446` have `''`/`NULL` and are served
+  the old way until rewritten. Still on the event loop, once per *write*: `_body`'s own
+  cacheability parse and `_safe_content` scan (~2.3s on the 15MB Resources answer, §6
+  item 4).
 - `/api/budgets` and `/api/insights` are cached (MONITOR); a budget POST bumps
   `budget_revision` so a cached "no budgets" cannot outlive a create.
 - Local accounts get a stable cache partition; each Entra user has their own partition,
@@ -269,7 +284,7 @@ it during the warm pass that followed the `d3a6fcb` deploy (`snapshot_warm_targe
 written in `snapshot_cache._refresh`: from after the slot and authorisation to the snapshot
 being stored — so the route's computation plus the cache's own body checks and write, but
 no transfer and no queueing; the pass runs one view at a time). For the 8–15MB views the
-body checks are ~2s of it (§6 item 3). It supersedes the bench's cold column wherever they
+body checks are ~2s of it (§6 item 4). It supersedes the bench's cold column wherever they
 disagree, which is Commitments, Insights and Recommendations (§5a). Every other bench
 column still holds.
 
@@ -300,7 +315,9 @@ AKS 5.4s, Health 2.0s, ESU 0.7s.
 
 45 endpoints: 42 × 200; the three 400s (`change-analysis`, `performance`,
 `service-health`) need parameters the bench does not send — by design.
-Repeat views of Resources/Tags are 2–4s because of payload size, not queries.
+Repeat views of Resources/Tags were 2–4s because of payload size, not queries — more
+exactly, ~1s of per-hit CPU re-deriving the stored body, which `f1b2446` removed (§5b). The
+"After warming" and "Repeat" columns predate it and have not been re-measured live.
 
 ### 5a. The cold path, profiled — and what the old §6 item 1 got wrong
 
@@ -404,6 +421,48 @@ Measurement trap found the hard way: `asyncio.run()` leaves `_inflight` tasks bo
 event loop, so a second scenario in the same process measures contaminated numbers. **One
 process per scenario.**
 
+### 5b. The 2–4s repeat views — measured, fixed, and what it means for paging
+
+Paging was approved as "what removes the 8–15MB payloads and the 2–4s repeat views". Before
+building it, the repeat view was taken apart on the real 14.6MB Resources body (dev laptop,
+Snapdragon X Elite, roughly 3× the Scale B2's single-thread speed — an estimate):
+
+| Per repeat view, before `f1b2446` | Time | Where |
+|---|---|---|
+| `json.loads` of the stored body + `_partial_evidence` walk of every row, for the one `X-CloudLens-Coverage` header | 791ms | event loop |
+| `GZipMiddleware` recompressing the same bytes at level 9 | 253ms | worker thread (Starlette offloads ≥128KB) |
+| PostgreSQL read of the TOASTed body (live, measured) | 15–32ms | database |
+| Whole hit through the real route and middleware | **1,329ms** | |
+| Same hit after `f1b2446` | **47ms** | |
+
+Live repeat views scaled with body size in the same way (Uptime 7.8MB 1.6s, Tags 10.5MB
+2.3–3.9s, Resources 15.3MB 3.7s). Also measured: parsing the 14.6MB body takes 69MiB and
+~250ms; filtering, searching and sorting its 8,000 rows in Python takes 3–135ms; tags are
+62% of its bytes; gzip takes it to 1.07MB on the wire.
+
+**What the four read-only surveys found** (Resources, Tags, Uptime, cache layer — reports
+in the session folder, §8):
+
+- All three tabs were **deliberately** built so that a filter click never touches the
+  network, and say so in code (`dashboard-spend.js:999-1003`, `main.py:4512-4514`). Dozens
+  of tests pin it — e.g. `browser_ui_performance.js` asserts one request for five searches,
+  `browser_resources.js` "local filtering does not refetch".
+- Every KPI, facet list, sort (with `Intl.Collator` numeric collation), outlier cut, footer
+  total and details panel is computed in the browser over the capped row set (Resources and
+  Tags 8,000 rows, Uptime 4,000 meters). Paging means porting all of it to Python with exact
+  parity (rounding, collation, IEEE edge cases) — the Resources survey lists 20 separate
+  computations for that tab alone; Tags adds any/all tag selection, chargeback and budget
+  creation; Uptime adds schedule savings and charts drawn from daily cells.
+- Per-click requests cannot go through the snapshot cache as it stands: every distinct query
+  string is a new entry (4,096-row FIFO shared by all users) and a new warm target (1,000
+  cap). The design all four converged on: keep the existing full answer as the cached base,
+  and serve filter/sort/page clicks from an in-process, byte-capped copy of it on uncached
+  routes. v3's SQL-ranked paging (`D:\cloud lens v3` `1090ed9`) is 0.4–0.9s per page only
+  when a stored ranking matches; filter bar/FX/odd windows fall back to 14–57s, it needs 7
+  new tables, and its `resource_ids` collides with v2's (shared database).
+- Cheaper alternative the Uptime survey costed: keep client-side filtering and slim the
+  payload (drop unread keys, stop repeating the ~150-byte id, columnar daily cells).
+
 ---
 
 ## 6. Pending work — in the order I would do it
@@ -412,30 +471,42 @@ Done on 30 Sep and no longer pending: server-side warming (`383f72e`), Always On
 on Scale, Anomalies and Billing opportunities cached (`e99b71c`), the cold-path profile and
 both fixes it produced (`9920e2d`, `d3a6fcb` — §5a), `d3a6fcb` deployed and re-measured on
 Scale (no end-to-end change there, and why — §5a), the stale §5 column replaced by
-server-measured cold compute, and the full suite, which ran at
+server-measured cold compute, the repeat-view cost found and fixed (`f1b2446`, deployed —
+§5b), and the full suite, which ran at
 `d3a6fcb`: **2220 passed, 7 failed, 10 skipped, 1 error, 14m13s with `-n 4`** (log in the
-session folder, §8). See §3–§5.
+session folder, §8). `f1b2446` was validated with `test_snapshot_cache.py` (141 passed, incl.
+PostgreSQL) and the warming/cache/asset suites (101 passed); the full suite has not been
+re-run since. See §3–§5.
 
-1. **Server-side filtering and paging** (approved by Ravi: "summary tables first, then
-   this"). Uptime, Tags, Resources, Billing return KPIs + chart data + one page (~50 rows);
-   filters/sort/page as query params; same look and feel; update `tests/browser_*.js` and
-   frontend tests. This is what removes the 8–15MB payloads and the 2–4s repeat views.
+1. **Decide paging with Ravi — it is now a product decision, not a speed fix.** First
+   measure what `f1b2446` did end to end: ask Ravi for the admin password (process
+   environment only) and run `tools\bench_tabs.py spend` against live; before it,
+   Resources/Tags/Uptime repeat views were 3.7s/2.3–3.9s/1.6s. If they are now well under a
+   second, what paging still buys is a smaller download (1.1MB gzip for Resources) and less
+   browser memory, at the cost of a round trip per filter click and porting all of §5b's
+   client logic. Options, cheapest first: (a) stop here; (b) slim the payloads (Uptime
+   survey's plan; tags are 62% of Resources' bytes); (c) the in-process-base paging design
+   in §5b, tab by tab, Resources first. Do not start (c) without Ravi's go-ahead.
 2. **Insights: stop running the whole Tags query to read three numbers** (§5a). Its cold
    time is the `tags` source, 31s; `_from_tags` needs only the window's total, untagged
    cost and untagged resource count. Serve those from one aggregate over the `tags` usage
    summary, through the reader like every other tab, and prove it equal to
    `cost_by_tag`'s `total`/`untagged` at three scopes before switching (§8). The next
    ceiling is then `waste` (21.6s), then `rightsizing` (15.4s). Small, generic, measured.
-3. **Resources cold ~30s** (26.6s server compute at `d3a6fcb`). SQL is ~17s (9.7s narrow
+3. **Re-run the full suite at `f1b2446`** (detached, `-n 4`, ~14 min) and compare with
+   `suite-d3a6fcb.log`: the seven known failures and one ordering error, nothing new.
+4. **Resources cold ~30s** (30.1s server compute at `f1b2446`). SQL is ~17s (9.7s narrow
    ranking over `resource_costs` + ~6s detail gather); the rest is app-side on a 2-vCPU
-   box, including ~2.3s of snapshot-cache body checks on a 15MB answer (`_safe_content`
-   regex scan 1.5s). Paging (item 1) shrinks both.
-4. **Verify Entra sign-in warming on live** (§4): after a deploy, sign in via SSO, confirm a
+   box, including ~2.3s of snapshot-cache body checks on a 15MB answer (`_body`'s parse and
+   `_safe_content` regex scan, still on the event loop at write time). Moving that check
+   into a worker thread, as `f1b2446` did for the hit path, frees the loop during cold
+   computes; paging would shrink both.
+5. **Verify Entra sign-in warming on live** (§4): after a deploy, sign in via SSO, confirm a
    `sign-in` pass runs for that oid (its targets' `computed` moves) and the next views hit.
    The same sign-in is the only way to measure `d3a6fcb` end to end without a customer
    estate: if that user's token sees many subscriptions, Insights' stored `timing_ms.advisor`
    is the fan-out's cost for them (§5a shows how to read it without the admin password).
-5. **The seven pre-existing test failures, still unfixed.** Proved pre-existing on 30 Sep
+6. **The seven pre-existing test failures, still unfixed.** Proved pre-existing on 30 Sep
    by re-running them against a clean tree with `app/cost.py` stashed — all seven fail
    identically, so no 28–30 Sep work caused them:
    `test_budget_reading`, `test_datastore_safety::test_summary_does_not_label_unknown_plus_usd_as_single_currency`,
@@ -447,12 +518,14 @@ session folder, §8). See §3–§5.
    which looks like one cause sitting behind several of the seven. Separately, the 1 error,
    `test_fx_rollup::test_failed_build_preserves_native_statistics`, is ordering-dependent —
    it passes on its own, so it is a test-isolation bug, not a product one.
-6. `/api/schedules` is 8.2s cold and not a snapshot-cached route (0.08s repeat from its
+7. `/api/schedules` is 8.2s cold and not a snapshot-cached route (0.08s repeat from its
    own cache). Small; check whether it belongs in `DEFAULT_POLICIES`.
-7. Unconfirmed: live July partition looks bloated (≈20GB heap for 5.0M rows vs ≈10GB for
+8. Unconfirmed: live July partition looks bloated (≈20GB heap for 5.0M rows vs ≈10GB for
    5.8M in August, 0 dead tuples). Not investigated.
-8. Carried from 28 Sep and still open: `stash@{0}` (`env_tags`, Environment filter
-   always empty), browser-suite clean pass, the two UI decisions in the old §7e.
+9. Carried from 28 Sep and still open: `stash@{0}` (`env_tags`, Environment filter
+   always empty), browser-suite clean pass, the two UI decisions in the old §7e. Also: Tags
+   and Uptime ignore the global filter bar (`rg`, `service`, `region`, `charge`, `pricing`,
+   `env`) although the browser sends it, so those params only split their cache keys.
 
 ---
 
@@ -511,11 +584,13 @@ session folder, §8). See §3–§5.
   outputs), and `…\session-state\1ccfca3b-…\files\` (the 30 Sep full-suite log
   `suite-d3a6fcb.log` and the clean-tree baseline `suite-baseline-clean-tree.log` that
   proves the seven failures pre-existing), and `…\session-state\81c61fc4-…\files\` (the
-  `d3a6fcb` deploy: `cloudlens-d3a6fcb.zip` as deployed, sha256 `3cfe79b5…`;
-  `warm_compare.py`, which snapshots `snapshot_warm_targets`, follows a warm pass and
-  compares two passes, read-only; `warm-before-9920e2d.json` and `warm-after-d3a6fcb.json`,
-  the two passes in §5a). Not in the repo. Copy the probes into the new session's folder if
-  useful.
+  `d3a6fcb` and `f1b2446` deploys: `cloudlens-d3a6fcb.zip`, `cloudlens-f1b2446.zip` as
+  deployed; `warm_compare.py`, which snapshots `snapshot_warm_targets`, follows a warm pass
+  and compares two passes, read-only; `warm-before/after-*.json`, the passes in §5a/§5;
+  `survey-resources.md`, `survey-uptime.md`, `survey-cache-layer.md`,
+  `survey-tags-partial.md`, the four paging surveys behind §5b — every client-side
+  computation per tab with file:line, and the tests that pin them). Not in the repo. Copy
+  the probes into the new session's folder if useful.
 - **Cold compute on live without the admin password.** Any deploy (new version digest) makes
   the warmer recompute every target serially; `warm_compare.py snap` before the deploy and
   `watch <before> <after>` after it gives a per-view before/after from the server's own
@@ -528,16 +603,17 @@ session folder, §8). See §3–§5.
 ## 9. First moves in the new chat
 
 1. `git status` (only `tools/bench-tabs-latest.json` should be dirty) and
-   `git log --oneline -8` — top should be this handover, then `399894c`, `571171a`,
-   `94f3439`, `d3a6fcb`, `fbbf999`, `9920e2d`. Scale runs `d3a6fcb`: the same application
-   code as `main` (§2).
+   `git log --oneline -8` — top should be this handover, then `f1b2446`, `34ba93d`,
+   `e971ed2`, `399894c`. Scale runs `f1b2446`: the same application code as `main` (§2).
 2. Start the Scale database if stopped; confirm the firewall rule for today's IP (§1).
 3. Baseline without the password: `warm_compare.py snap` (§8) records every warm target's
-   server compute time and whether the last pass finished. Ask Ravi for the live admin
-   password (process environment only) only when a client-side `tools\bench_tabs.py` run
-   is needed — expect hits almost everywhere: 18 of the 19 warm targets were recomputed after
-   the last deploy (Budgets sits below the 1s floor by design) and Always On keeps them warm.
-4. Pick up §6 item 1 (paging), unless Ravi prefers item 2 (Insights' tags source — smaller
-   and measured, but only the cold path benefits).
+   server compute time and whether the last pass finished. Then ask Ravi for the live admin
+   password (process environment only) and run `tools\bench_tabs.py spend` — the first live
+   measurement of `f1b2446`'s repeat views (§6 item 1). Expect hits almost everywhere: 17 of
+   the 19 warm targets were recomputed after the last deploy (Budgets and ESU sit below the
+   1s floor) and Always On keeps them warm.
+4. Put §6 item 1 to Ravi with those numbers — stop, slim, or page — before writing any
+   paging code. If he prefers something smaller first, item 2 (Insights' tags source) is
+   ready to start.
 5. Before believing any number: read §7 first, and re-measure in isolation. Three of the
    entries there are traps this session walked into and had to back out of.
