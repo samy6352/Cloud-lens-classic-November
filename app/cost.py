@@ -288,6 +288,57 @@ def caller_token(url: str = "") -> str | None:
     return caller.token_for(url) if url else caller.fallback
 
 
+# One connection pool for every ARM call, instead of one per call.
+#
+# `_fetch` used to open an `httpx.AsyncClient` inside its own `async with`, so every request
+# paid a fresh TCP connect and TLS handshake to management.azure.com. That is invisible on one
+# call and dominant on a fan-out: Advisor asks once per subscription, and on the 71-subscription
+# live estate the handshakes were almost the whole cost. Measured there, same 71 calls, same
+# four concurrency slots, same outcome (14 recommendations, 68 refusals):
+#
+#   a client per call:   59.4s wall, 141.3s summed, mean 2.05s per refused call
+#   one shared client:    4.2s wall,  13.3s summed, mean 0.18s per refused call
+#
+# This changes no request, no header and no concurrency limit, so it is neutral with respect to
+# the throttling behaviour `_CONCURRENCY` and `_retry_after` exist to manage -- the same number
+# of requests still leaves at the same rate. It only stops re-establishing the connection they
+# travel over.
+#
+# Bound to the event loop that created it. An `AsyncClient` is not portable across loops, and
+# the test suite creates a fresh loop per test, so a pool cached from a previous one would hand
+# out connections belonging to a closed loop. Rebuilt whenever the running loop differs.
+_pool: httpx.AsyncClient | None = None
+_pool_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _shared_client() -> httpx.AsyncClient:
+    global _pool, _pool_loop
+
+    loop = asyncio.get_running_loop()
+    factory = httpx.AsyncClient
+    # Rebuilt when the pool belongs to another loop, has been closed, or is no longer an
+    # instance of whatever `httpx.AsyncClient` currently names. That last case is not
+    # hypothetical: several suites monkeypatch the attribute with a stub or a lambda returning a
+    # MockTransport client, and a cached real pool would silently ignore the substitution and
+    # send their requests to Azure. `getattr` for `is_closed` because those stubs are not
+    # clients and do not have it.
+    reusable = (
+        _pool is not None
+        and _pool_loop is loop
+        and not getattr(_pool, "is_closed", False)
+        and isinstance(factory, type)
+        and isinstance(_pool, factory)
+    )
+    if not reusable:
+        # Keep-alives at least as wide as `_CONCURRENCY`, so four callers in flight together
+        # never queue behind one another for a connection.
+        _pool = factory(
+            timeout=90,
+            limits=httpx.Limits(max_connections=16, max_keepalive_connections=16))
+        _pool_loop = loop
+    return _pool
+
+
 class Azure:
     """Minimal ARM client using the caller's credential, or the server's when there isn't one."""
 
@@ -321,9 +372,25 @@ class Azure:
         return tok.token
 
     async def close(self) -> None:
+        global _pool, _pool_loop
+
         if self._credential is not None:
             await self._credential.close()
             self._credential = None
+        # The pool outlives any one request but not the process, and closing it here keeps
+        # `close()` meaning "release what this module is holding". It can only be awaited from
+        # the loop that built it; called from any other, it is dropped and `_shared_client`
+        # rebuilds on next use.
+        pool, loop = _pool, _pool_loop
+        _pool, _pool_loop = None, None
+        if pool is None or pool.is_closed:
+            return
+        try:
+            running: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            await pool.aclose()
 
     async def request(self, method: str, url: str, *, json_body: dict | None = None,
                       params: dict | None = None, attempts: int = 5, cache: bool = True) -> dict:
@@ -413,7 +480,8 @@ class Azure:
         if "/providers/Microsoft.CostManagement/" in url:
             headers["ClientType"] = CLIENT_TYPE
 
-        async with _CONCURRENCY, httpx.AsyncClient(timeout=90) as client:
+        async with _CONCURRENCY:
+            client = _shared_client()
             for attempt in range(attempts):
                 r = await client.request(method, url, json=json_body, params=params,
                                          headers=headers)
