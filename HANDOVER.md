@@ -48,10 +48,17 @@ performance table, test list and open items are stale.
 >   the cache in ~0.1s). July `VACUUM FULL` **not approved** — do not run it. Local v2/v3
 >   split: a full database copy (~81GB) was **rejected for disk space**; a clone was started
 >   and cancelled at 17GB, fully cleaned up (no database, tablespace or files left).
+> - **Local v2/v3 clash fixed (1 Oct 12:20 IST), without copying the database.** v3
+>   `aac1314` (local in `D:\cloud lens v3`, not pushed) renames its four generic ranking
+>   tables to `resource_rank_ids/_subs/_raw/_daily`; the existing tables were renamed in
+>   place (one transaction), so v3's stamp stayed valid (all generations still 10, no v3
+>   rebuild). v2 then rebuilt only its two missing tables on its own startup path
+>   (`resource_costs` 8.1M rows, `resource_ids` 5.9M rows, 542s, ~4.3GB on C); all 12 v2
+>   derived tables fresh, `derived_complete` true. Benchmarks no longer need to skip
+>   `_ensure_derived`.
 > - **Still open:** (1) Ravi rotates the live admin password (typed into the 1 Oct chat);
->   (2) one SSO sign-in for item 5; (3) the local v2/v3 table clash, without copying the
->   database (see §1); (4) item 9 UI decisions. MCAPS stops the live DB overnight — start
->   it first (~5 min) and expect cold buffers.
+>   (2) one SSO sign-in for item 5; (3) item 9 UI decisions. MCAPS stops the live DB
+>   overnight — start it first (~5 min) and expect cold buffers.
 > - Still open: items 1 (decision only), 5, 9 (need Ravi). **Item 8 answered** (read-only, 1 Oct 03:25 IST):
 >   `costs_202607` is 20,064MB of heap for 5.02M rows (4,188 B/row) against 1,834 and 1,807
 >   B/row for August and September, with identical sampled row widths (~1,654B, Tags ~980B).
@@ -145,12 +152,9 @@ python -m pytest -q -n 4                                   # full, ~14 min
   f-strings; SIM rules are on).
 - The local PostgreSQL is **shared with other sessions** (e.g. `D:\cloud lens v3`
   runs its own suites and rebuilds). Check `pg_stat_activity` before timing anything.
-- **Table-name collision with v3 (from code reading, not checked in the database).** v3's
-  `resource_ranks.py` drops and renames a plain `public.resource_ids`; v2 publishes its own
-  `resource_ids` as a view over `resource_ids_a`/`_b` and adopts a plain table of that name
-  as `_a` (`derived.py:195-236`). Either start order is hazardous on the shared local
-  database: run `\d+ public.resource_ids` before starting both apps, and rename v3's tables
-  if its ranking design is ever ported here. Scale is unaffected (no v3 there).
+- **Table-name collision with v3 — fixed 1 Oct.** v3 `aac1314` prefixes all its ranking
+  tables `resource_rank_*`, so v3 no longer drops or renames anything v2 publishes. If
+  v2 ever fails at boot with `"resource_ids" is not a view`, an older v3 build ran.
 
 **Deploy** (≈ 3 min, then background derived builds):
 
