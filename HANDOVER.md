@@ -70,11 +70,11 @@ $env:CLOUDLENS_PASSWORD=<AUTH_PASSWORD from the repo .env — the LOCAL one>
 node tests/run_browser_suites.mjs [name-filter ...]
 ```
 
-- Baseline **18/31**. The 13 failures were proved pre-existing on 1 Oct (identical on the
-  previous frontend): account, compact, dashboard, drilldowns (`locator('dialog')` matches
-  two dialogs), focus_schedules ("only five schedules"), focus_workflow, month_hover,
-  reporting_period, sidebar, subsection_styles (Overview header layout), tab_search,
-  tag_budgets, ui_responsive.
+- Baseline **24/31** (1 Oct 17:30 IST, `332c9e1`, warm server). Still failing: dashboard and
+  reporting_period (fixture drift, part-fixed, see §6 item 2), month_hover, sidebar,
+  ui_responsive (timeouts, not yet triaged), focus_schedules and focus_workflow (they test
+  `renderLegacySettings` in `dashboard-reports.js`, which nothing calls since the 16 Sep
+  snapshot: dead UI). cost_data flakes occasionally; rerun before believing it.
 - After a code change the snapshot cache is cold: Executive took 111s locally on the first
   view, past the runner's 120s readiness wait. Warm it (one signed-in GET) before running.
 
@@ -207,7 +207,7 @@ hand-narrowed answers and summary vs detail; skipped filters), `test_snapshot_ca
 | # | Item | Waits on |
 |---|---|---|
 | ~~1~~ | ~~Login page for the demo account~~ — **closed 1 Oct 16:40 IST, not a bug.** Live `/login` returns 200 and renders our page; App Service auth is off; nothing in `app/` or `web/login.html` redirects to Microsoft on its own; sign-out clears the session (`/api/auth/me` → `authenticated: false`); "Sign in with a local account" reveals the form in one click. The "bounce" was the 1 Oct chat firing sign-out, navigate, click and snapshot in parallel — the snapshot caught the old dashboard mid-navigation. The demo account's real failure was the INR timeout, fixed by `CLOUDLENS_FX_ROLLUP` (§5) | — |
-| 2 | **The 13 pre-existing browser-suite failures** (§1). Three have concrete causes (dialog selector, five schedules, Overview header); the rest are timeouts — check each against a warm server first | Nothing — ready |
+| 2 | **Browser suites, 7 left** (§1). Done 1 Oct: six fixed (`332c9e1`), plus one real bug found and fixed: Tags drew two charts for a budget whose trend loads lazily (`226acb9`). Left: dashboard (next stall is the Billing refresh hold near line 713), reporting_period, month_hover, sidebar, ui_responsive; the two focus suites need Ravi's call: delete the dead `renderLegacySettings` UI and its suites, or retarget them at the Cost data tab | Nothing for the five; Ravi for the focus pair |
 | 3 | **Quick refresh and `ChargeCategory`.** Either ask the Query API to group by `ChargeType` as well (check its grouping limit live), or say in the filter bar that quick-loaded subscriptions have no cost type | Nothing — small decision for Ravi on approach |
 | 4 | **Window anchoring.** Every view ends its window on the newest day *in view*, so one freshly quick-refreshed subscription moves every user's window and shows the others' missing days as gaps. A generic rule (e.g. the newest day most of the estate has reached) needs Ravi's view | Ravi |
 | 5 | **Environment filter for real:** resolve `env` at ingest (in `staging`, where rows are already touched once). The `stash@{0}` design rebuilt >24 min and was cancelled; `CLOUDLENS_ENV_ROLLUP` exists but alters `costs_rollup` in place | Ravi, if the filter is wanted |
