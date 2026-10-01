@@ -56,10 +56,29 @@ performance table, test list and open items are stale.
 >   (`resource_costs` 8.1M rows, `resource_ids` 5.9M rows, 542s, ~4.3GB on C); all 12 v2
 >   derived tables fresh, `derived_complete` true. Benchmarks no longer need to skip
 >   `_ensure_derived`.
-> - **Still open:** (1) Ravi rotates the live admin password (typed into the 1 Oct chat);
->   (2) one SSO sign-in for item 5; (3) item 9 UI decisions. MCAPS stops the live DB
->   overnight — start it first (~5 min) and expect cold buffers.
-> - Still open: items 1 (decision only), 5, 9 (need Ravi). **Item 8 answered** (read-only, 1 Oct 03:25 IST):
+> - **Item 9 UI decisions (Ravi, 1 Oct 11:30 IST):** (a) Tags and Uptime now honour the
+>   filter bar on the server. Uptime applies all five dimensions (its summary holds them;
+>   2–15s cold on the local estate). Tags applies resource group / service / region only:
+>   its per-resource money comes from `resource_presence`, which has no charge type or
+>   pricing column, and applying those timed out (>110s) on the detail table — so they are
+>   skipped, returned as `filters_skipped`, and named in a banner on the tab (Ravi chose
+>   this over rebuilding the summary). (b) The Environment filter is hidden while it cannot
+>   be resolved and nothing is selected on it (Scale: always — `CLOUDLENS_ENV_ROLLUP` is
+>   off there); a saved selection still shows the notice. Resolving `env` at ingest stays a
+>   later item. (c) `dashboardReady` stays gated on Executive — not fired early: Executive
+>   now serves from cache in ~0.07s, so the gain is gone and ~25 suites depend on it.
+>   (d) `chart.umd.min.js` stays eager — browser-cached after the first view, and lazy
+>   loading risks visible chart pop-in.
+> - **Noticed, not changed:** every tab anchors its window on the newest day *in its own
+>   view*. ₹1,590 of rows with an empty `ChargeCategory` are dated 30 Sep while Usage ends
+>   28 Sep, so unfiltered windows end two days after the real usage data, and a
+>   Usage-filtered view covers a different 30 days (its totals can exceed unfiltered).
+>   Worth a look at what those rows are.
+> - **Still open:** (1) one SSO sign-in for item 5 (Ravi chose not to rotate the admin
+>   password for now); (2) `env` resolved at ingest, if the Environment filter is wanted;
+>   (3) charge type / pricing on Tags, only if people need them there (summary rebuild).
+>   MCAPS stops the live DB overnight — start it first (~5 min) and expect cold buffers.
+> - **Item 8 answered** (read-only, 1 Oct 03:25 IST):
 >   `costs_202607` is 20,064MB of heap for 5.02M rows (4,188 B/row) against 1,834 and 1,807
 >   B/row for August and September, with identical sampled row widths (~1,654B, Tags ~980B).
 >   Its counters show why: **11.64M rows inserted and 5.81M deleted** — July was imported
@@ -570,7 +589,7 @@ re-run since. See §3–§5.
 | 6 | Seven pre-existing test failures + one ordering-dependent error | **Done** `a171364` (error did not recur) |
 | 7 | `/api/schedules` 8.2s cold and uncached — cache it or not | **Done** `ac9bf8e`: not cached, reason recorded |
 | 8 | Possibly bloated July partition (~20GB vs ~10GB for August) | **Confirmed** (double import + delete); `VACUUM FULL` **declined** by Ravi, 1 Oct |
-| 9 | Carried: `stash@{0}` Environment filter, browser-suite clean pass, two UI decisions; Tags/Uptime ignore the global filter bar | **Ravi**, for the UI decisions |
+| 9 | Carried: `stash@{0}` Environment filter, browser-suite clean pass, two UI decisions; Tags/Uptime ignore the global filter bar | **Decided 1 Oct** (see top); `env` at ingest still open |
 
 At the close of 30 Sep, Ravi was offered: start the unblocked work (3 in the background,
 then 2 and 4), measure live first (1), or stop. He asked for this handover instead, so no
