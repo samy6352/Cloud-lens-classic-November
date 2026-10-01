@@ -43,12 +43,15 @@ performance table, test list and open items are stale.
 >   subscriptions; Service Health reports its own failed read as the app identity).
 >   Recommendation to Ravi: option **(a), no paging** — what remains is ~1.1MB gzip download
 >   and browser memory, not waiting. Awaiting his confirmation.
-> - **Next session, in order:** (1) Ravi confirms no paging → close item 1; (2) Ravi rotates
->   the live admin password (typed into the 1 Oct chat); (3) July `VACUUM (FULL, ANALYZE)
->   costs_202607` if approved, in a quiet window; (4) one SSO sign-in for item 5;
->   (5) Insights' new ceiling: `waste` 20s, `rightsizing` 19s — measure, then generic fix;
->   (6) separate local databases for v2 and v3; (7) item 9 UI decisions. MCAPS stops the
->   live DB overnight — start it first (~5 min) and expect cold buffers.
+> - **Decided 1 Oct 11:00 IST (Ravi):** item 1 closed — **no paging**. Waste/rightsizing
+>   cold-time work **dropped** (only the background warmer pays it; users see Insights from
+>   the cache in ~0.1s). July `VACUUM FULL` **not approved** — do not run it. Local v2/v3
+>   split: a full database copy (~81GB) was **rejected for disk space**; a clone was started
+>   and cancelled at 17GB, fully cleaned up (no database, tablespace or files left).
+> - **Still open:** (1) Ravi rotates the live admin password (typed into the 1 Oct chat);
+>   (2) one SSO sign-in for item 5; (3) the local v2/v3 table clash, without copying the
+>   database (see §1); (4) item 9 UI decisions. MCAPS stops the live DB overnight — start
+>   it first (~5 min) and expect cold buffers.
 > - Still open: items 1 (decision only), 5, 9 (need Ravi). **Item 8 answered** (read-only, 1 Oct 03:25 IST):
 >   `costs_202607` is 20,064MB of heap for 5.02M rows (4,188 B/row) against 1,834 and 1,807
 >   B/row for August and September, with identical sampled row widths (~1,654B, Tags ~980B).
@@ -555,14 +558,14 @@ re-run since. See §3–§5.
 
 | # | Step | Waits on |
 |---|---|---|
-| 1 | Measure `f1b2446`'s repeat views on live, then decide paging: stop / slim / page | **Measured** (all < 0.6s on spend tabs); **Ravi**: confirm (a) stop |
+| 1 | Measure `f1b2446`'s repeat views on live, then decide paging: stop / slim / page | **Closed**: measured < 0.6s; Ravi chose no paging (1 Oct) |
 | 2 | Insights: replace its 31s `tags` source with a small aggregate for the 3 numbers it reads | **Done** `8cdae1a`, deployed |
 | 3 | Re-run the full suite at `f1b2446` (~14 min, `-n 4`) | **Done** (at `ac9bf8e`: 2243 passed, 0 failed) |
 | 4 | Move the write-time body check (~2.3s on Resources) off the event loop | **Done** `54afda3`, deployed |
 | 5 | Verify Entra sign-in warming on live; first end-to-end test of `d3a6fcb` | **Ravi**: one SSO sign-in after a deploy |
 | 6 | Seven pre-existing test failures + one ordering-dependent error | **Done** `a171364` (error did not recur) |
 | 7 | `/api/schedules` 8.2s cold and uncached — cache it or not | **Done** `ac9bf8e`: not cached, reason recorded |
-| 8 | Possibly bloated July partition (~20GB vs ~10GB for August) | **Confirmed**: double import + delete; `VACUUM FULL` needs **Ravi**'s go-ahead (see top) |
+| 8 | Possibly bloated July partition (~20GB vs ~10GB for August) | **Confirmed** (double import + delete); `VACUUM FULL` **declined** by Ravi, 1 Oct |
 | 9 | Carried: `stash@{0}` Environment filter, browser-suite clean pass, two UI decisions; Tags/Uptime ignore the global filter bar | **Ravi**, for the UI decisions |
 
 At the close of 30 Sep, Ravi was offered: start the unblocked work (3 in the background,
