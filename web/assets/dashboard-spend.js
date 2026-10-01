@@ -1686,13 +1686,13 @@ async function renderTags(token) {
   }
 
   if (tagViewMode === "chargeback") {
-    setContent($("tabBody"), tagViewToggle() + chargebackMarkup(d));
+    setContent($("tabBody"), tagViewToggle(d) + chargebackMarkup(d));
     wireTagViewToggle(d);
     wireChargeback(d);
     return;
   }
 
-  setContent($("tabBody"), tagViewToggle() + tagsMarkup(d));
+  setContent($("tabBody"), tagViewToggle(d) + tagsMarkup(d));
   wireTagViewToggle(d);
   wireTags();
   paintTags();
@@ -1705,7 +1705,7 @@ async function renderTags(token) {
  * cost" against "what does each business unit owe" — and neither is a mode of the other, so this
  * is a switch between two whole sections rather than a filter kept within one of them.
  */
-function tagViewToggle() {
+function tagViewToggle(d) {
   return `<div class="seg tagview-toggle" role="radiogroup" aria-label="View">
     <button type="button" class="seg-btn${tagViewMode === "explorer" ? " on" : ""}"
             data-tagview="explorer" role="radio"
@@ -1713,7 +1713,22 @@ function tagViewToggle() {
     <button type="button" class="seg-btn${tagViewMode === "chargeback" ? " on" : ""}"
             data-tagview="chargeback" role="radio"
             aria-checked="${tagViewMode === "chargeback"}">Spend breakdown</button>
-  </div>`;
+  </div>${tagFilterNote(d)}`;
+}
+
+/**
+ * Names the filter-bar choices this tab did not apply. Its per-resource money is summed
+ * at a grain without charge type, pricing model or environment; applying those would put
+ * the tab on the full detail table. A filter that silently does nothing reads as a wrong
+ * number, so the skip is said where the figures are.
+ */
+const FILTER_LABELS = { charge: "Cost type", pricing: "Pricing", env: "Environment" };
+function tagFilterNote(d) {
+  const skipped = (d?.filters_skipped || []).map(k => FILTER_LABELS[k] || k);
+  if (!skipped.length) return "";
+  return `<p class="banner" data-tag-filters-skipped>${esc(skipped.join(" and "))}
+    ${skipped.length === 1 ? "filter does" : "filters do"} not apply on this tab. Resource group,
+    service and region filters do.</p>`;
 }
 
 function wireTagViewToggle(d) {
@@ -1723,11 +1738,11 @@ function wireTagViewToggle(d) {
       closeTagDropdowns();
       tagViewMode = b.dataset.tagview;
       if (tagViewMode === "chargeback") {
-        setContent($("tabBody"), tagViewToggle() + chargebackMarkup(d));
+        setContent($("tabBody"), tagViewToggle(d) + chargebackMarkup(d));
         wireTagViewToggle(d);
         wireChargeback(d);
       } else {
-        setContent($("tabBody"), tagViewToggle() + tagsMarkup(d));
+        setContent($("tabBody"), tagViewToggle(d) + tagsMarkup(d));
         wireTagViewToggle(d);
         wireTags();
         paintTags();
@@ -2038,7 +2053,7 @@ function wireChargeback(d) {
   if (select) {
     select.onchange = () => {
       chargebackState.key = select.value;
-      setContent($("tabBody"), tagViewToggle() + chargebackMarkup(d));
+      setContent($("tabBody"), tagViewToggle(d) + chargebackMarkup(d));
       wireTagViewToggle(d);
       wireChargeback(d);
     };

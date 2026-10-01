@@ -78,7 +78,9 @@ async (page) => {
   await context.addInitScript(() => {
     localStorage.setItem("costCurrency", JSON.stringify("INR"));
     localStorage.setItem("costPeriodMonth", JSON.stringify("2026-08"));
-    localStorage.setItem("costFilters", JSON.stringify({ env: ["Production"] }));
+    if (!localStorage.getItem("fixtureKeepFilters")) {
+      localStorage.setItem("costFilters", JSON.stringify({ env: ["Production"] }));
+    }
   });
   test.on("pageerror", error => errors.push(error.message));
   await context.route("**/*", async route => {
@@ -276,6 +278,22 @@ async (page) => {
     await test.reload();
     await ready();
     check("explicitly auth-disabled deployments still render navigation", await test.locator("#tabs [role=tab]").count() === 7);
+    // An environment that cannot be resolved, with nothing selected on it, is hidden like an
+    // empty dimension: no standing "unavailable" line, the usable filters unaffected.
+    filterMode = "unavailable";
+    await test.evaluate(() => {
+      localStorage.setItem("fixtureKeepFilters", "1");
+      localStorage.setItem("costFilters", JSON.stringify({}));
+    });
+    await test.reload();
+    await ready();
+    await test.locator('[data-dim="service"] button').waitFor();
+    check("unavailable environment with no selection is hidden, not announced",
+      !await test.locator('[data-dim="env"]').count()
+      && !(await test.locator("#fbStatus").textContent()).trim()
+      && await test.locator('[data-dim="service"] button').isEnabled());
+    await test.evaluate(() => localStorage.removeItem("fixtureKeepFilters"));
+    filterMode = "ok";
     await test.evaluate(() => localStorage.removeItem("fixtureIdentity"));
     for (const failure of ["timeout", "failure"]) {
       const before = identityRequests;

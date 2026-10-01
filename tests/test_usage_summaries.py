@@ -285,6 +285,87 @@ def test_insights_untagged_summary_follows_the_display_currency(wh, monkeypatch)
     assert _untagged([])["total"] == 0.0
 
 
+STORAGE = {"service": ["Storage"]}
+COMPUTE = {"service": ["Virtual Machines"]}
+
+
+def _tags_filtered(scope, filters):
+    from app import reporting, tags
+
+    with reporting.select(None):
+        return tags.cost_by_tag(scope, days=30, filters=filters)
+
+
+def _uptime_filtered(scope, filters):
+    from app import reporting, uptime
+
+    with reporting.select(None):
+        return uptime.hourly_cost(scope, days=30, filters=filters)
+
+
+@pytest.mark.parametrize("scope", [None, SUBS[:1]])
+def test_filter_bar_narrows_tags_to_exactly_the_matching_charges(wh, scope):
+    """The Tags tab used to ignore the filter bar. Narrowed, it must hold only the
+    resources with charges in the slice, each with the money it had unfiltered (every
+    charge of those resources is in the slice), and totals that add up to them."""
+    whole = _tags(scope)
+    narrowed = _tags_filtered(scope, STORAGE)
+    by_id = {r["id"]: r for r in whole["resources"]}
+
+    assert {r["name"] for r in narrowed["resources"]} == (
+        {"bare0", "bare1", "bare2"} if scope is None else {"bare0"})
+    for row in narrowed["resources"]:
+        assert row["cost"] == pytest.approx(by_id[row["id"]]["cost"])
+        assert row["d"] == by_id[row["id"]]["d"]
+    assert narrowed["total"] == pytest.approx(sum(r["cost"] for r in narrowed["resources"]), abs=0.01)
+    assert narrowed["total"] < whole["total"]
+    assert _tags_filtered(scope, None) == whole, "no selection must be the unfiltered answer"
+
+
+def test_filter_bar_narrows_uptime_to_exactly_the_matching_meters(wh):
+    whole = _uptime(SUBS)
+    narrowed = _uptime_filtered(SUBS, COMPUTE)
+
+    def resolved(payload, row):
+        # `v` indexes this response's own value pool, which shrinks with the answer.
+        return {**row, "v": [payload["tag_values"][i] for i in row.get("v", [])]}
+
+    assert narrowed["resources"], "the fixture bills VM hours"
+    assert {r["service"] for r in narrowed["resources"]} == {"Virtual Machines"}
+    kept = {r["key"]: resolved(whole, r) for r in whole["resources"]
+            if r["service"] == "Virtual Machines"}
+    assert {r["key"]: resolved(narrowed, r) for r in narrowed["resources"]} == kept
+    assert set(narrowed["daily"]) == set(kept)
+    assert _uptime_filtered(SUBS, None) == whole
+
+
+@pytest.mark.parametrize("filters", [STORAGE, COMPUTE, {"region": ["eastus"]},
+                                     {"charge": ["Usage"], "pricing": ["OnDemand"]}])
+def test_filtered_tags_and_uptime_are_the_same_from_summaries_or_detail(wh, monkeypatch, filters):
+    """Under a filter the reader may answer from a summary (when its grain holds the
+    filtered column) or from the filtered detail rows; which one must never show."""
+    routed = (_uptime_filtered(SUBS, filters), _tags_filtered(SUBS, filters))
+    _plain(monkeypatch, wh)
+    plain = (_uptime_filtered(SUBS, filters), _tags_filtered(SUBS, filters))
+    for name, a, b in zip(("uptime", "tags"), routed, plain):
+        _same(a, b, f"{name} {filters}")
+
+
+def test_tags_skips_and_names_filters_its_summary_cannot_serve(wh):
+    """Charge type and pricing are not in the per-resource summary's grain; applying them
+    put the tab on the detail table (timed out on the real estate). They are skipped and
+    named, and the answer is exactly the one the served filters alone give."""
+    whole = _tags(SUBS)
+    skipped = _tags_filtered(SUBS, {"charge": ["Usage"], "pricing": ["OnDemand"], "env": []})
+    assert skipped["filters_skipped"] == ["charge", "pricing"]
+    assert {**skipped, "filters_skipped": []} == whole
+
+    mixed = _tags_filtered(SUBS, {**STORAGE, "charge": ["Usage"]})
+    assert mixed["filters_skipped"] == ["charge"]
+    assert {**mixed, "filters_skipped": []} == _tags_filtered(SUBS, STORAGE)
+    assert whole["filters_skipped"] == []
+
+
 def test_latest_tags_in_the_window_win_across_a_month_boundary(wh):
     result = _tags(SUBS)
     vm = next(r for r in result["resources"] if r["name"] == "vm0")

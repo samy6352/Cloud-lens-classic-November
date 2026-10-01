@@ -152,9 +152,47 @@ def merge_live_keys(payload: dict[str, Any], live: list[dict[str, Any]]) -> dict
 
 
 
+def _served_filters(filters: dict[str, list[str]] | None
+                    ) -> tuple[dict[str, list[str]] | None, list[str]]:
+    """The filter bar's selection split into what this tab applies and what it skips.
+
+    Money per resource comes from the per-resource summary, whose grain holds resource
+    group, service and region but not charge type, pricing model or environment. Those
+    would push the whole tab onto the detail table -- over the 110s statement bound on
+    the 16.9M-row estate -- so they are skipped and named, never silently dropped.
+    """
+    from . import presence
+
+    applied: dict[str, list[str]] = {}
+    skipped: list[str] = []
+    for key, values in (filters or {}).items():
+        if not any(v and v.strip() for v in (values or [])):
+            continue
+        if key in presence.FILTERABLE:
+            applied[key] = values
+        else:
+            skipped.append(key)
+    return applied or None, sorted(skipped)
+
+
 def cost_by_tag(scope: list[str] | None = None, days: int = 30,
-                currency: str | None = None) -> dict[str, Any]:
-    """Every tagged resource in the window, with its cost, its tag keys and its daily spend."""
+                currency: str | None = None,
+                filters: dict[str, list[str]] | None = None) -> dict[str, Any]:
+    """Every tagged resource in the window, with its cost, its tag keys and its daily spend.
+
+    `filters` is the filter bar's selection. The dimensions the per-resource summary holds
+    narrow the charges every resource's money and daily cells are summed from; the rest
+    are reported in `filters_skipped` (see `_served_filters`). Tags themselves are looked
+    up per returned resource, so a resource kept by the filter shows the tags it carries.
+    """
+    applied, skipped = _served_filters(filters)
+    payload = _cost_by_tag(scope, days, currency, applied)
+    payload["filters_skipped"] = skipped
+    return payload
+
+
+def _cost_by_tag(scope: list[str] | None, days: int, currency: str | None,
+                 filters: dict[str, list[str]] | None) -> dict[str, Any]:
     from . import reporting, resource_tags
 
     days = reporting.period_days(days)
@@ -162,7 +200,8 @@ def cost_by_tag(scope: list[str] | None = None, days: int = 30,
         return _empty(days)
     from .warehouse import warehouse
 
-    with warehouse.reader(scope=scope, currency=currency, usage=("tags",)) as r:
+    with warehouse.reader(scope=scope, currency=currency, filters=filters,
+                          usage=("tags",)) as r:
         # Money per resource from the per-resource summary when it can price this
         # connection, tags looked up for just the resources returned. Scanning `costs`
         # for both timed out on a 16.9M-row estate: `Tags` is most of every row's bytes.

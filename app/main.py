@@ -4496,7 +4496,8 @@ async def dashboard_uptime(request: Request, days: int = 30, scope: str = "",
     picked = narrow([s for s in scope.split(",") if s.strip()], allowed)
     payload = await offload(hourly_cost, picked or None,
                             days=max(1, min(days, 365)),
-                            currency=currency or None)
+                            currency=currency or None,
+                            filters=request_filters(request))
     # The tag breakdown on this tab carries the same caveat as the Tags tab: a load that cannot
     # carry tags leaves every meter looking untagged, which is a different statement from "these
     # meters have no tags" and must not be made silently.
@@ -4530,7 +4531,7 @@ async def dashboard_tags(request: Request, days: int = 30, scope: str = "",
     async with as_user(user):
         payload, live = await asyncio.gather(
             offload(cost_by_tag, picked or None, days=max(1, min(days, 365)),
-                    currency=currency or None),
+                    currency=currency or None, filters=request_filters(request)),
             live_tag_keys(subs),
         )
     merged = merge_live_keys(payload, live)

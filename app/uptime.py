@@ -50,13 +50,20 @@ WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", 
 
 
 def hourly_cost(scope: list[str] | None = None, days: int = 30,
-                currency: str | None = None) -> dict[str, Any]:
-    """Billed hours, derived rates and estimated billed coverage for the window."""
+                currency: str | None = None,
+                filters: dict[str, list[str]] | None = None) -> dict[str, Any]:
+    """Billed hours, derived rates and estimated billed coverage for the window.
+
+    `filters` is the filter bar's selection. It narrows the reader's scope view, so every
+    relation below -- the hourly summary where its grain serves the filter, the same grain
+    over the filtered detail rows where it does not -- answers the narrowed slice.
+    """
     from . import reporting, resource_tags
     from .warehouse import warehouse
 
     days = reporting.period_days(days)
-    with warehouse.reader(scope=scope, currency=currency, usage=("hourly", "tags")) as r:
+    with warehouse.reader(scope=scope, currency=currency, filters=filters,
+                          usage=("hourly", "tags")) as r:
         # Each relation below is the precomputed summary when it can answer this
         # connection exactly and the same grain over the scoped `costs` view when it
         # cannot, so the SQL is identical either way; only the speed differs. Reading

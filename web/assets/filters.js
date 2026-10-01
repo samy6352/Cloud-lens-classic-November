@@ -195,7 +195,8 @@ function notifyChange(immediate = false) {
 function render() {
   const bar = $("filterBar");
   const usable = DIMS.filter(({ key }) => (available[key] || []).length > 1 || chosen[key]?.length);
-  if (!usable.length && !filterError && !unavailableDimensions.length) {
+  const held = unavailableDimensions.some(key => chosen[key]?.length);
+  if (!usable.length && !filterError && !held) {
     bar.hidden = true;
     return;
   }
@@ -204,9 +205,14 @@ function render() {
   $("fbClear").hidden = activeFilterCount() === 0;
   const status = $("fbStatus");
   if (status) {
-    const unavailable = unavailableDimensions.map(key => DIMS.find(dim => dim.key === key).label);
+    // A dimension that could not load and has nothing selected is hidden like an empty one:
+    // on an estate whose environment tags cannot be resolved in time, a standing "temporarily
+    // unavailable" line on every page read as a broken filter. It is still named when a saved
+    // selection on it keeps applying, because that narrowing is otherwise invisible.
+    const held = unavailableDimensions.filter(key => chosen[key]?.length);
+    const unavailable = held.map(key => DIMS.find(dim => dim.key === key).label);
     const notice = filterError || (unavailable.length
-      ? `${unavailable.join(", ")} filter choices are temporarily unavailable, not necessarily empty. Other filters remain usable.${unavailableDimensions.some(key => chosen[key]?.length) ? " Existing selections still apply." : ""}` : "");
+      ? `${unavailable.join(", ")} filter choices are temporarily unavailable, not necessarily empty. Other filters remain usable. Existing selections still apply.` : "");
     status.innerHTML = notice
       ? `${esc(notice)} <button type="button" class="linkish" id="fbRetry">Retry filters</button>` : "";
     if ($("fbRetry")) $("fbRetry").onclick = () => loadFilters(queuedDays, queuedMonth);
