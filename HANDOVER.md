@@ -69,11 +69,20 @@ performance table, test list and open items are stale.
 >   now serves from cache in ~0.07s, so the gain is gone and ~25 suites depend on it.
 >   (d) `chart.umd.min.js` stays eager — browser-cached after the first view, and lazy
 >   loading risks visible chart pop-in.
+> - **The "stray 30 Sep rows" — explained (1 Oct 15:15 IST), no live impact.** They are
+>   three of Ravi's own USD subscriptions (`e3d73cb0…`, `bd2e809d…`, `616dc9b8…`) loaded
+>   by *quick refresh* (Cost Management Query API). Locally they were quick-refreshed on 29
+>   and 30 Sep, so they end 30 Sep while the 67 FOCUS-exported subscriptions end 28 Sep —
+>   that is what pushed every *local* window two days forward. **On Scale all 70 end 28 Sep**
+>   (one ends 6 Sep), so live windows were never shifted. Their empty `ChargeCategory` is
+>   by design: it is in `QUICK_OMITS` (the Query API is not asked for it). Consequence on
+>   live: a Cost type filter of "Usage" excludes those three subscriptions' ~$7.1k. Two
+>   generic points, not acted on: (a) the window anchors on the newest day in view, so one
+>   freshly quick-refreshed subscription moves every user's window and shows the others'
+>   missing days as gaps; (b) the quick query could also group by `ChargeType` (needs a
+>   live check against the Query API's grouping limits).
 > - **Noticed, not changed:** every tab anchors its window on the newest day *in its own
->   view*. ₹1,590 of rows with an empty `ChargeCategory` are dated 30 Sep while Usage ends
->   28 Sep, so unfiltered windows end two days after the real usage data, and a
->   Usage-filtered view covers a different 30 days (its totals can exceed unfiltered).
->   Worth a look at what those rows are.
+>   view* (see the entry above for why this showed up locally).
 > - **Item 5 verified on live (1 Oct 13:56 IST, Ravi's Entra sign-in, oid 75aa28a0…):**
 >   sign-in warming works. Log: the deploy's startup pass skipped Ravi's 4 targets as
 >   `no-identity` (Entra sessions do not survive a restart — by design); each Entra sign-in
