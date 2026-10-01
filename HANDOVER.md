@@ -206,7 +206,7 @@ hand-narrowed answers and summary vs detail; skipped filters), `test_snapshot_ca
 
 | # | Item | Waits on |
 |---|---|---|
-| 1 | **Login page for the demo account.** After sign-out, `/login` hands a browser that is signed in to Microsoft straight back to Microsoft (email-first / silent SSO), so the local-account form is hard to reach. Find where the redirect happens (`web/login*`, `/auth/login`, `email_first`) and keep the local option reachable without weakening SSO | Nothing — ready (Ravi agreed it was next) |
+| ~~1~~ | ~~Login page for the demo account~~ — **closed 1 Oct 16:40 IST, not a bug.** Live `/login` returns 200 and renders our page; App Service auth is off; nothing in `app/` or `web/login.html` redirects to Microsoft on its own; sign-out clears the session (`/api/auth/me` → `authenticated: false`); "Sign in with a local account" reveals the form in one click. The "bounce" was the 1 Oct chat firing sign-out, navigate, click and snapshot in parallel — the snapshot caught the old dashboard mid-navigation. The demo account's real failure was the INR timeout, fixed by `CLOUDLENS_FX_ROLLUP` (§5) | — |
 | 2 | **The 13 pre-existing browser-suite failures** (§1). Three have concrete causes (dialog selector, five schedules, Overview header); the rest are timeouts — check each against a warm server first | Nothing — ready |
 | 3 | **Quick refresh and `ChargeCategory`.** Either ask the Query API to group by `ChargeType` as well (check its grouping limit live), or say in the filter bar that quick-loaded subscriptions have no cost type | Nothing — small decision for Ravi on approach |
 | 4 | **Window anchoring.** Every view ends its window on the newest day *in view*, so one freshly quick-refreshed subscription moves every user's window and shows the others' missing days as gaps. A generic rule (e.g. the newest day most of the estate has reached) needs Ravi's view | Ravi |
@@ -241,6 +241,9 @@ New on 1 October:
   previous frontend (copy the two assets from `HEAD`, run, restore); all 13 were
   pre-existing.
 - **A full local DB clone** (`CREATE DATABASE … TEMPLATE`) — ~81GB; Ravi declined for disk.
+- **Firing browser actions in parallel** (sign-out + navigate + click + snapshot) — the
+  snapshot lands mid-navigation and invents a redirect. That is how §6 item 1 got opened.
+  Run browser steps one after another.
 
 ---
 
@@ -273,5 +276,5 @@ New on 1 October:
    — top should be this handover, then `f673e0a`, `0989c4f`, `c69fd56`, `919be08`, `61fb0e6`.
    `git rev-list --count backup/cloud-lens-v2/main..main` shows what is unpushed.
 2. If touching live: start the database if stopped (§1); confirm the firewall IP.
-3. Ask Ravi which item from §6 to take; item 1 (login page) was agreed as next on 1 Oct.
+3. Ask Ravi which item from §6 to take; item 1 is closed (not a bug), item 2 is next.
 4. Before believing any number, read §7.
