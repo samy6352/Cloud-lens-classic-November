@@ -74,9 +74,19 @@ performance table, test list and open items are stale.
 >   28 Sep, so unfiltered windows end two days after the real usage data, and a
 >   Usage-filtered view covers a different 30 days (its totals can exceed unfiltered).
 >   Worth a look at what those rows are.
-> - **Still open:** (1) one SSO sign-in for item 5 (Ravi chose not to rotate the admin
->   password for now); (2) `env` resolved at ingest, if the Environment filter is wanted;
->   (3) charge type / pricing on Tags, only if people need them there (summary rebuild).
+> - **Item 5 verified on live (1 Oct 13:56 IST, Ravi's Entra sign-in, oid 75aa28a0…):**
+>   sign-in warming works. Log: the deploy's startup pass skipped Ravi's 4 targets as
+>   `no-identity` (Entra sessions do not survive a restart — by design); each Entra sign-in
+>   then ran a `sign-in` pass over exactly those 4 (08:25:52 and 08:26:37 UTC). The
+>   `failed-401` in the first pass was the session being signed out mid-pass for the
+>   re-test — the pass correctly refused to compute as a signed-out user. Limit observed:
+>   the pass starts at the same moment the browser asks for the same views, so the first
+>   page after sign-in is still cold (Executive 14.1s, Savings 13.4s; single-flighted, not
+>   computed twice); it helps the views opened later. The real cold-start cost for Entra
+>   users is the startup/deploy pass having no session to use. `d3a6fcb` still cannot be
+>   measured end to end: Ravi's token sees 1 subscription, so Advisor is one call.
+> - **Still open:** (1) `env` resolved at ingest, if the Environment filter is wanted;
+>   (2) charge type / pricing on Tags, only if people need them there (summary rebuild).
 >   MCAPS stops the live DB overnight — start it first (~5 min) and expect cold buffers.
 > - **Item 8 answered** (read-only, 1 Oct 03:25 IST):
 >   `costs_202607` is 20,064MB of heap for 5.02M rows (4,188 B/row) against 1,834 and 1,807
@@ -588,7 +598,7 @@ re-run since. See §3–§5.
 | 2 | Insights: replace its 31s `tags` source with a small aggregate for the 3 numbers it reads | **Done** `8cdae1a`, deployed |
 | 3 | Re-run the full suite at `f1b2446` (~14 min, `-n 4`) | **Done** (at `ac9bf8e`: 2243 passed, 0 failed) |
 | 4 | Move the write-time body check (~2.3s on Resources) off the event loop | **Done** `54afda3`, deployed |
-| 5 | Verify Entra sign-in warming on live; first end-to-end test of `d3a6fcb` | **Ravi**: one SSO sign-in after a deploy |
+| 5 | Verify Entra sign-in warming on live; first end-to-end test of `d3a6fcb` | **Verified** 1 Oct (see top); `d3a6fcb` unmeasurable with a 1-sub token |
 | 6 | Seven pre-existing test failures + one ordering-dependent error | **Done** `a171364` (error did not recur) |
 | 7 | `/api/schedules` 8.2s cold and uncached — cache it or not | **Done** `ac9bf8e`: not cached, reason recorded |
 | 8 | Possibly bloated July partition (~20GB vs ~10GB for August) | **Confirmed** (double import + delete); `VACUUM FULL` **declined** by Ravi, 1 Oct |
