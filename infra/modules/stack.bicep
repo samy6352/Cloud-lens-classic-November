@@ -704,6 +704,14 @@ resource webApp 'Microsoft.Web/sites@2023-12-01' = {
           value: snapshotServerWarmingEnabled ? 'true' : 'false'
         }
         {
+          // Without the FX companion rollup every display currency other than "as billed"
+          // converts from the detail table: on the 16.9M-row Scale estate Executive in INR
+          // timed out at 240s; with it, 16.9s cold and cached after. Additive and
+          // reversible (a separate table), unlike CLOUDLENS_ENV_ROLLUP.
+          name: 'CLOUDLENS_FX_ROLLUP'
+          value: 'true'
+        }
+        {
           name: 'WEBSITE_WARMUP_PATH'
           value: '/readyz'
         }

@@ -85,6 +85,19 @@ performance table, test list and open items are stale.
 >   computed twice); it helps the views opened later. The real cold-start cost for Entra
 >   users is the startup/deploy pass having no session to use. `d3a6fcb` still cannot be
 >   measured end to end: Ravi's token sees 1 subscription, so Advisor is one call.
+> - **Demo (local `admin`) account fixed (1 Oct 14:24–15:35 IST).** Its browser kept
+>   `costCurrency=INR` (and 67 of 70 subscriptions); Scale had no FX companion rollup
+>   (`CLOUDLENS_FX_ROLLUP` unset), so every non-"as billed" currency converted from the
+>   detail table: Executive in INR **504 at 240s / 500 at 120–180s**, so the dashboard
+>   failed at the browser's 30s. Entra users were unaffected (as billed). Set
+>   `CLOUDLENS_FX_ROLLUP=true` on Scale; the restart built `costs_fx_rollup` alone in ~6 min
+>   (09:57–10:03 UTC), generation unchanged so the cache kept serving. After: Executive INR
+>   **16.9s cold → 0.1s**, USD 11.8s → 0.1s; the demo browser (INR, 67 subs) ready in
+>   18.4s cold, **0.42s** on reload. Now also in `infra/modules/stack.bicep`.
+>   `CLOUDLENS_ENV_ROLLUP` deliberately **not** enabled: it alters `costs_rollup` in place
+>   and cannot be switched back off without a versioned rollback.
+>   Also noticed: after sign-out, `/login` hands an Entra-signed-in browser straight back
+>   to Microsoft, so the local form is hard to reach from such a browser.
 > - **Still open:** (1) `env` resolved at ingest, if the Environment filter is wanted;
 >   (2) charge type / pricing on Tags, only if people need them there (summary rebuild).
 >   MCAPS stops the live DB overnight — start it first (~5 min) and expect cold buffers.
@@ -231,7 +244,7 @@ carry `X-CloudLens-Cache` (`hit`/`miss`/`response-too-large`/…) and `Server-Ti
 | App | `cloudlens-web-scale`, plan `cloudlens-plan-scale` (B2), Central India |
 | Database | `cloudlens-postgres-scale`, Standard_E2ds_v5, PostgreSQL 18, 2 vCPU |
 | DB settings | `shared_buffers` 4GB, `max_parallel_workers_per_gather` 2, default collation **`en_US.utf8`** |
-| App settings | `PG_WORK_MEM=128MB`, `PG_STATEMENT_TIMEOUT=180s` (read-only connections only), `SNAPSHOT_CACHE_ENABLED=true`, `SNAPSHOT_WARMING_ENABLED=true`, `SNAPSHOT_SERVER_WARMING_ENABLED=true`, `AUTH_ALLOW_LOCAL=true`, `AUTO_INGEST=false`, `AUTO_REFRESH=false` |
+| App settings | `PG_WORK_MEM=128MB`, `PG_STATEMENT_TIMEOUT=180s` (read-only connections only), `SNAPSHOT_CACHE_ENABLED=true`, `SNAPSHOT_WARMING_ENABLED=true`, `SNAPSHOT_SERVER_WARMING_ENABLED=true`, `CLOUDLENS_FX_ROLLUP=true` (since 1 Oct), `AUTH_ALLOW_LOCAL=true`, `AUTO_INGEST=false`, `AUTO_REFRESH=false` |
 | Platform | One uvicorn worker. `alwaysOn` **enabled 30 Sep** (had drifted to `false` from `infra/modules/stack.bicep`) |
 | Data | 16.9M cost rows, 2026-07-01 → 2026-09-28, 70 subscriptions (HDFC demo) |
 | Sign-in | SSO shows only the user's own RBAC subscriptions; use local `admin` to see all 70 |
