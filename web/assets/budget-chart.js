@@ -22,6 +22,12 @@ export async function loadBudgetTrend(host, budget, {
 }) {
   if (!host) return false;
   const draw = () => drawBudgetChart(host, budget, options);
+  // drawChart appends, so a redraw over the snapshot must clear it first or the card shows both.
+  const redraw = () => {
+    for (const canvas of host.querySelectorAll?.("canvas") ?? []) globalThis.Chart?.getChart?.(canvas)?.destroy();
+    host.innerHTML = "";
+    return draw();
+  };
   if (budget.trend || budget.filter_exact === false || budget.trend_note) {
     draw();
     return true;
@@ -60,9 +66,9 @@ export async function loadBudgetTrend(host, budget, {
     delete budget._trendError;
     return false;
   } else if (budget.trend) {
-    draw();
+    redraw();
   } else if (options.snapshot) {
-    draw();
+    redraw();
   } else {
     host.innerHTML = `<p class="muted note">${esc(budget.trend_note)}</p>`;
   }
