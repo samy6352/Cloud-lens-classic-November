@@ -75,13 +75,12 @@ def hourly_cost(scope: list[str] | None = None, days: int = 30,
         # warehouse view is: cost lands a day or two late, so a window ending at CURRENT_DATE
         # drops the most recent complete day and, on a stale warehouse, returns nothing at all
         # — which reads as "nothing ran" instead of "this data is old".
-        edge = r.rows(f'SELECT max("ChargePeriodStart") AS hi FROM {agg}')
-        hi = edge[0]["hi"] if edge and edge[0]["hi"] else None
+        hi = reporting.edge(r, agg)
         if hi is None:
             return _empty(days)
 
         start = reporting.start_sql(hi, days)
-        window = f'"ChargePeriodStart" > {start}'
+        window = reporting.period_sql(hi, days)
 
         # Every row in the window, so the tab can say what share of spend is hour-billed at
         # all. Without it a small hourly total is indistinguishable from a small estate.

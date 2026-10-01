@@ -13,8 +13,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
-from app.warehouse import (COLUMNS, QUERY_BACKOFF, QUICK_DEADLINE, QUICK_OMITS, Warehouse,
-                           _query_wait)
+from app.warehouse import (
+    COLUMNS,
+    QUERY_BACKOFF,
+    QUICK_DEADLINE,
+    QUICK_OMITS,
+    Warehouse,
+    _query_wait,
+)
 
 passed = failed = 0
 

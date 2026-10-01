@@ -66,8 +66,10 @@ def hourly_reader(monkeypatch):
 
 def test_hourly_rolling_window_uses_exact_day_count(hourly_reader):
     uptime.hourly_cost(["a"], days=30)
-    assert all('"ChargePeriodStart" > DATE \'2026-09-06\' - INTERVAL 30 DAY' in query
-               for query in hourly_reader if "WHERE" in query)
+    windowed = [q for q in hourly_reader if "WHERE" in q and "AS hi" not in q]
+    assert windowed and all(
+        '"ChargePeriodStart" > DATE \'2026-09-06\' - INTERVAL 30 DAY' in query
+        and '"ChargePeriodStart" <= DATE \'2026-09-06\'' in query for query in windowed)
 
 
 def test_native_currency_filter_does_not_hide_truncated_meters(hourly_reader, monkeypatch):

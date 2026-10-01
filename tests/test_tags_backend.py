@@ -42,8 +42,10 @@ def tag_reader(monkeypatch):
 def test_tag_rolling_window_uses_exact_day_count(tag_reader):
     result = tags.cost_by_tag(["a"], days=30)
     assert result["days"] == 30
-    assert all('"ChargePeriodStart" > DATE \'2026-09-06\' - INTERVAL 30 DAY' in query
-               for query in tag_reader.queries if "WHERE" in query)
+    windowed = [q for q in tag_reader.queries if "WHERE" in q and "AS hi" not in q]
+    assert windowed and all(
+        '"ChargePeriodStart" > DATE \'2026-09-06\' - INTERVAL 30 DAY' in query
+        and '"ChargePeriodStart" <= DATE \'2026-09-06\'' in query for query in windowed)
 
 
 def test_tag_limit_keeps_daily_and_resource_totals_consistent(tag_reader, monkeypatch):

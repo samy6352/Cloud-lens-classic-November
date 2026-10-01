@@ -72,13 +72,11 @@ class Commitments:
         days = reporting.period_days(days)
         with self.wh.reader(scope, currency=currency, include_commitments=True) as r:
             agg = r.agg
-            hi = r.rows(f'SELECT max("ChargePeriodStart") AS hi FROM {agg}')
-            hi = hi[0]["hi"] if hi and hi[0]["hi"] else None
+            hi = reporting.edge(r, agg)
             if not hi:
                 return {"empty": True, "days": days}
 
-            start = reporting.start_sql(hi, days)
-            period = f'"ChargePeriodStart" > {start}'
+            period = reporting.period_sql(hi, days)
 
             split = r.rows(
                 'SELECT coalesce("PricingModel", \'\') AS model, '
@@ -242,12 +240,11 @@ class Commitments:
 
         days = reporting.period_days(days)
         with self.wh.reader(scope, currency=currency, include_commitments=True) as r:
-            hi = r.rows(f'SELECT max("ChargePeriodStart") AS hi FROM {r.agg}')
-            hi = hi[0]["hi"] if hi and hi[0]["hi"] else None
+            hi = reporting.edge(r)
             if not hi:
                 return {"empty": True, "days": days, "commitments": []}
 
-            period = f'"ChargePeriodStart" > {reporting.start_sql(hi, days)}'
+            period = reporting.period_sql(hi, days)
 
             # Byte-order grouping, for the reason set out in `coverage` above: the benefit id is
             # a full ARM resource path and the distinct-resource count is over resource ids, so
@@ -410,11 +407,10 @@ class Commitments:
 
         days = reporting.period_days(days)
         with self.wh.reader(scope, currency=currency, include_commitments=True) as r:
-            edge = r.rows(f'SELECT max("ChargePeriodStart") AS hi FROM {r.agg}', 1)
-            hi = edge[0]["hi"] if edge else None
+            hi = reporting.edge(r)
             if not hi:
                 return {"empty": True, "days": days, "reason": "No billing data is available."}
-            period = f'"ChargePeriodStart" > {reporting.start_sql(hi, days)}'
+            period = reporting.period_sql(hi, days)
             rows = r.rows(
                 'SELECT strftime("ChargePeriodStart", \'%Y-%m\') AS month, '
                 '"MeterName" AS meter, coalesce("PricingModel", \'\') AS model, '

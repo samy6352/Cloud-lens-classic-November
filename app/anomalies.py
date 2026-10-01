@@ -407,7 +407,7 @@ def _rows(con: Any, dimension: str, days: int, *,
         source = "costs"
 
     if end is None:
-        edge = con.execute(f'SELECT max("ChargePeriodStart") FROM {source}').fetchone()
+        edge = con.execute(reporting.edge_sql(source)).fetchone()
         if not edge or not edge[0]:
             return []
         end = str(edge[0])[:10]
@@ -518,10 +518,14 @@ def analyse(scope: list[str] | None = None, days: int = 60,
                     "coverage": {"basis": "validated_focus_day_receipts", "verified_days": 0},
                     "note": "No cost data is loaded yet, so there is nothing to compare against."}
 
-        end = bounds[1] if bounds else date.fromisoformat(str(span[1])[:10])
+        # The window ends where most of the recent spend has reached, not on the newest day
+        # any one subscription has (see `reporting.edge_sql`); `span` stays the data held.
+        anchor = con.execute(reporting.edge_sql(agg)).fetchone()
+        newest = date.fromisoformat(str(anchor[0] if anchor and anchor[0] else span[1])[:10])
+        end = bounds[1] if bounds else newest
         start = bounds[0] if bounds else end - timedelta(days=days - 1)
         history_start = start - timedelta(days=WINDOW * 4)
-        as_of = min(end, date.fromisoformat(str(span[1])[:10]))
+        as_of = min(end, newest)
         covered, coverage = _coverage(con, scope, history_start, as_of, agg)
         history_currencies = con.execute(
             f'SELECT DISTINCT "ChargePeriodStart", "BillingCurrency" FROM {agg} '

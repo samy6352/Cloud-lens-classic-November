@@ -56,7 +56,7 @@ class FakeReader:
         self.hi, self._rows, self._services, self._resources = hi, rows, services, resources
 
     def rows(self, sql, limit=None):
-        if "max(\"ChargePeriodStart\") AS hi" in sql:
+        if "AS hi" in sql:
             return [{"hi": self.hi}] if self.hi else []
         if "\"ServiceName\" AS service" in sql:
             return list(self._services)

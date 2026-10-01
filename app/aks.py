@@ -113,12 +113,11 @@ def _cost_rows(
 
     days = reporting.period_days(days)
     with wh.reader(scope, currency=currency) as r:
-        hi = r.rows(f'SELECT max("ChargePeriodStart") AS hi FROM {r.agg}')
-        hi = hi[0]["hi"] if hi and hi[0]["hi"] else None
+        hi = reporting.edge(r)
         if not hi:
             return [], [], None
 
-        period = f'"ChargePeriodStart" > {reporting.start_sql(hi, days)}'
+        period = reporting.period_sql(hi, days)
         # Both halves of the bill in one pass: the managed node group, and anything charged
         # against the Kubernetes service itself, which is where the Standard-tier control plane
         # (and Automatic-tier) uptime SLA lands.

@@ -540,7 +540,7 @@ def test_csv_disconnect_waits_for_fetch_before_closing_context(monkeypatch):
     monkeypatch.setattr(main, "request_filters", lambda request: {})
     @contextmanager
     def reader(*args, **kwargs):
-        yield SimpleNamespace(rows=lambda sql: [{"hi": "2026-07-17"}])
+        yield SimpleNamespace(rows=lambda sql, limit=None: [{"hi": "2026-07-17"}])
     class Connection:
         def execute(self, sql):
             if sql.startswith("FETCH"):

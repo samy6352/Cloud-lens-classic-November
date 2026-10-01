@@ -91,18 +91,76 @@ def start_sql(hi: Any, days: int) -> str:
     return f"DATE '{date.fromisoformat(str(hi)[:10]).isoformat()}' - INTERVAL {int(days)} DAY"
 
 
+def until_sql(hi: Any) -> str:
+    """Inclusive upper edge. Needed because the window's end is not always the newest day
+    held: a subscription loaded further than most of the estate must not show its extra
+    days beside everyone else's gaps (see `edge_sql`). A chosen calendar month is explicit,
+    so it ends where the month does."""
+    bounds = month_bounds()
+    if bounds:
+        return f"DATE '{bounds[1].isoformat()}'"
+    return f"DATE '{date.fromisoformat(str(hi)[:10]).isoformat()}'"
+
+
+def period_sql(hi: Any, days: int) -> str:
+    """The rolling window ending on `hi`, both edges bounded."""
+    return (f'"ChargePeriodStart" > {start_sql(hi, days)} '
+            f'AND "ChargePeriodStart" <= {until_sql(hi)}')
+
+
 def since_date(default: str) -> str:
     bounds = month_bounds()
     return bounds[0].isoformat() if bounds else default
 
 
+# How far back "recent spend" reaches when weighing subscriptions against each other.
+EDGE_WEIGHT_DAYS = 7
+
+
+def edge_sql(source: str) -> str:
+    """One row, one column `hi`: the day a rolling window should end on.
+
+    Not simply the newest day in view. Subscriptions are loaded at different times -- a
+    quick refresh brings one up to yesterday while the exported rest end three days
+    earlier -- and anchoring on the newest day let that one subscription move everyone's
+    window, showing every other subscription's not-yet-loaded days as a fall to zero.
+
+    The rule is the newest day reached by subscriptions holding at least half of the
+    recent spend: each subscription's last day, weighted by what it cost over the
+    `EDGE_WEIGHT_DAYS` before the newest day in view. A subscription that has gone quiet
+    or been deleted carries no recent spend, so it cannot hold the window back; one
+    subscription on its own still gets its own last day. USD where the row has it, so
+    one currency cannot outweigh another by its exchange rate alone.
+    """
+    weight = ('abs(CASE WHEN coalesce("CostInUsd", 0) <> 0 THEN "CostInUsd" '
+              'ELSE coalesce("BilledCost", 0) END)')
+    return (
+        "WITH per AS ("
+        f' SELECT coalesce("SubAccountId", \'\') AS sub, max("ChargePeriodStart") AS last'
+        f' FROM {source} WHERE "ChargePeriodStart" IS NOT NULL GROUP BY 1),'
+        " top AS (SELECT max(last) AS newest FROM per),"
+        " recent AS ("
+        f' SELECT coalesce("SubAccountId", \'\') AS sub, sum({weight}) AS w FROM {source}, top'
+        f' WHERE "ChargePeriodStart" > CAST(top.newest AS DATE) - {EDGE_WEIGHT_DAYS}'
+        " GROUP BY 1),"
+        " ranked AS ("
+        " SELECT per.last, sum(coalesce(recent.w, 0)) OVER (ORDER BY per.last DESC) AS reached,"
+        " sum(coalesce(recent.w, 0)) OVER () AS total"
+        " FROM per LEFT JOIN recent ON recent.sub = per.sub)"
+        " SELECT last AS hi FROM ranked WHERE reached >= total / 2"
+        " ORDER BY last DESC LIMIT 1")
+
+
+def edge(reader: Any, source: str | None = None) -> Any:
+    """`edge_sql` run on a reader; None when there is no data in view."""
+    rows = reader.rows(edge_sql(source or getattr(reader, "agg", "costs")), 1)
+    return rows[0]["hi"] if rows and rows[0].get("hi") else None
+
+
 def window(reader: Any, days: int) -> tuple[str, str, str]:
     # The rollup when the reader offers one: this runs on every tab load, and a
-    # min/max over the detail table reads every page to find two dates.
-    source = getattr(reader, "agg", "costs")
-    rows = reader.rows(
-        f'SELECT max("ChargePeriodStart") AS hi, min("ChargePeriodStart") AS lo FROM {source}')
-    hi = rows[0]["hi"] if rows and rows[0].get("hi") else None
+    # grouping over the detail table reads every page to find one date.
+    hi = edge(reader)
     if hi is None:
         return "", "", ""
     bounds = month_bounds()
@@ -134,10 +192,8 @@ def metadata(warehouse: Any, scope: list[str] | None, days: int = 30,
         # of every page, and both questions below are a scan of the detail table for
         # an answer the rollup holds at a fraction of the rows.
         source = getattr(reader, "agg", "costs")
-        rows = reader.rows(
-            'SELECT max("ChargePeriodStart") AS hi, min("ChargePeriodStart") AS lo '
-            f'FROM {source}')
-        latest = str(rows[0]["hi"])[:10] if rows and rows[0].get("hi") else None
+        edge_day = edge(reader, source)
+        latest = str(edge_day)[:10] if edge_day else None
         months = reader.rows(
             'SELECT DISTINCT substr(CAST("ChargePeriodStart" AS VARCHAR), 1, 7) AS month '
             f'FROM {source} WHERE "ChargePeriodStart" IS NOT NULL '

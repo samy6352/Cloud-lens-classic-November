@@ -4890,14 +4890,13 @@ async def download_raw_costs(request: Request, days: int = 30, scope: str = "",
 
     # `reader(scope)` physically shadows the costs table, so this cannot return a row the
     # caller is not entitled to even if the SQL below were wrong.
-    from .reporting import start_sql
+    from .reporting import edge, start_sql, until_sql
 
     filters = request_filters(request)
 
     def newest():
         with warehouse.reader(picked or allowed, filters=filters) as r:
-            rows = r.rows('SELECT max("ChargePeriodStart") AS hi FROM costs')
-            return rows[0]["hi"] if rows else None
+            return edge(r)
 
     hi = await offload(newest)
     if not hi:
@@ -4914,6 +4913,7 @@ async def download_raw_costs(request: Request, days: int = 30, scope: str = "",
                 columns = ",".join(f'"{name}"' for name in COLUMNS)
                 con.execute(f"DECLARE raw_cost_export NO SCROLL CURSOR FOR SELECT {columns} FROM costs "
                             f'WHERE "ChargePeriodStart" > {start_sql(hi, days)} '
+                            f'AND "ChargePeriodStart" <= {until_sql(hi)} '
                             'ORDER BY "ChargePeriodStart" DESC, "BilledCost" DESC')
                 buf = io.StringIO()
                 writer = csv.writer(buf)

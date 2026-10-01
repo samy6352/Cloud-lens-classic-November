@@ -52,7 +52,7 @@ def scan(monkeypatch):
 
         def rows(self, sql, limit=None):
             state.queries.append(sql)
-            if 'max("ChargePeriodStart") AS hi' in sql:
+            if 'AS hi' in sql:
                 return [{"hi": state.hi}]
             if '"ChargePeriodStart" AS day' in sql:
                 return [dict(row) for row in state.daily]

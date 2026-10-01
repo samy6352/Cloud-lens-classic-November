@@ -54,7 +54,7 @@ class FakeReader:
         self.hi, self._rows, self._daily = hi, rows, daily
 
     def rows(self, sql, limit=None):
-        if 'max("ChargePeriodStart") AS hi' in sql:
+        if 'AS hi' in sql:
             return [{"hi": self.hi}] if self.hi else []
         if '"ChargePeriodStart" AS day' in sql:
             return list(self._daily)

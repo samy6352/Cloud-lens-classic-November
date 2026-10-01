@@ -212,13 +212,12 @@ def _cost_by_tag(scope: list[str] | None, days: int, currency: str | None,
         # ending at CURRENT_DATE quietly drops the most recent complete day -- and on a
         # warehouse that has not been refreshed this week it returns almost nothing, which
         # reads as "you have no tagged resources" rather than "this data is stale".
-        edge = r.rows(f'SELECT max("ChargePeriodStart") AS hi FROM {agg}')
-        hi = edge[0]["hi"] if edge and edge[0]["hi"] else None
+        hi = reporting.edge(r, agg)
         if hi is None:
             return _empty(days)
 
         start = reporting.start_sql(hi, days)
-        window = f'"ChargePeriodStart" > {start}'
+        window = reporting.period_sql(hi, days)
         totals = r.rows(
             'SELECT COALESCE(NULLIF("BillingCurrency", \'\'), \'unknown\') AS currency, '
             'SUM(COALESCE("BilledCost", 0)) AS cost '
@@ -531,13 +530,12 @@ def untagged_summary(scope: list[str] | None = None, days: int = 30,
         agg = getattr(r, "agg", "costs")
         tag_source = getattr(r, "tags", None)
         named = getattr(r, "named", "costs") if tag_source else "costs"
-        edge = r.rows(f'SELECT max("ChargePeriodStart") AS hi FROM {agg}')
-        hi = edge[0]["hi"] if edge and edge[0]["hi"] else None
+        hi = reporting.edge(r, agg)
         if hi is None:
             return _summary_empty(days)
 
         start = reporting.start_sql(hi, days)
-        window = f'"ChargePeriodStart" > {start}'
+        window = reporting.period_sql(hi, days)
         totals = r.rows(
             'SELECT COALESCE(NULLIF("BillingCurrency", \'\'), \'unknown\') AS currency, '
             'SUM(COALESCE("BilledCost", 0)) AS cost '

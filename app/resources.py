@@ -59,7 +59,8 @@ class Resources:
                 source = r.resource_costs
             key = '"ResourceHash"' if hashed else 'LOWER(TRIM("ResourceId"))'
             combined = f'"ChargePeriodStart" > {prev} AND "ChargePeriodStart" <= DATE \'{hi}\''
-            period = f'"ChargePeriodStart" > {start}'
+            period = (f'"ChargePeriodStart" > {start} '
+                      f'AND "ChargePeriodStart" <= {reporting.until_sql(hi)}')
             previous = f'"ChargePeriodStart" > {prev} AND "ChargePeriodStart" <= {start}'
             currency_sql = ('COALESCE(NULLIF(NULLIF(UPPER(TRIM("BillingCurrency")), '
                             '\'\'), \'UNKNOWN\'), \'unknown\')')

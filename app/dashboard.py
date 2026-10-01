@@ -288,10 +288,11 @@ class Dashboard:
                 return {"sections": [], "days": days, "empty": True}
 
             agg = _aggregate(r)
+            span = f'"ChargePeriodStart" > {start} AND "ChargePeriodStart" <= {reporting.until_sql(hi)}'
             rows = r.rows(
                 'SELECT "ServiceFamily" AS family, "BillingCurrency" AS currency, '
                 f'sum("BilledCost") AS cost FROM {agg} '
-                f'WHERE "ChargePeriodStart" > {start} GROUP BY 1, 2', None)
+                f'WHERE {span} GROUP BY 1, 2', None)
 
             # AKS, on the same connection, because the picker offers it as a segment beside the
             # service families and a segment with no figure beside seven that have one reads as
@@ -300,7 +301,7 @@ class Dashboard:
             # is slow and can be refused -- but the total does not, so the strip stays fast.
             aks_rows = r.rows(
                 f'SELECT "BillingCurrency" AS currency, sum("BilledCost") AS cost FROM {agg} '
-                f'WHERE "ChargePeriodStart" > {start} AND ('
+                f'WHERE {span} AND ('
                 'lower("ResourceGroup") LIKE \'mc\\_%\' ESCAPE \'\\\' '
                 'OR lower("ServiceName") LIKE \'%kubernetes%\') GROUP BY 1', None)
 
@@ -309,7 +310,7 @@ class Dashboard:
             # connection rather than a second round trip once the tab is opened.
             marketplace_rows = r.rows(
                 f'SELECT "BillingCurrency" AS currency, sum("BilledCost") AS cost FROM {agg} '
-                f'WHERE "ChargePeriodStart" > {start} AND {MARKETPLACE_CLAUSE} GROUP BY 1', None)
+                f'WHERE {span} AND {MARKETPLACE_CLAUSE} GROUP BY 1', None)
 
         seen = {r["family"] for r in rows if r["family"]}
         out: list[dict] = []
@@ -368,8 +369,9 @@ class Dashboard:
             if not hi:
                 return {"days": days, "empty": True}
 
-            period = f'"ChargePeriodStart" > {start}'
-            window = f'"ChargePeriodStart" > {prev}'
+            until = f'"ChargePeriodStart" <= {reporting.until_sql(hi)}'
+            period = f'"ChargePeriodStart" > {start} AND {until}'
+            window = f'"ChargePeriodStart" > {prev} AND {until}'
             agg = _aggregate(r)
             res = _counted(r)
             # One pass per shape, all inside the same connection. Splitting current from
@@ -679,7 +681,8 @@ class Dashboard:
             if not hi:
                 return {"section": section_id, "label": label, "empty": True, "days": days}
 
-            period = f'"ChargePeriodStart" > {start}'
+            period = (f'"ChargePeriodStart" > {start} '
+                      f'AND "ChargePeriodStart" <= {reporting.until_sql(hi)}')
             previous = f'"ChargePeriodStart" > {prev} AND "ChargePeriodStart" <= {start}'
 
             # The rollup carries `PublisherName` now, so every tab -- Marketplace
