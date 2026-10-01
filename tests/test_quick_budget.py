@@ -13,7 +13,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
-from app.warehouse import COLUMNS, QUERY_BACKOFF, QUICK_DEADLINE, Warehouse, _query_wait
+from app.warehouse import (COLUMNS, QUERY_BACKOFF, QUICK_DEADLINE, QUICK_OMITS, Warehouse,
+                           _query_wait)
 
 passed = failed = 0
 
@@ -168,6 +169,16 @@ good = wh._map_query({
 check("a good page still maps", len(good) == 1)
 check("with its family, so the cost areas still classify",
       good[0][idx["ServiceFamily"]] == "Compute")
+
+# Without a cost type, a Cost type filter of Usage dropped every quick-loaded subscription.
+typed = wh._map_query({
+    "columns": [{"name": "Cost"}, {"name": "UsageDate"}, {"name": "ChargeType"},
+                {"name": "Currency"}],
+    "rows": [[5.0, 20260801, "Usage", "USD"]],
+}, {"id": "s", "name": "S"})
+check("the quick path fills the cost type from ChargeType",
+      typed[0][idx["ChargeCategory"]] == "Usage")
+check("and no longer reports it as missing", "ChargeCategory" not in QUICK_OMITS)
 
 src = (Path(__file__).resolve().parents[1] / "app" / "warehouse.py").read_text(encoding="utf-8")
 check("the deadline is checked before sleeping, not only before requesting",

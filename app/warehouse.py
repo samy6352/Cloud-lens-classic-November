@@ -225,9 +225,16 @@ QUERY_GAP = 1.5
 QUERY_BACKOFF = (2.0, 5.0)
 QUICK_DEADLINE = float(os.getenv("QUICK_REFRESH_SECONDS", "75"))
 
-# Five, because five is verified to work in one call. Each dimension multiplies the row count,
-# and the Query API refuses a request whose result would be too large — so this is the set that
-# buys the most schema for the least risk of that refusal.
+# Six, verified live on 1 Oct 2026 across three subscriptions (ActualCost and AmortizedCost).
+# Each dimension can multiply the row count, and the Query API refuses a request whose result
+# would be too large — so this is the set that buys the most schema for the least risk of that
+# refusal.
+#
+# ChargeType was the sixth. Without it every quick-loaded row had an empty ChargeCategory, so a
+# Cost type filter of Usage dropped those subscriptions entirely. It added no rows (charge type
+# is near-constant per resource per day), totals matched to the cent, and its values — Usage,
+# Purchase — are the ones the full import stores. PricingModel also fits but is left out: the
+# API says "OnDemand" where full imports store null, so the two paths would disagree.
 #
 # ServiceFamily earns its place over MeterCategory, which was here first and was a mistake: the
 # whole cost-area breakdown — Compute & Web, AI & Data and the rest — is a GROUP BY on
@@ -240,12 +247,13 @@ QUERY_DIMENSIONS = [
     ("ServiceFamily", "ServiceFamily"),
     ("ResourceGroupName", "ResourceGroup"),
     ("ResourceLocation", "RegionName"),
+    ("ChargeType", "ChargeCategory"),
 ]
 
 # What a quick load cannot know. Named here so the UI can say so plainly rather than leaving
 # someone to notice an empty Tags tab and assume the refresh failed.
 QUICK_OMITS = ("PricingQuantity", "UnitPrice", "UnitOfMeasure", "MeterName", "ProductName",
-               "ChargeCategory", "PricingModel", "BenefitName", "BenefitId", "PublisherName",
+               "PricingModel", "BenefitName", "BenefitId", "PublisherName",
                "CostCenter", "Tags", "ServiceSubcategory", "ListCost", "ContractedCost",
                "ListUnitPrice", "ContractedUnitPrice", "PricingCurrency",
                "ExchangeRatePricingToBilling", "CommitmentDiscountType",
