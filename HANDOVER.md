@@ -227,7 +227,10 @@ carry `X-CloudLens-Cache` (`hit`/`miss`/`response-too-large`/…) and `Server-Ti
 | Sign-in | SSO shows only the user's own RBAC subscriptions; use local `admin` to see all 70 |
 | App identity | `cloudlens-id-scale` (user-assigned): Reader + Cost Management Reader on **one** subscription, the one hosting `CloudLens-Scale`. Local `admin` has no delegated token, so its live Azure calls (Advisor, Resource Graph, Monitor) go out as this identity and cover that one subscription — not the 70 in the warehouse |
 
-Deployed commit: **`ac9bf8e`** (30 Sep ~21:33 UTC = 1 Oct ~03:03 IST, RuntimeSuccessful;
+Deployed commit: **`fa481a1`** (1 Oct 07:43 UTC = 13:13 IST, Kudu status 4; filters verified
+on live: Tags `service=` 47 rows 1.7s, `charge=` skipped and named; Uptime `service=` 3.4s;
+warm pass shows unfiltered Tags 17.8s / Uptime 7.6s / Resources 30.5s cold — no
+regression). Before that **`ac9bf8e`** (30 Sep ~21:33 UTC = 1 Oct ~03:03 IST, RuntimeSuccessful;
 see the update at the top). Previously **`f1b2446`** (30 Sep 18:18 UTC, `az webapp deploy`, RuntimeSuccessful;
 warm pass claimed 18:18:06, all 17 targets recomputed by 18:21:40; the migration added
 `private_snapshots.coverage` and `.body_gzip`, and all 17 rewritten rows carry them —
