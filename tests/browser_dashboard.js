@@ -46,10 +46,11 @@ async (page) => {
     export const allSubscriptions = () => [{id:'11111111-1111-4111-8111-111111111111',name:'Demo'},
       {id:'22222222-2222-4222-8222-222222222222',name:'Second subscription'}];
     export const scopeIds = () => window.testScope || ['11111111-1111-4111-8111-111111111111'];
+    export const selectSubscriptions = ids => { window.testScope = [...ids]; return true; };
     export const whoAmI = async () => ({user:{admin:window.testAdmin !== false},authenticated:true});
     export const onScopeChange = fn => window.addEventListener('cl:test-refresh',fn);
     export const askAgent = () => {};
-    export const drawChart = () => {};
+    export const drawChart = async () => null;
     export const refreshHeader = () => {};
     export const setGlanceSpark = () => {};
   `;
@@ -57,7 +58,7 @@ async (page) => {
     "app.js": appStub,
     "analysis.js": "export const close=()=>{},invalidate=()=>{},isOpen=()=>false,openAnalysis=()=>{},setAnalysisContext=()=>{},wireAnalysis=()=>{};",
     "bot.js": "export const mountBot=()=>{},setBotState=()=>{};",
-    "filters.js": "export const activeFilterCount=()=>0,clearAllFilters=()=>{},filterQuery=()=>window.testFilters||[],loadFilters=()=>{},setFilterCurrency=()=>{},wireFilters=()=>{};",
+    "filters.js": "export const activeFilterCount=()=>0,applyFilter=()=>{},clearAllFilters=()=>{},filterHasValue=()=>false,filterQuery=()=>window.testFilters||[],loadFilters=()=>{},setFilterCurrency=()=>{},wireFilters=()=>{};",
   };
   test.on("pageerror", e => errors.push(e.message));
   await context.route("**/*", async route => {
@@ -328,6 +329,8 @@ async (page) => {
     check("actions remain available without Local data", await test.locator("#statusActions").isVisible());
     await test.evaluate(() => { document.getElementById("dataState").hidden = false; });
     await test.setViewportSize({ width: 1440, height: 1000 });
+    // The calendar sits in the collapsed "Spend patterns" section and loads only once opened.
+    await test.evaluate(() => { document.getElementById("overviewPatterns").open = true; });
     await test.locator("#spendHeatmap").scrollIntoViewIfNeeded();
     await calendarStarted;
     await goto("resources");
@@ -335,6 +338,7 @@ async (page) => {
     releaseCalendar();
     await test.waitForTimeout(150);
     await goto("overview");
+    await test.evaluate(() => { document.getElementById("overviewPatterns").open = true; });
     await test.locator("#tabBody #spendHeatmap .heat-cell[title]").first().waitFor();
     check("a delayed heatmap import survives cached navigation", await test.locator("#tabBody #spendHeatmap h3").textContent() === "Daily pattern");
     check("four days of data are visible", await test.locator("#tabBody #spendHeatmap .heat-cell[title]").count() === 4);
@@ -383,13 +387,15 @@ async (page) => {
               buttonHeight: active.getBoundingClientRect().height,
               underline: Math.abs(parseFloat(marker.height) - 2) < .1 && marker.transform === "matrix(1, 0, 0, 1, 0, 0)",
               sameRow: Math.abs((a.top + a.bottom - b.top - b.bottom) / 2) < 2,
+              // With a subsection nav the h2 is screen-reader only (app.css .view-title rule).
+              titleHidden: title.parentElement.getBoundingClientRect().width <= 1,
               overflow: document.documentElement.scrollWidth > innerWidth,
             };
           });
           check(`integrated ${section} header ${theme}/${width}`, header.borderless && header.noNestedPanel
-            && header.sharedSurface && Math.abs(header.titleSize - 14) < .1 && header.underline && !header.overflow
+            && header.sharedSurface && header.titleHidden && header.underline && !header.overflow
             && header.buttonHeight >= 39 && header.buttonHeight <= 41
-            && header.height <= (width > 620 ? 54 : 80) && (width <= 620 || header.sameRow));
+            && header.height <= (width > 620 ? 54 : 80));
           unifiedHeaders.push(header);
         }
       }
@@ -427,7 +433,7 @@ async (page) => {
     await test.locator(".wf-go").first().click();
     await test.waitForFunction(() => document.querySelector(".wf-result").textContent.includes("Fixture comparison"));
     await goto("resources");
-    await test.locator("[data-table]").waitFor();
+    await test.locator("[data-table]:visible").waitFor();
     const pollsAfterLeave = requests.filter(x => x.includes("/savings/progress")).length;
     await test.waitForTimeout(1500);
     check("Savings stops polling off-tab", requests.filter(x => x.includes("/savings/progress")).length === pollsAfterLeave);
@@ -454,15 +460,15 @@ async (page) => {
     check("clicking ordinary row content collapses details", await test.locator("#tabBody .row-detail").count() === 0);
     await rowCell.click();
     await test.locator("#tabBody .row-detail details summary").first().click();
-    const before = await test.locator("[data-table]").getAttribute("data-table");
-    await test.evaluate(() => { window.resourceNode = document.querySelector("[data-table]"); });
+    const before = await test.locator("[data-table]:visible").getAttribute("data-table");
+    await test.evaluate(() => { window.resourceNode = [...document.querySelectorAll("[data-table]")].find(table => table.offsetParent); });
     const resourcesBeforeReturn = requests.filter(url => url.startsWith("/api/dashboard/resources")).length;
     await test.evaluate(() => { window.realNow = Date.now; Date.now = () => window.realNow() + 86400000; });
     await goto("overview");
     await goto("resources");
     check("day-old tab snapshots do not refetch", requests.filter(url => url.startsWith("/api/dashboard/resources")).length === resourcesBeforeReturn);
     await test.evaluate(() => { Date.now = window.realNow; delete window.realNow; });
-    check("cached navigation reuses real DOM", await test.evaluate(() => window.resourceNode === document.querySelector("[data-table]")));
+    check("cached navigation reuses real DOM", await test.evaluate(() => window.resourceNode === [...document.querySelectorAll("[data-table]")].find(table => table.offsetParent)));
     check("cached navigation retains page and sort", (await test.locator(".pager-count").textContent()).includes("21") &&
       await test.locator('th[data-col="3"]').getAttribute("aria-sort") === "descending");
     const cachedDetail = await test.locator("#tabBody .row-detail").evaluate(element => ({
@@ -474,7 +480,7 @@ async (page) => {
     await test.locator("#refreshViews").click();
     await test.waitForFunction(() => document.documentElement.dataset.dashboardReady === "true");
     check("Refresh views fetches new results", requests.filter(url => url.startsWith("/api/dashboard/resources")).length === resourcesBeforeReturn + 1);
-    check("refresh uses stable table identity", await test.locator("[data-table]").getAttribute("data-table") === before);
+    check("refresh uses stable table identity", await test.locator("[data-table]:visible").getAttribute("data-table") === before);
     check("refresh retains page and sort", (await test.locator(".pager-count").textContent()).includes("21") &&
       await test.locator('th[data-col="3"]').getAttribute("aria-sort") === "descending");
     check("refresh retains expanded row identity", (await test.locator("#tabBody .row-detail").innerText()).includes(selectedName));
@@ -484,7 +490,7 @@ async (page) => {
     await test.evaluate(() => { window.testScope = ["b"]; window.dispatchEvent(new Event("cl:test-refresh")); });
     await test.waitForTimeout(200);
     check("changed scope does not leak table query", await test.locator("#resourceSearch").inputValue() === "");
-    check("changed scope changes table key", await test.locator("[data-table]").getAttribute("data-table") !== before);
+    check("changed scope changes table key", await test.locator("[data-table]:visible").getAttribute("data-table") !== before);
     check("changed scope does not inherit row expansion", await test.locator("#tabBody .row-detail").count() === 0);
     for (const change of ["period", "currency", "filter"]) {
       await test.locator("#resourceSearch").fill("resource-7");
@@ -498,7 +504,7 @@ async (page) => {
       await test.waitForTimeout(160);
       check(`changed ${change} does not leak table query`, await test.locator("#resourceSearch").inputValue() === "");
     }
-    await test.evaluate(() => { window.retainedResources = document.querySelector("[data-table]"); });
+    await test.evaluate(() => { window.retainedResources = [...document.querySelectorAll("[data-table]")].find(table => table.offsetParent); });
     const retainedResourceRequests = requests.filter(url => url.startsWith("/api/dashboard/resources")).length;
     await goto("savings");
     await test.waitForFunction(() => document.querySelector("#svRefresh") && !document.querySelector("#svRefresh").disabled, { timeout: 10000 });
@@ -547,7 +553,7 @@ async (page) => {
     }
     await goto("resources");
     check("more than eight visited tabs retain their original DOM", await test.evaluate(() =>
-      window.retainedResources === document.querySelector("[data-table]")));
+      window.retainedResources === [...document.querySelectorAll("[data-table]")].find(table => table.offsetParent)));
     check("more than eight visited tabs retain results without refetching",
       requests.filter(url => url.startsWith("/api/dashboard/resources")).length === retainedResourceRequests);
     const timings = await test.evaluate(() => window.timings);

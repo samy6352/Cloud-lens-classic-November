@@ -16,7 +16,8 @@ async (page) => {
     const illustration = await page.request.get("http://localhost:8100/assets/account-illustration.png");
     assert(illustration.ok(), "Account illustration is served locally");
     const image = await illustration.body();
-    await context.route("**/*", route => route.request().url().endsWith("/assets/account-illustration.png")
+    // The shell stamps asset URLs with a content hash (/assets/v/<hash>/…), so match the name.
+    await context.route("**/*", route => /\/account-illustration\.png$/.test(new URL(route.request().url()).pathname)
       ? route.fulfill({ contentType: "image/png", body: image })
       : route.fulfill({ contentType: "text/html", body: html }));
     await test.goto("http://account-fixture.invalid/");
@@ -34,9 +35,10 @@ async (page) => {
       window.placeAccount = new Function("$", `${place}; return placeAccount;`)($);
       new Function("$", `${wire}; wireAccount();`)($);
       window.logoutCalls = []; window.loginTarget = "";
-      new Function("$", "fetch", "location", signout)($, async (url, options) => {
+      // cacheWarmer: the shell stops its warmer on sign-out; there is none in this fixture.
+      new Function("$", "fetch", "location", "cacheWarmer", signout)($, async (url, options) => {
         window.logoutCalls.push({ url, method: options.method });
-      }, { replace: path => { window.loginTarget = path; } });
+      }, { replace: path => { window.loginTarget = path; } }, null);
       $("tabs").innerHTML = ["Overview", "Billing", "Savings", "Monitor", "Governance", "Reports"]
         .map(name => `<button class="rail-item" role="tab">${name}</button>`).join("");
       $("tabBody").innerHTML = "<h2>Fixture data</h2>";

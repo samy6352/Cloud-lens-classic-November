@@ -46,6 +46,9 @@ async (page) => {
     await context.route("**/api/dashboard/tags?**",route=>route.fulfill({json:tags}));
     await context.route("**/api/budgets**",async route=>{
       if(route.request().method()!=="GET")throw new Error("No budget writes are permitted.");
+      // Budgets without a trend fetch it lazily (e7b08fb); this one has no history to give.
+      if(new URL(route.request().url()).pathname==="/api/budgets/trend")
+        return route.fulfill({json:{trend:null}});
       reads.push(route.request().url());
       if(hold)await hold;
       return route.fulfill({json:payload});

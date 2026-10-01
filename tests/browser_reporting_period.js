@@ -27,9 +27,9 @@ async (page) => {
     export const get=async(url,options={})=>{const r=await fetch(url,{signal:options.signal});if(!r.ok)throw new Error('Fixture request failed');return r.json()};
     export const freshReads=async fn=>fn();
     export const post=async()=>({});
-    export const scopeIds=()=>['fixture-sub'],allSubscriptions=()=>[{id:'fixture-sub',name:'Fixture'}];
+    export const scopeIds=()=>['fixture-sub'],allSubscriptions=()=>[{id:'fixture-sub',name:'Fixture'}],selectSubscriptions=()=>true;
     export const whoAmI=async()=>({authenticated:true,user:{admin:false}});
-    export const onScopeChange=()=>{},askAgent=()=>{},drawChart=()=>{},refreshHeader=()=>{},setGlanceSpark=()=>{};
+    export const onScopeChange=()=>{},askAgent=()=>{},drawChart=async()=>null,refreshHeader=()=>{},setGlanceSpark=()=>{};
     export const readStore=(key,fallback)=>{const v=localStorage.getItem(key);return v?JSON.parse(v):fallback};
     export const writeStore=(key,value)=>localStorage.setItem(key,JSON.stringify(value));
   `;

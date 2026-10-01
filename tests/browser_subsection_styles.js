@@ -37,13 +37,14 @@ async (page) => {
         await ready();
         const area = await styles("#viewActions > .ar-picker",
           '#viewActions .ar-seg[aria-pressed="true"]', '#viewActions .ar-seg[aria-pressed="false"]');
+        // Same rule as Billing: with a subsection nav the h2 stays for screen readers but is
+        // visually hidden (app.css `.view-actions:has(.subsection-nav) .view-title`).
         const header = await test.locator("#viewActions").evaluate(el => {
-          const title = el.querySelector("h2"), picker = el.querySelector(".ar-picker");
-          const a = title.getBoundingClientRect(), b = picker.getBoundingClientRect();
-          return { title: title.textContent, sameRow: Math.abs((a.top + a.bottom - b.top - b.bottom) / 2) < 2,
+          const title = el.querySelector("h2"), box = title.parentElement.getBoundingClientRect();
+          return { title: title.textContent, visuallyHidden: box.width <= 1 && box.height <= 1,
             areaLabels: el.querySelectorAll(".ar-label").length };
         });
-        if (header.title !== "Overview" || header.areaLabels || (width > 1100 && !header.sameRow)
+        if (header.title !== "Overview" || header.areaLabels || !header.visuallyHidden
           || await test.locator("#tabBody .ar-picker").count()) {
           throw new Error(`Overview header layout differs from Billing: ${JSON.stringify(header)}`);
         }

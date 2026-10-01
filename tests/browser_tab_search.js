@@ -63,7 +63,7 @@ async (page) => {
     const initialReads=reads.length;
     await open();
     check(await input.evaluate(node=>node===document.activeElement),"opening search focuses its input");
-    check(await test.locator("#tabSearchResults [role=option]").count()===21,"All tabs includes available secondary and area views");
+    check(await test.locator("#tabSearchResults [role=option]").count()===22,"All tabs includes available secondary and area views");
     check(await test.locator("#tabSearchResults").innerText().then(text=>text.includes("Kubernetes / AKS")&&!text.includes("Audit log")),
       "conditional views are present and unauthorized tabs are absent");
     check(await test.locator("#tabSearchRecentTitle").count()===0,"no invented recent searches");
@@ -84,7 +84,7 @@ async (page) => {
     await open();
     check((await test.locator('[role=group][aria-labelledby="tabSearchRecentTitle"]').innerText()).includes("resources"),
       "opening search shows the last executed query");
-    check(await test.locator('[role=group][aria-labelledby="tabSearchAllTitle"] [role=option]').count()===21,
+    check(await test.locator('[role=group][aria-labelledby="tabSearchAllTitle"] [role=option]').count()===22,
       "all tabs remain available below recent searches");
     await input.fill("application");
     await test.locator("#tabSearchResults [role=option]").first().click();await ready();
