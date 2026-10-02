@@ -15,12 +15,17 @@ async (page) => {
   test.on("pageerror", error => errors.push(error.message));
   try {
     await test.goto(origin);
-    await test.waitForFunction(() => document.documentElement.dataset.dashboardReady === "true");
+    await test.waitForFunction(() => document.documentElement.dataset.dashboardReady === "true",
+      null, { timeout: 120000 });
     if (await test.locator("#railMini").getAttribute("aria-pressed") === "true") {
       await test.locator("#railMini").click();
     }
-    await test.waitForFunction(() => document.querySelector(".sidebar").getBoundingClientRect().width > 190);
-    const labels = ["Overview", "Billing", "Savings", "Monitor", "Governance", "Reports"];
+    const scale = await test.evaluate(() => Number(getComputedStyle(document.documentElement).getPropertyValue("--ui-scale")));
+    const expandedWidth = 200 * scale, miniWidth = 60 * scale;
+    await test.waitForFunction(width => Math.abs(document.querySelector(".sidebar").getBoundingClientRect().width - width) < .5,
+      expandedWidth);
+    await test.locator("#accountTrigger").waitFor({ state: "visible" });
+    const labels = ["Overview", "Billing", "All resources", "Savings", "Monitor", "Governance", "Reports"];
     assert(JSON.stringify(await test.locator("[data-main-section] .rail-name").allTextContents())
       === JSON.stringify(labels), "All primary labels are retained");
     assert(await test.locator(".rail-icon-frame .rail-icon").count() === labels.length, "All icons are framed");
@@ -30,7 +35,7 @@ async (page) => {
       rows: [...document.querySelectorAll(".rail-item")].map(el => el.getBoundingClientRect().height),
       labelsFit: [...document.querySelectorAll(".rail-item .rail-name")].every(el => el.scrollWidth <= el.clientWidth),
     }));
-    assert(density.width <= 200.5 && density.rows.every(height => height >= 39.5 && height <= 40.5)
+    assert(Math.abs(density.width - expandedWidth) < .5 && density.rows.every(height => height >= 39.5 && height <= 40.5)
       && density.labelsFit, `Compact sidebar retains readable labels: ${JSON.stringify(density)}`);
     await test.locator("#primary-overview").focus();
     await test.keyboard.press("ArrowDown");
@@ -46,14 +51,16 @@ async (page) => {
     await test.keyboard.press("Enter");
     assert(await test.locator("#railMini").evaluate(el => el === document.activeElement
       && el.getAttribute("aria-pressed") === "true"), "Collapse preserves keyboard focus");
-    await test.waitForFunction(() => getComputedStyle(document.getElementById("shell")).gridTemplateColumns
-      .split(" ").length > 1 && document.querySelector(".sidebar").getBoundingClientRect().width <= 60.5);
+    await test.waitForFunction(width => getComputedStyle(document.getElementById("shell")).gridTemplateColumns
+      .split(" ").length > 1 && Math.abs(document.querySelector(".sidebar").getBoundingClientRect().width - width) < .5,
+      miniWidth);
     const collapsedWidth = await test.locator(".sidebar").evaluate(el => el.getBoundingClientRect().width);
-    assert(collapsedWidth <= 60.5, `Collapsed rail uses no more than 60px: ${collapsedWidth}`);
+    assert(Math.abs(collapsedWidth - miniWidth) < .5, `Collapsed rail follows UI scale: ${collapsedWidth}`);
     assert(await test.locator("#primary-billing").evaluate(el => (el.dataset.tooltip || el.title) === "Billing"),
       "Collapsed icons retain discoverable labels");
     await test.reload();
-    await test.waitForFunction(() => document.documentElement.dataset.dashboardReady === "true");
+    await test.waitForFunction(() => document.documentElement.dataset.dashboardReady === "true",
+      null, { timeout: 120000 });
     await test.locator("#accountTrigger").waitFor({ state: "visible" });
     assert(await test.locator("#railMini").getAttribute("aria-pressed") === "true",
       "Collapsed preference survives reload");

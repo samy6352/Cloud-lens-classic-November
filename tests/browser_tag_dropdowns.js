@@ -78,6 +78,8 @@ async (page) => {
       "values belong only to the second dropdown, not the key list or page panels");
     check(await test.locator("#tagValuesToggle").isEnabled()
       && await test.locator("#tagValuesLabel").innerText() === "All values","selecting a tag enables Values with all values included");
+    await test.waitForFunction(disabledStyle =>
+      getComputedStyle(document.getElementById("tagValuesToggle")).backgroundColor !== disabledStyle, disabledStyle);
     check(await test.locator("#tagValuesToggle").evaluate((node,disabledStyle)=>getComputedStyle(node).backgroundColor!==disabledStyle,disabledStyle),
       "Values no longer has its disabled grey background");
     await test.keyboard.press("Escape");

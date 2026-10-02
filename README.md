@@ -236,6 +236,22 @@ rolling day/week; generation frequency and coverage are separate.
 CSV/gzip parsing, strict complete-run validation and transactional reconciliation are unchanged.
 External exports, retention policies and existing good data are not modified.
 
+Daily archives retain one whole-estate snapshot per dataset and UTC day (or the explicitly
+requested scoped archive), using the existing names. Extraction uses a PostgreSQL server
+cursor and one consistent query snapshot, counts rows while writing, and does not sort the
+whole estate. Parquet columns keep the warehouse types even when the first batch is null.
+Extraction runs on a worker thread; memory is bounded by a row batch rather than the complete
+query result. Daily archive row order is unspecified; filtered downloads keep their existing
+date ordering.
+
+`ARCHIVE_QUERY_TIMEOUT_SECONDS` defaults to 300 seconds per cursor statement/fetch;
+`ARCHIVE_EXPORT_TIMEOUT_SECONDS` defaults to 3600 seconds for extraction and separately for
+upload. Both accept integers from 1 to 86400. These bulk limits do not change dashboard
+timeouts. Blob uploads stage 4 MiB blocks and atomically replace the daily blob only after
+all blocks succeed; empty exports and failed staging never overwrite a good archive.
+Cancelled work joins its file-owning threads before temporary-file cleanup. This bounds
+memory, not local disk: enough temporary space for the compressed archive is still required.
+
 API: `GET /api/cost-data` returns scoped saved state and coverage;
 `POST /api/cost-data/preview` reviews `scope`, `action` (setup/schedule/frequency/refresh/reconcile),
 `cadence`, `start` and `end`; `POST /api/cost-data/setup` requires that stable preview token

@@ -21,7 +21,9 @@ async (page) => {
     await test.goto(origin);
     await test.waitForFunction(() => document.documentElement.dataset.dashboardReady === "true", null, { timeout: 120000 });
     const tab = test.locator('#tabs [data-main-section="resources"]');
-    const warmed = test.waitForResponse(response => response.url().endsWith("/assets/dashboard-resources.js"));
+    const warmed = test.waitForResponse(response =>
+      /^\/assets\/(?:v\/[a-f0-9]+\/)?dashboard-resources\.js$/.test(new URL(response.url()).pathname)
+      && response.ok());
     await tab.hover();
     await warmed;
     if (requests) throw new Error("Hover preloading started a data request.");

@@ -28,16 +28,20 @@ Three decisions shape the naming:
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import logging
 import os
 import re
+import threading
+import time
 from datetime import UTC, date, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 from urllib.parse import urlencode
+from uuid import uuid4
 from xml.etree import ElementTree
 
 import httpx
@@ -68,6 +72,7 @@ MIN_ROWS = 1
 # Rows held in memory at once when streaming a result set out to a file. The archive can be
 # millions of rows and the app runs on a small instance, so it is never materialised whole.
 _ROW_BATCH = 50000
+_UPLOAD_CHUNK = 4 * 1024 * 1024
 _LIST_MAX_PAGES = 100
 
 # The datasets a refresh can produce. The key is what the UI asks for; the value is the folder.
@@ -82,6 +87,17 @@ _SAFE = re.compile(r"[^a-z0-9._-]+")
 
 class ArchiveError(RuntimeError):
     """Something went wrong writing the archive, phrased for whoever pressed Refresh."""
+
+
+async def _join_cancelled_worker(task: asyncio.Task) -> None:
+    """Repeated cancellation must not release files still owned by a worker thread."""
+    joined = asyncio.gather(task, return_exceptions=True)
+    while not joined.done():
+        try:
+            await asyncio.shield(joined)
+        except asyncio.CancelledError:
+            continue
+    joined.result()
 
 
 def enabled() -> bool:
@@ -173,6 +189,48 @@ class BlobWriter:
                 "etag": r.headers.get("ETag"),
                 "written": datetime.now(UTC).isoformat(timespec="seconds"),
             }
+
+    async def put_file(self, name: str, path: Path, content_type: str) -> dict[str, Any]:
+        """Stage bounded blocks; publish only after the entire file was uploaded."""
+        size = path.stat().st_size
+        if size <= 0 or (size + _UPLOAD_CHUNK - 1) // _UPLOAD_CHUNK > 50000:
+            raise ArchiveError("Archive file is empty or exceeds the 50,000-block upload limit.")
+        prefix = uuid4().hex
+        blocks = ElementTree.Element("BlockList")
+        headers = await self._headers()
+        async with httpx.AsyncClient(timeout=300) as client:
+            await self.ensure_container(client)
+            with path.open("rb") as source:
+                uploaded = 0
+                index = 0
+                while True:
+                    read = asyncio.create_task(asyncio.to_thread(source.read, _UPLOAD_CHUNK))
+                    try:
+                        chunk = await asyncio.shield(read)
+                    except asyncio.CancelledError:
+                        await _join_cancelled_worker(read)
+                        raise
+                    if not chunk:
+                        break
+                    block = base64.b64encode(f"{prefix}-{index:06d}".encode("ascii")).decode("ascii")
+                    r = await client.put(self._url(name, urlencode({"comp": "block", "blockid": block})),
+                                         headers=headers, content=chunk)
+                    if r.status_code != 201:
+                        raise ArchiveError(_explain(r.status_code, r.text, self.account))
+                    ElementTree.SubElement(blocks, "Latest").text = block
+                    uploaded += len(chunk)
+                    index += 1
+            if uploaded != size:
+                raise ArchiveError("Archive file changed during upload; the previous blob was not replaced.")
+            r = await client.put(self._url(name, "comp=blocklist"),
+                                 headers={**headers, "Content-Type": "application/xml",
+                                          "x-ms-blob-content-type": content_type},
+                                 content=ElementTree.tostring(blocks, encoding="utf-8"))
+            if r.status_code != 201:
+                raise ArchiveError(_explain(r.status_code, r.text, self.account))
+            return {"name": name, "bytes": uploaded, "url": self._url(name),
+                    "etag": r.headers.get("ETag"),
+                    "written": datetime.now(UTC).isoformat(timespec="seconds")}
 
     async def get(self, name: str) -> bytes:
         """One blob's bytes. Used to read an archived snapshot back for comparison."""
@@ -318,6 +376,57 @@ def _write_rows(destination: Path, fmt: str, *, source_sql: str,
     return rows, destination.stat().st_size
 
 
+def _archive_limits() -> tuple[int, int]:
+    values = []
+    for name, default in (("ARCHIVE_QUERY_TIMEOUT_SECONDS", 300),
+                          ("ARCHIVE_EXPORT_TIMEOUT_SECONDS", 3600)):
+        raw = os.getenv(name, str(default)).strip()
+        if not raw.isdecimal() or not 1 <= int(raw) <= 86400:
+            raise ArchiveError(f"{name} must be an integer between 1 and 86400 seconds.")
+        values.append(int(raw))
+    return values[0], values[1]
+
+
+def _write_archive(destination: Path, fmt: str, con: Any,
+                   cancel: threading.Event | None = None) -> tuple[int, int]:
+    """One cursor snapshot, counted while writing, without a whole-estate sort."""
+    import pyarrow as pa
+
+    from .warehouse import NUMERIC
+
+    query_timeout, export_timeout = _archive_limits()
+    deadline = time.monotonic() + export_timeout
+    rows = 0
+    with con.raw.transaction(), con.raw.cursor(name=f"archive_{uuid4().hex}") as cur:
+        con.execute("SELECT set_config('statement_timeout', ?, true)", [f"{query_timeout}s"])
+        cur.execute("SELECT * FROM costs")
+        columns = [d.name for d in cur.description]
+        schema = pa.schema([(name, pa.float64() if name in NUMERIC else
+                             pa.date32() if name == "ChargePeriodStart" else pa.string())
+                            for name in columns])
+
+        def batches():
+            nonlocal rows
+            while True:
+                if cancel is not None and cancel.is_set():
+                    raise ArchiveError("Archive extraction was cancelled.")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ArchiveError("Archive extraction exceeded its total time limit.")
+                con.execute("SELECT set_config('statement_timeout', ?, true)",
+                            [str(max(1, int(min(query_timeout, remaining) * 1000)))])
+                batch = cur.fetchmany(_ROW_BATCH)
+                if not batch:
+                    break
+                rows += len(batch)
+                yield batch
+            if time.monotonic() > deadline:
+                raise ArchiveError("Archive extraction exceeded its total time limit.")
+
+        _write_batches(destination, fmt, columns, batches(), schema=schema)
+    return (rows, destination.stat().st_size) if rows else (0, 0)
+
+
 def _write_snapshot(destination: Path, fmt: str, raw: bytes, *,
                     scope: list[str] | None, since: str | None,
                     until: str | None) -> tuple[int, int]:
@@ -399,17 +508,19 @@ def _table_batches(table: Any) -> Any:
         yield list(zip(*columns, strict=True))
 
 
-def _write_batches(destination: Path, fmt: str, columns: list[str], batches: Any) -> None:
+def _write_batches(destination: Path, fmt: str, columns: list[str], batches: Any,
+                   *, schema: Any = None) -> None:
     if fmt == "parquet":
-        _stream_parquet(destination, columns, batches)
+        _stream_parquet(destination, columns, batches, schema=schema)
     else:
         _stream_csv(destination, columns, batches)
 
 
-def _stream_parquet(destination: Path, columns: list[str], batches: Any) -> None:
+def _stream_parquet(destination: Path, columns: list[str], batches: Any,
+                    *, schema: Any = None) -> None:
     """Write row batches to Parquet, one batch at a time.
 
-    The schema is taken from the first batch rather than declared up front, so a column
+    Unless the warehouse's stable schema is supplied, it is taken from the first batch, so a column
     whose Python type depends on how the driver decoded it -- `Decimal` for a numeric,
     `float` for a double -- is described by what actually arrived instead of by an
     assumption. ZSTD matches what earlier archives used, so they stay the same size.
@@ -421,7 +532,8 @@ def _stream_parquet(destination: Path, columns: list[str], batches: Any) -> None
     try:
         for batch in batches:
             table = pa.Table.from_pydict(
-                {name: [row[i] for row in batch] for i, name in enumerate(columns)}
+                {name: [row[i] for row in batch] for i, name in enumerate(columns)},
+                schema=schema,
             )
             if writer is None:
                 writer = pq.ParquetWriter(destination, table.schema, compression="zstd")
@@ -448,7 +560,8 @@ def _stream_csv(destination: Path, columns: list[str], batches: Any) -> None:
             )
 
 
-def _export_parquet(destination: Path, scope: list[str] | None = None) -> tuple[int, int]:
+def _export_parquet(destination: Path, scope: list[str] | None = None,
+                    cancel: threading.Event | None = None) -> tuple[int, int]:
     """Write the warehouse's cost rows to a Parquet file. Returns (rows, bytes).
 
     Streamed in batches through pyarrow rather than materialised in Python, which matters
@@ -459,13 +572,13 @@ def _export_parquet(destination: Path, scope: list[str] | None = None) -> tuple[
 
     con = warehouse.connect(read_only=True, scope=scope)
     try:
-        return _write_rows(destination, "parquet", source_sql="costs",
-                           scope=None, since=None, until=None, con=con)
+        return _write_archive(destination, "parquet", con, cancel)
     finally:
         con.close()
 
 
-def _export_csv(destination: Path, scope: list[str] | None = None) -> tuple[int, int]:
+def _export_csv(destination: Path, scope: list[str] | None = None,
+                cancel: threading.Event | None = None) -> tuple[int, int]:
     """The same rows as CSV, in the shape a Cost Management export writes.
 
     Why bother, when Parquet is a tenth the size: because a file that Azure's own export could
@@ -480,8 +593,7 @@ def _export_csv(destination: Path, scope: list[str] | None = None) -> tuple[int,
 
     con = warehouse.connect(read_only=True, scope=scope)
     try:
-        return _write_rows(destination, "csv", source_sql="costs",
-                           scope=None, since=None, until=None, con=con)
+        return _write_archive(destination, "csv", con, cancel)
     finally:
         con.close()
 
@@ -522,7 +634,15 @@ async def archive_current(metric: str, *, when: date | None = None,
 
     with TemporaryDirectory() as tmp:
         path = Path(tmp) / f"archive{ext}"
-        rows, size = write(path, scope=scope)
+        cancel = threading.Event()
+        extraction = asyncio.create_task(asyncio.to_thread(write, path, scope=scope, cancel=cancel))
+        try:
+            rows, size = await asyncio.shield(extraction)
+        except asyncio.CancelledError:
+            # The worker owns the open file and cursor; join it before deleting its directory.
+            cancel.set()
+            await _join_cancelled_worker(extraction)
+            raise
         if not rows:
             raise ArchiveError(
                 "The warehouse is empty for that selection, so there is nothing to export."
@@ -530,13 +650,12 @@ async def archive_current(metric: str, *, when: date | None = None,
                 "The warehouse is empty, so there is nothing to archive. The refresh that "
                 "triggered this loaded no rows."
             )
-        data = path.read_bytes()
-
-    writer = BlobWriter()
-    try:
-        written = await writer.put(name, data, content_type)
-    finally:
-        await writer.close()
+        writer = BlobWriter()
+        try:
+            async with asyncio.timeout(_archive_limits()[1]):
+                written = await writer.put_file(name, path, content_type)
+        finally:
+            await writer.close()
 
     log.info("archived %s rows to %s/%s/%s", rows, ACCOUNT, CONTAINER, name)
     return {

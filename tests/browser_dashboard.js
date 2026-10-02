@@ -676,7 +676,8 @@ async (page) => {
     check("achieved savings are distinct from billed spend", (await test.locator("#billSaved .bill-value").textContent()).includes("40.00"));
     check("Billing uses last calendar month", (await test.locator("#billPeriod").textContent()).includes("August 2026"));
     releaseBillingEstimate();
-    await test.waitForFunction(() => !document.querySelector("#billRefresh").disabled);
+    await test.waitForFunction(() => !document.querySelector("#billRefresh").disabled
+      && document.querySelector("#billPotential .bill-value")?.textContent.includes("20.00"));
     check("potential is the compatible estimate, not alternatives added together", (await test.locator("#billPotential .bill-value").textContent()).includes("20.00"));
     check("clear recommendation action labels are present", (await test.locator(".bill-recommendation").allTextContents()).join("|")
       === "Right-size resources|Buy Reservation|Increase Savings Plan coverage");
@@ -711,15 +712,21 @@ async (page) => {
     billingLegacy = false;
     await test.locator("#billRefresh").click();
     await test.waitForFunction(() => document.querySelector("#billSpent .bill-value")?.textContent.includes("100.00")
-      && document.querySelector("#billRefresh").disabled);
+      && !document.querySelector("#billRefresh").disabled
+      && document.querySelector("#billPotential .bill-loading-note"));
+    check("completed statement stays refreshable while opportunities load",
+      await test.locator("#billRefresh").isEnabled());
     await goto("resources");
     holdBillingRefresh = null;
     releaseBillingRefresh();
     const completedStatementRequests = requests.filter(url => /^\/api\/dashboard\/billing(?:\?|$)/.test(url)).length;
+    const interruptedOutlookRequests = requests.filter(url => url.startsWith("/api/dashboard/billing/opportunities")).length;
     await goto("billing");
-    await test.waitForFunction(() => !document.querySelector("#billRefresh").disabled);
+    await test.waitForFunction(() => !document.querySelector("#billRefresh").disabled
+      && !document.querySelector("#billPotential .bill-loading-note"));
     check("interrupted Billing resumes only its unfinished opportunities",
-      requests.filter(url => /^\/api\/dashboard\/billing(?:\?|$)/.test(url)).length === completedStatementRequests);
+      requests.filter(url => /^\/api\/dashboard\/billing(?:\?|$)/.test(url)).length === completedStatementRequests
+      && requests.filter(url => url.startsWith("/api/dashboard/billing/opportunities")).length === interruptedOutlookRequests + 1);
     await goto("tags");
     await test.locator("#tagSumSub").waitFor();
     check("Tags initially explores every loaded resource", (await test.locator("#tagSumSub").textContent()).includes("4 of 4")
@@ -803,8 +810,8 @@ async (page) => {
     await test.locator("#budgetFind").waitFor();
     check("budget retry recovers with retained search", await test.locator("#budgetFind").inputValue() === "Production");
     check("Tags and Budgets produce no browser exceptions", errors.length === 0);
-    const billingSections = ["Billing summary", "Hourly Billing", "Applications & Tags", "Budgets"];
-    check("Billing owns four subsections without Resources", JSON.stringify(await test.locator("#viewActions [data-subsection]").allTextContents())
+    const billingSections = ["Billing summary", "Hourly Billing", "Applications & Tags", "History", "Budgets"];
+    check("Billing owns five subsections without Resources", JSON.stringify(await test.locator("#viewActions [data-subsection]").allTextContents())
       === JSON.stringify(billingSections));
     check("nested view keeps Billing selected on the left",
       await test.locator('#tabs [data-main-section="billing"]').getAttribute("aria-selected") === "true");
@@ -840,8 +847,8 @@ async (page) => {
     check("unauthorized cross-link does not load a hidden view", requests.length === beforeInvalid
       && (await test.locator("#toasts").textContent()).includes("not available"));
     await test.setViewportSize({ width: 390, height: 844 });
-    await test.waitForFunction(() => document.getElementById("tabs").getAttribute("aria-orientation") === "horizontal");
-    check("mobile primary navigation is horizontal", await test.locator("#tabs").getAttribute("aria-orientation") === "horizontal");
+    await test.waitForFunction(() => document.querySelector('#tabs [role="tablist"]')?.getAttribute("aria-orientation") === "horizontal");
+    check("mobile primary navigation is horizontal", await test.locator('#tabs [role="tablist"]').getAttribute("aria-orientation") === "horizontal");
     await test.locator('#tabs [data-main-section="billing"]').click();
     await test.locator('#viewActions [data-subsection="billing"]').click();
     await test.waitForFunction(() => document.documentElement.dataset.dashboardReady === "true");

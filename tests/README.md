@@ -75,6 +75,13 @@ hover, and that a line chart's tooltip is placed clear of the caret.
 which budgets a tag key and value actually match (on the filter Azure holds, not on the name),
 case-insensitive keys against case-sensitive values, budgets that filter on more than the
 selection, and that no live budget read happens until a value is chosen.
+`browser_focus_schedules.js` and `browser_focus_workflow.js` exercise the current Cost data
+tabs, not the retired schedules form. The browser runner passes their shared
+`createCostDataFixture` from `cost_data_browser_fixture.mjs`; direct invocations must pass
+the same helper as the second argument. It uses real reports/CSS assets from the source
+page's origin and intercepts all fixture traffic, rejecting unexpected requests.
+Coverage includes scoped cadence review/cancellation, approval tokens and retry keys,
+read-only export inventory, durable import progress, cached return and header routing.
 `browser_premium.js` checks the real shell across all three themes and desktop/mobile widths,
 including readable text contrast, full-height navigation alignment and overflow.
 `test_azure_updates.py` and `test_service_health.py` exercise official-feed schemas, stale/error

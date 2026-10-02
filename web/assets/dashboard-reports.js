@@ -6,9 +6,6 @@ export function createTabs(ctx) {
 // What the Export data tab has selected. Kept outside the render so switching away and back does
 // not silently discard a selection somebody has just spent a minute making.
 let reportChoice = readStore(key("costReport"), null);
-const schedulePageSize = 5;
-let schedulePage = 0;
-let scheduleScope = null;
 let scheduleChoice = null;
 const scheduleCadences = new Map();
 const lastImports = new Map();
@@ -477,11 +474,7 @@ function reportUrl(choice, format) {
  * job of the code here is only to keep the link's href current.
  */
 
-/**
- * @param {boolean} fresh Bypass the server's export cache. Set only by the Reload button:
- *   a schedule created in the Azure portal is the one change CloudLens cannot invalidate on,
- *   and a reload that returns the identical cached list is not a reload.
- */
+/** Load the accessible subscription catalog and the selected Cost data setup. */
 async function renderSettings(token, reloadCatalog = true) {
   stop();
   const sequence = ++settingsSequence;
@@ -1051,168 +1044,6 @@ function wireCostData() {
   queue(10000);
 }
 
-async function renderLegacySettings(token, fresh = false) {
-  stop();
-  const sequence = ++settingsSequence;
-  let sched;
-  try {
-    sched = await get(`/api/schedules${qs()}${fresh ? "&fresh=true" : ""}`, { timeout: 45000 });
-  } catch (error) {
-    if (token !== ctx.loadToken || sequence !== settingsSequence) return;
-    const message = scheduleReadError(error);
-    // A failed explicit reload must not erase the last successful form or schedule list.
-    if (settingsData && $("sReload")) {
-      settingsToken = token;
-      $("sNotice").textContent = message;
-      wireFocusWorkflow(settingsData);
-      if (focusPending || settingsData.sync?.status === "running") queueFocusCheck(10000);
-      return;
-    }
-    setContent($("tabBody"), `<section class="card"><h3>Cost exports</h3>
-      <p class="muted note" role="alert">${esc(message)}</p>
-      <button type="button" class="ghost" id="sReload">Retry loading exports</button>
-      ${permissionPanel()}</section>`);
-    $("sReload").onclick = () => renderSettings(ctx.loadToken, true);
-    wirePermissions();
-    return;
-  }
-  if (token !== ctx.loadToken || sequence !== settingsSequence) return;
-
-  sched.sync = normalizeFocusSync(sched.sync);
-  settingsData = sched;
-  settingsToken = token;
-  const subs = scheduleSubscriptions(sched);
-  const writable = subs.filter((s) => s.can_write === true);
-  const canWrite = writable.length > 0;
-  const mine = sched.schedules || [];
-  const destination = sched.destination || {};
-  const readNotice = sched.error ? "Some export schedules could not be read. Check subscription access and reload the list before making changes." : "";
-  const currentScope = [...scopeIds()].sort().join(",");
-  if (currentScope !== scheduleScope) schedulePage = 0;
-  scheduleScope = currentScope;
-  schedulePage = Math.min(schedulePage, Math.max(0, Math.ceil(mine.length / schedulePageSize) - 1));
-  if (!(scheduleChoice === "*" && writable.length > 1) &&
-      !writable.some((s) => s.id === scheduleChoice)) {
-    scheduleChoice = writable[0]?.id || null;
-  }
-
-  setContent($("tabBody"), `
-    <section class="card">
-      <div class="tagpick-head">
-        <h3>Scheduled exports</h3>
-        <button type="button" class="linkish" id="sReload">Reload list</button>
-      </div>
-      <p class="muted note">FOCUS reports → Azure Blob → changed-day reconciliation (native Daily reports are month-to-date).
-        ${subs.length} accessible subscription${subs.length === 1 ? "" : "s"} detected · ${writable.length} writable.</p>
-      ${sched.sync?.auto_enabled === false
-        ? '<p class="muted note">Automatic ingestion is paused or its Blob destination is not configured in this environment.</p>' : ""}
-
-      ${canWrite ? `
-        <div class="budget-grid">
-          <label class="bfield"><span>Subscription</span>
-            <select id="sSub">
-              ${writable.length > 1 ? `<option value="*">All selected writable subscriptions (${writable.length})</option>` : ""}
-              ${subs.map((s) => `<option value="${esc(s.id)}"${s.can_write === true ? "" : " disabled"}>
-                ${esc(s.name || s.id)}${s.can_write === true ? "" : " — read only"}</option>`).join("")}
-            </select>
-          </label>
-          <label class="bfield"><span>Report</span>
-            <select id="sMetric">
-              <option value="FocusCost">FOCUS — actual and amortized in one file</option>
-            </select>
-          </label>
-          <label class="bfield"><span>How often</span>
-            <select id="sEvery">
-              <option value="Daily" selected>Daily — recommended</option>
-              <option value="Weekly">Weekly</option>
-              <option value="Monthly">Monthly</option>
-            </select>
-          </label>
-        </div>
-        <p class="muted note" id="sCoverage"></p>
-        <div class="build-bar">
-          <button class="primary" id="sCreate">Review and save schedule</button>
-          <button type="button" class="ghost" id="sRefresh">Refresh latest</button>
-          <span class="muted" id="sNote"></span>
-        </div>`
-        : `<p class="muted note">${subs.length
-          ? "Read-only access. Schedule changes and Refresh latest require Azure export write access."
-          : "No accessible subscriptions were returned for this selection. Check access or change the header selection."}</p>`}
-      <p class="muted note" id="sNotice" role="status" aria-live="polite">${esc(readNotice || settingsNotice)}</p>
-      ${permissionPanel()}
-      <details class="view-help" data-state-key="focus-import-progress">
-        <summary><span id="sSyncSummary">Import status</span></summary>
-        <div id="sSyncDetails"></div>
-        <button type="button" class="linkish" id="sCheck">Check import status</button>
-      </details>
-
-      ${mine.length ? `<h4 class="sub-head">Existing schedules</h4>
-        <div class="schedules" id="sScheduleList">${mine.map((s) => scheduleRow(s,
-          writable.some((sub) => sub.id === s.subscription_id) && s.can_write !== false)).join("")}</div>
-        <nav class="pager schedule-pager" aria-label="Schedule pages">
-          <span class="pager-count" id="sScheduleCount" role="status" aria-live="polite"></span>
-          <span class="pager-btns">
-            <button type="button" class="ghost" id="sPrev" aria-controls="sScheduleList">Previous</button>
-            <button type="button" class="ghost" id="sNext" aria-controls="sScheduleList">Next</button>
-          </span>
-        </nav>`
-        : `<p class="muted empty">Nothing scheduled yet.</p>`}
-      <details class="view-help" data-state-key="cost-exports-about">
-        <summary>About this view</summary>
-        <p>FOCUS contains actual and amortized cost together. Daily (recommended) and Weekly
-          cover the current month to date (MonthToDate), not a rolling day or week.
-          Monthly covers the previous calendar month (TheLastMonth), starting on the first of next month.
-          Refresh latest requests the current month without changing your saved cadence. Azure may restate charges.</p>
-        <p>Destination: <code>${esc(destination.account_id || "ARCHIVE_ACCOUNT_ID not configured")}</code> /
-          <code>${esc(destination.container || "focus-exports")}</code> /
-          <code>${esc(destination.folder || "focus/<subscription-id>")}</code>.
-          Saving may create the export's managed identity and grant it Storage Blob Data Contributor.
-          No storage keys; snapshot archives remain separate.</p>
-        <p>All runs retained: CreateNewReport uses separate Azure-generated folders. No lifecycle deletion
-          is added; storage costs grow. When automatic ingestion is enabled, the backend checks completed reports every
-          ${esc(Math.round((Number(sched.sync?.poll_seconds) || 900) / 60))} minutes and replaces changed day
-          partitions only. Unchanged days are skipped; retained copies are not added together.
-          Existing legacy or external schedules are never replaced by this form.</p>
-      </details>
-    </section>
-    <section class="card" id="focusWorkflow">
-      <h3>Initial FOCUS load (last 90 days)</h3>
-      <p class="muted note">Available even when Quick or partial costs already exist. Uses the header's selected subscriptions.
-        Exactly 90 inclusive UTC dates, split at calendar-month boundaries. Missing days remain unknown.</p>
-      <div class="build-bar">
-        <button type="button" class="ghost" id="fPreview">Preview 90-day FOCUS load</button>
-        <button type="button" class="ghost" id="fJobsReload">Check jobs and coverage</button>
-      </div>
-      <details class="view-help"><summary>Reconcile a historical period</summary>
-        <div class="budget-grid">
-          <label class="bfield"><span>From (UTC)</span><input type="date" id="fFrom"></label>
-          <label class="bfield"><span>Through (UTC)</span><input type="date" id="fTo"></label>
-        </div>
-        <button type="button" class="ghost" id="fReconcile">Preview reconciliation</button>
-      </details>
-      <details class="view-help"><summary>Daily FOCUS sync mode</summary>
-        <p class="muted note">Compact custom windows require verified returned coverage and explicit workload-identity approval.
-          Native Daily is month-to-date, not a delta. Cadence changes affect only this deployment's owned exports.</p>
-        <label class="bfield"><span>Mode</span><select id="fDailyMode">
-          <option value="compact">Compact custom window — last 7 days</option>
-          <option value="native-month-to-date">Explicit native Daily month-to-date fallback</option>
-        </select></label>
-        <button type="button" class="ghost" id="fDailyPreview">Preview daily mode change</button>
-        <button type="button" class="ghost" id="fVerify">Preview 7-day custom-window verification</button>
-      </details>
-      <div id="fPlan" aria-live="polite"></div>
-      <p class="muted note" id="fNotice" role="status" aria-live="polite"></p>
-      <div id="fJobs"></div>
-    </section>`);
-
-  wirePermissions();
-  wireSettings(sched);
-  wireSchedulePages();
-  paintFocusStatus();
-  wireFocusWorkflow(sched);
-  if (focusPending || sched.sync?.status === "running") queueFocusCheck();
-}
-
 async function focusPost(url, body) {
   const response = await fetch(url, { method: "POST",
     headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -1469,31 +1300,6 @@ function scheduleCoverage(recurrence) {
 function scheduleDestination(dest, subscription) {
   const folder = (dest.folder || "focus/<subscription-id>").replace("<subscription-id>", subscription.toLowerCase());
   return `${dest.account_id || "Storage not configured"}/${dest.container || "focus-exports"}/${folder}`;
-}
-
-function wireSchedulePages() {
-  const host = $("sScheduleList");
-  if (!host) return;
-  // Reuse wired nodes: paging preserves open details and in-flight action guards,
-  // leaves the approval form untouched, and never requests Azure data.
-  const rows = [...host.children];
-  const previous = $("sPrev");
-  const next = $("sNext");
-  const paintPage = () => {
-    const start = schedulePage * schedulePageSize;
-    const end = Math.min(start + schedulePageSize, rows.length);
-    host.replaceChildren(...rows.slice(start, end));
-    $("sScheduleCount").textContent = `Showing ${start + 1}–${end} of ${rows.length} schedules`;
-    previous.disabled = schedulePage === 0;
-    next.disabled = end === rows.length;
-  };
-  previous.onclick = () => {
-    if (!previous.disabled) { schedulePage--; paintPage(); }
-  };
-  next.onclick = () => {
-    if (!next.disabled) { schedulePage++; paintPage(); }
-  };
-  paintPage();
 }
 
 /**

@@ -25,6 +25,8 @@ import { dirname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { chromium } from "playwright";
+import { createCostDataFixture } from "./cost_data_browser_fixture.mjs";
+import { waitForDashboard } from "./browser_runner_readiness.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB = join(HERE, "..", "web");
@@ -140,8 +142,7 @@ async function main() {
       throw new Error(`${BASE} redirected to the login page. Set CLOUDLENS_USER / CLOUDLENS_PASSWORD.`);
     }
     // The dashboard shell has to exist before a suite can borrow the page.
-    await page.waitForFunction(() => document.documentElement.dataset.dashboardReady === "true",
-      null, { timeout: 120000 });
+    await waitForDashboard(page);
 
     for (const name of names) {
       running = name;
@@ -150,7 +151,7 @@ async function main() {
       try {
         const suite = await loadSuite(name);
         const result = await Promise.race([
-          suite(page, {}),
+          suite(page, { createCostDataFixture }),
           new Promise((_, reject) => setTimeout(
             () => reject(new Error(`suite exceeded ${SUITE_TIMEOUT_MS} ms`)), SUITE_TIMEOUT_MS)),
         ]);

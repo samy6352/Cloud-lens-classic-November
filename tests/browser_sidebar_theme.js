@@ -21,6 +21,14 @@ async (page) => {
     for (let cycle = 0; cycle < 4; cycle++) {
       await test.locator("#themeBtn").click();
       await test.locator("#accountTrigger").click();
+      await test.waitForFunction(() => {
+        const probe = document.createElement("span");
+        probe.style.backgroundColor = "var(--rail-surface)";
+        document.body.appendChild(probe);
+        const expected = getComputedStyle(probe).backgroundColor;
+        probe.remove();
+        return getComputedStyle(document.querySelector(".account-popover")).backgroundColor === expected;
+      });
       await test.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
       const palette = await test.evaluate(() => {
         const root = getComputedStyle(document.documentElement);

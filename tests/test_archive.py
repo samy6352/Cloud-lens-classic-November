@@ -140,12 +140,28 @@ async def main() -> int:
     import tempfile
 
     class FakeCon:
+        @property
+        def raw(self):
+            return self
+
+        def transaction(self):
+            from contextlib import nullcontext
+            return nullcontext()
+
+        def cursor(self, **kwargs):
+            from contextlib import nullcontext
+            self.description = []
+            return nullcontext(self)
+
         def execute(self, sql, *args):
             self.last = sql
             return self
 
         def fetchone(self):
             return (0,)
+
+        def fetchmany(self, size):
+            return []
 
         def close(self):
             pass

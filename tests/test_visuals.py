@@ -451,15 +451,14 @@ check("the section break uses the compact spacing scale",
 check("the panel that opens the section is marked as doing so",
       '<section class="card section-lead">' in dash and ".card.section-lead" in css)
 
-# The create form is why someone opens Cost exports; the list is the record of having used it.
-# With fourteen schedules the form sat below a screenful of cards.
+# The primary review flows lead; raw export inventory is an optional read-only detail.
 _settings = dash[dash.index("async function renderSettings"):dash.index("function snapshotOptions")]
-check("the create form comes before the list of schedules",
-      _settings.index('id="sCreate"') < _settings.index('class="schedules"'))
-check("and the list is labelled, now that it is no longer the first thing",
-      '<h4 class="sub-head">Existing schedules</h4>' in dash and ".sub-head {" in css)
-check("the label is a step down from the panel title, not another one",
-      bool(re.search(r"\.sub-head \{[^}]*font-size: var\(--t-micro\)", css, re.S)))
+check("import and schedule reviews come before export inventory",
+      _settings.index('id="cdReview"') < _settings.index('id="cdInventory"')
+      and _settings.index('id="cdChange"') < _settings.index('id="cdInventory"'))
+check("export inventory is explicitly read only",
+      "Legacy and external export inventory (read only)" in _settings)
+check("the obsolete schedules renderer is removed", "renderLegacySettings" not in dash)
 
 # Azure reports a budget as one number with no history, so the meter can say 93% without
 # answering what follows: a steady climb landing just inside, or a breach three weeks ago?

@@ -79,11 +79,26 @@ async (page) => {
     await hover(await pointFor(0, 1, true));
     for (const dataset of [1, 2, 1, 0]) await hover(await pointFor(dataset, 1), false);
     await hover(await pointFor(0, 1, true));
+    assert(await test.locator("#cl-tooltip").evaluate(tip => getComputedStyle(tip).pointerEvents === "none"),
+      "Short chart tooltip stays click-through");
+    await test.evaluate(() => {
+      window.chart.options.plugins.tooltip.callbacks.footer = () =>
+        Array.from({ length: 80 }, (_, index) => `Detail ${index}`);
+      window.chart.update("none");
+    });
+    await hover(await pointFor(0, 1, true));
+    assert(await test.locator("#cl-tooltip").evaluate(tip =>
+      tip.scrollHeight > tip.clientHeight && getComputedStyle(tip).pointerEvents === "auto"),
+    "Scrollable chart tooltip accepts hover");
     await test.locator("#cl-tooltip").hover();
     await test.waitForTimeout(250);
     assert(await test.locator("#cl-tooltip").isVisible(), "Tooltip remains readable while hovered");
     await test.keyboard.press("Escape");
     assert(await test.locator("#cl-tooltip").isHidden(), "Escape dismisses the hovered tooltip");
+    await test.evaluate(() => {
+      window.chart.options.plugins.tooltip.callbacks.footer = () => [];
+      window.chart.update("none");
+    });
     await test.mouse.move(410, 200);
     await hover(await pointFor(1, 2));
     await test.mouse.move(410, 200);
