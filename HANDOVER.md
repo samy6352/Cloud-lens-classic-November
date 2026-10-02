@@ -1,4 +1,10 @@
-# CloudLens — handover, 1 October 2026 (16:00 IST)
+# CloudLens — handover, 1 October 2026 (16:00 IST), updated 2 October 15:00 IST
+
+**Update, 2 Oct 15:00 IST — read §3a first.** Since this file was written: quick refresh
+fills cost type (`5f178dd`), report windows anchor on the spend-weighted edge (`180e3d2`),
+both deployed to Scale; `e3d73cb0` was quick-refreshed on live; overnight the Scale plan
+was found downgraded to **F1** and the database stopped — both restored. §6 items 3 and 4
+are closed.
 
 Supersedes the 30 Sep → 1 Oct handover, kept as `HANDOVER-2026-09-30.md`. That file still
 holds the architecture (its §4), the per-tab performance history (§5, §5a, §5b) and the
@@ -7,10 +13,9 @@ paging surveys; they are not repeated here. `HANDOVER-2026-09-28.md` is older st
 **Start here:** §0 (rules), §4 (decisions Ravi has already made — do not reopen them),
 §6 (what is left). §9 is the literal first moves.
 
-**State:** nothing in flight. No server, test run, deploy or build is running. `main` is
-pushed (`git rev-list --count backup/cloud-lens-v2/main..main` = 0 after this commit is
-pushed). Scale runs `fa481a1` application code plus `CLOUDLENS_FX_ROLLUP=true`; `main` is
-that code plus handover/infra commits only. Every item on the 30 Sep pending list is
+**State (2 Oct 15:00 IST):** nothing in flight. No server, test run, deploy or build is
+running. `main` is pushed up to `180e3d2`; this handover update is the only commit on top.
+Scale runs `180e3d2` (deployed 1 Oct 21:31 IST) plus `CLOUDLENS_FX_ROLLUP=true`. Every item on the 30 Sep pending list is
 either done, decided against by Ravi, or listed in §6.
 
 ---
@@ -134,12 +139,13 @@ Insights stores per-source `timing_ms` in its body (`private_snapshots`, filter
 | App | `cloudlens-web-scale`, plan B2, Central India, one uvicorn worker, Always On |
 | Database | `cloudlens-postgres-scale`, Standard_E2ds_v5, PostgreSQL 18, 2 vCPU, 128GB (67GB used), collation `en_US.utf8` |
 | App settings | `PG_WORK_MEM=128MB`, `PG_STATEMENT_TIMEOUT=180s`, `SNAPSHOT_CACHE_ENABLED`, `SNAPSHOT_WARMING_ENABLED`, `SNAPSHOT_SERVER_WARMING_ENABLED`, **`CLOUDLENS_FX_ROLLUP=true` (since 1 Oct 14:24 IST)**, `CLOUDLENS_PARTITION_COSTS=1`, `AUTH_ALLOW_LOCAL=true`, `AUTO_INGEST=false`, `AUTO_REFRESH=false`. **Not set:** `CLOUDLENS_ENV_ROLLUP`, `CLOUDLENS_READ_INDEXES`, `CLOUDLENS_DERIVED_LAYOUT` |
-| Data | 16.9M cost rows, 2026-07-01 → 2026-09-28, 70 subscriptions (HDFC demo, 99.99% INR + 3 small USD subscriptions of Ravi's). All 70 end 28 Sep except one (6 Sep) |
+| Data | 16.9M cost rows, 2026-07-01 → 2026-09-28, 70 subscriptions (HDFC demo, 99.99% INR + 3 small USD subscriptions of Ravi's). All end 28 Sep except one (6 Sep) and `e3d73cb0`, quick-refreshed 1 Oct to **1 Oct** (§3a). Estate window still ends 28 Sep (`180e3d2`) |
 | Derived tables | 12, all stamped, incl. `costs_fx_rollup` (built 1 Oct 09:57–10:03 UTC) |
 | Sign-in | Entra SSO shows the user's own RBAC subscriptions (Ravi: 1). Local `admin` sees all 70 |
 | App identity | `cloudlens-id-scale`: Reader + Cost Management Reader on **one** subscription. Local `admin` has no delegated token, so its live Azure calls (Advisor, Resource Graph, Monitor) see that one subscription |
 
-**Deployed:** `fa481a1` (1 Oct 13:13 IST). Previously `ac9bf8e` (1 Oct 03:03 IST),
+**Deployed:** `180e3d2` (1 Oct 21:31 IST). Before it `5f178dd` (1 Oct 18:28 IST),
+`fa481a1` (1 Oct 13:13 IST), `ac9bf8e` (1 Oct 03:03 IST),
 `f1b2446` (30 Sep). `infra/modules/stack.bicep` now carries `CLOUDLENS_FX_ROLLUP=true`
 (`0989c4f`), so a redeploy from the template keeps it.
 
@@ -164,6 +170,21 @@ hand-narrowed answers and summary vs detail; skipped filters), `test_snapshot_ca
 
 ---
 
+## 3a. What 1 Oct evening → 2 Oct changed
+
+| Commit / action | What | Measured / verified |
+|---|---|---|
+| `226acb9`, `332c9e1` | Tags budget double chart fixed; six browser suites brought up to date (24/31 pass) | See §6 item 2 |
+| `5f178dd` | **Quick refresh fills cost type.** The Query API also groups by `ChargeType` (six groupings work; seven too), mapped to `ChargeCategory`; dropped from `QUICK_OMITS`. `PricingModel` deliberately left out: the API returns "OnDemand" where full imports store nothing | Live API on all three quick subs: same row counts, totals to the cent, values Usage/Purchase as full imports |
+| `180e3d2` | **Window anchoring (Ravi chose spend-weighted majority).** `reporting.edge_sql`: the end day is the newest day reached by subscriptions holding ≥ half of the last `EDGE_WEIGHT_DAYS`=7 days' spend (USD where present, else BilledCost). A quiet/deleted sub carries no weight; a single sub in view gets its own last day. `period_sql(hi, days)` bounds windows on **both** ends (most views only had `> start`); calendar-month mode ends at month end. New `tests/test_window_anchor.py`; five test stubs keyed on `AS hi` | Local: edge 28 Sep vs max 30 Sep (3 subs ~$350/wk vs ~$270k/wk), 0.1s on rollup, 18s on `costs`. Live after refresh: edge **28 Sep**, max 1 Oct. Offline suite 1,682 passed; **PostgreSQL suite not run on this commit** |
+| Live quick refresh | `e3d73cb0`, ActualCost, `months=4` (so July is included), via `/api/ingest` as Ravi's SSO (the only sub it can write). Job `12122d0d…`, generation 3, all 12 derived tables rebuilt (~2h on live: started ~21:50, job finished 23:55 IST) | Jul $872→$459.32, Aug $494.09 (unchanged), Sep $875.53 to 30 Sep, Oct $20.92; no blank cost type. Ravi's view (1 sub) ends 1 Oct, as the rule intends. **Archive step failed** (statement timeout writing `actual/2026/10/actual-2026-10-01.parquet`) — data unaffected |
+| Overnight outage | ~00:15 IST 2 Oct: DB **stopped** (governance) and the App Service plan **downgraded B2 → F1**, app `QuotaExceeded` / 403, Always On off. Activity log showed no caller for either | DB started 00:34 IST (Ravi's account). 2 Oct 14:00 IST plan back to **B2**, Always On re-enabled, app 200, data verified signed in |
+
+The other two quick-refreshed subscriptions (`bd2e809d…`, `616dc9b8…`) still have blank
+cost type on live; Ravi's sign-in cannot refresh them (local `admin` can, with the password).
+
+---
+
 ## 4. Decisions Ravi has made — do not reopen
 
 | Decision | Date | Note |
@@ -177,6 +198,9 @@ hand-narrowed answers and summary vs detail; skipped filters), `test_snapshot_ca
 | **`dashboardReady` stays gated on Executive; `chart.umd.min.js` stays eager** | 1 Oct | Executive is cached (~0.07s); ~25 suites depend on the contract; no chart pop-in |
 | **Enable `CLOUDLENS_FX_ROLLUP` on Scale** | 1 Oct | Done. `CLOUDLENS_ENV_ROLLUP` deliberately **not** enabled: it alters `costs_rollup` in place and needs a versioned rollback to undo |
 | **Admin password: not rotating for now** | 1 Oct | Still never write it down |
+| **Window end day = spend-weighted majority** (not subscription majority, not "every sub") | 1 Oct | `180e3d2` |
+| **Quick refresh: fetch `ChargeType`**, not a filter-bar note | 1 Oct | `5f178dd` |
+| **Restore Scale to B2** after the F1 downgrade | 2 Oct | Done 14:00 IST |
 
 ---
 
@@ -197,8 +221,9 @@ hand-narrowed answers and summary vs detail; skipped filters), `test_snapshot_ca
   (`e3d73cb0…`, `bd2e809d…`, `616dc9b8…`) are loaded by *quick refresh* (Cost Management
   Query API). Locally they were quick-refreshed on 29–30 Sep and so ended two days after
   the FOCUS-exported 67, which moved every *local* window. On Scale all end 28 Sep.
-  Their empty `ChargeCategory` is by design (`QUICK_OMITS`), so a Cost type filter of
-  "Usage" excludes their ~$7.1k on live.
+  Their empty `ChargeCategory` was by design (`QUICK_OMITS`), so a Cost type filter of
+  "Usage" excluded their ~$7.1k on live. *(Superseded: `5f178dd` fills it; `e3d73cb0`
+  re-refreshed on live, §3a.)*
 
 ---
 
@@ -208,8 +233,11 @@ hand-narrowed answers and summary vs detail; skipped filters), `test_snapshot_ca
 |---|---|---|
 | ~~1~~ | ~~Login page for the demo account~~ — **closed 1 Oct 16:40 IST, not a bug.** Live `/login` returns 200 and renders our page; App Service auth is off; nothing in `app/` or `web/login.html` redirects to Microsoft on its own; sign-out clears the session (`/api/auth/me` → `authenticated: false`); "Sign in with a local account" reveals the form in one click. The "bounce" was the 1 Oct chat firing sign-out, navigate, click and snapshot in parallel — the snapshot caught the old dashboard mid-navigation. The demo account's real failure was the INR timeout, fixed by `CLOUDLENS_FX_ROLLUP` (§5) | — |
 | 2 | **Browser suites, 7 left** (§1). Done 1 Oct: six fixed (`332c9e1`), plus one real bug found and fixed: Tags drew two charts for a budget whose trend loads lazily (`226acb9`). Left: dashboard (next stall is the Billing refresh hold near line 713), reporting_period, month_hover, sidebar, ui_responsive; the two focus suites need Ravi's call: delete the dead `renderLegacySettings` UI and its suites, or retarget them at the Cost data tab | Nothing for the five; Ravi for the focus pair |
-| 3 | **Quick refresh and `ChargeCategory`.** Either ask the Query API to group by `ChargeType` as well (check its grouping limit live), or say in the filter bar that quick-loaded subscriptions have no cost type | Nothing — small decision for Ravi on approach |
-| 4 | **Window anchoring.** Every view ends its window on the newest day *in view*, so one freshly quick-refreshed subscription moves every user's window and shows the others' missing days as gaps. A generic rule (e.g. the newest day most of the estate has reached) needs Ravi's view | Ravi |
+| ~~3~~ | ~~Quick refresh and `ChargeCategory`~~ — **closed, `5f178dd`** (§3a). `bd2e809d`/`616dc9b8` still need a quick refresh on live to pick it up | Admin password for those two |
+| ~~4~~ | ~~Window anchoring~~ — **closed, `180e3d2`** (§3a) | — |
+| 4a | **Run the PostgreSQL suite on `180e3d2`** (only the offline suite ran) | Nothing |
+| 4b | **Archive write timed out** after the live quick refresh (`archive` in `/api/warehouse` ingest state). Find which statement and why (`PG_STATEMENT_TIMEOUT=180s` on live) | Nothing |
+| 4c | **Who downgraded Scale to F1?** Check the activity log again (it was empty at 00:40 and 14:00 IST); if it is governance, it may repeat nightly | Ravi, if it recurs |
 | 5 | **Environment filter for real:** resolve `env` at ingest (in `staging`, where rows are already touched once). The `stash@{0}` design rebuilt >24 min and was cancelled; `CLOUDLENS_ENV_ROLLUP` exists but alters `costs_rollup` in place | Ravi, if the filter is wanted |
 | 6 | Charge type / pricing on Tags (add to the per-resource summary grain — a large rebuild) | Only if people need it |
 | 7 | v3 `aac1314` push | v3 workstream / Ravi |
@@ -233,7 +261,8 @@ New on 1 October:
 - **Reading `warm_compare` right after the DB was started** — Resources looked +15.6s
   (45.7s); it was cold buffers. Re-measured standalone: 17.8–18.3s SQL, 30.5s warm pass.
 - **Comparing a filtered and unfiltered total and expecting filtered ≤ unfiltered** — the
-  windows can differ (anchoring, §6 item 4). Compare per-row money for the same window.
+  windows can differ (anchoring is spend-weighted per scope since `180e3d2`). Compare
+  per-row money for the same window.
 - **Comparing Uptime/Tags rows by their `v` arrays** — `v` indexes the response's own value
   pool (`tag_values` / `values`), which shrinks with the answer. Resolve to strings first.
 - **Applying charge/pricing filters to Tags** — detail table, >110s locally (§4).
@@ -244,6 +273,16 @@ New on 1 October:
 - **Firing browser actions in parallel** (sign-out + navigate + click + snapshot) — the
   snapshot lands mid-navigation and invents a redirect. That is how §6 item 1 got opened.
   Run browser steps one after another.
+
+New on 1–2 October evening:
+
+- **Starting a live refresh late in the evening.** A quick refresh rebuilds all 12 derived
+  tables on live (~2h). Governance stops the DB around 00:15 IST; start before ~21:30.
+- **Polling `/api/warehouse` in one long browser `evaluate`** — the MCP call times out;
+  poll `pg_stat_activity` read-only instead.
+- **`pytest -p no:cacheprovider`** — `conftest.py` needs `config.cache`; INTERNALERROR.
+- **No venv in the repo** — `package.ps1` takes `-Python`; omit it (defaults to `python`)
+  or pass the venv in §1.
 
 ---
 
@@ -273,8 +312,9 @@ New on 1 October:
 ## 9. First moves in the new chat
 
 1. `git status` (clean, or only `tools/bench-tabs-latest.json`) and `git log --oneline -6`
-   — top should be this handover, then `f673e0a`, `0989c4f`, `c69fd56`, `919be08`, `61fb0e6`.
+   — top should be this handover update, then `180e3d2`, `5f178dd`, `59e1e20`, `332c9e1`,
+   `226acb9`. Check Scale is still B2 and Running (§3a outage).
    `git rev-list --count backup/cloud-lens-v2/main..main` shows what is unpushed.
 2. If touching live: start the database if stopped (§1); confirm the firewall IP.
-3. Ask Ravi which item from §6 to take; item 1 is closed (not a bug), item 2 is next.
+3. Ask Ravi which item from §6 to take; items 1, 3, 4 are closed; 2, 4a, 4b are open.
 4. Before believing any number, read §7.
