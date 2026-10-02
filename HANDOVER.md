@@ -1,4 +1,4 @@
-# CloudLens — handover, 1 October 2026 (16:00 IST), updated 2 October 15:00 IST
+# CloudLens — handover, 1 October 2026 (16:00 IST), updated 2 October 18:55 IST
 
 **Release approved, 2 Oct 18:17 IST:** Ravi approved committing these browser/archive
 changes, deploying **Scale only**, taking a new whole-estate archive today (not
@@ -10,6 +10,46 @@ Scale is Running, B2, Always On. Existing Windows SSO signs Ravi in as an app ad
 no local/live password was used. Predeployment `GET /api/archive` reports storage
 **403/unreachable** for `stf2e87216abb1b0fa9f64/cloudlens`; production publication
 may be blocked even after successful extraction. Final release results follow here.
+
+**Release outcome, 2 Oct 18:55 IST (supersedes historical local/uncommitted notes below):**
+
+- All task changes committed as **`bc3de92ae93a0bbfcecd2600baf29ad0467e25f9`**.
+  Source-only ZIP deployed to **`cloudlens-web-scale` / `CloudLens-Scale` only**.
+  Deployment **`1078f187-76af-4e1e-a6b8-66c03d42c68e`** is active, status **4**;
+  Azure reports `RuntimeSuccessful`, one successful instance, zero failed.
+  Site started **12:55:16 UTC / 18:25:16 IST**. Live reports asset SHA-256 matches
+  the committed source (`995a216d8c65df81d563278f42d15bb4e2d1ed52c1c3cc1f49870746c35bb14e`);
+  the unused renderer is absent. `/healthz` and `/readyz` remain **200**, including
+  after the archive attempt. B2 / Always On unchanged.
+- Authenticated as Ravi through existing Windows SSO after the deploy invalidated
+  the in-memory app session; `/api/auth/me` confirmed `admin: true`. No password,
+  local credentials, direct warehouse construction or ad-hoc server execution.
+- Authorized **one** new whole-estate `POST /api/archive?metric=FocusCost` at
+  **12:56:24.064 UTC / 18:26:24 IST**. No refresh/rebuild and no reconstruction
+  of 1 Oct. Read-only live count: **16,928,527 rows**, 1.333s.
+- **Complete archive performance/publication is NOT proved.** The synchronous API
+  hit App Service **504 GatewayTimeout after 240.077s** (13:00:24.123 UTC).
+  The request's named cursor continued fetching 50,000-row batches afterward,
+  proving the gateway timeout did not stop extraction. It was still active at
+  **13:19:15.830 UTC**, transaction age **1371.490s**; it was gone by
+  **13:24:58.707 UTC**. No archive cursor remains. This brackets the end of the
+  observed database work, not successful extraction or upload: the lost response
+  provides **no completed row count, compressed bytes or completion timing**.
+- Independent pre/post `GET /api/archive` returns **storage 403/unreachable**.
+  Read-only ARM inspection confirms account `stf2e87216abb1b0fa9f64` has
+  **`publicNetworkAccess=Disabled`, no private endpoint connections**; Scale has
+  **no VNet integration**. Thus the configured blob endpoint is not reachable
+  from this deployment. The returned empty file list is an error result, not
+  evidence that the container contains no blobs. No successful new blob verified.
+- **Remaining blocker:** approve/restore a reachable storage network path, then
+  provide an archive execution/status path that survives the 240s front-end
+  request limit (for example a durable job with polling), before claiming an
+  end-to-end production measurement. Networking, roles, app settings and data
+  were not changed to work around this. No duplicate archive request was sent.
+- This outcome is committed as a documentation-only follow-up; push target remains
+  the approved private `backup` remote, **`main:cloud-lens-v2/main`**. The deployed
+  application remains `bc3de92`; this follow-up does not require redeployment.
+  Release artifacts and read-only probe scripts are in this session's `files/`.
 
 **Update, 2 Oct 15:00 IST — read §3a first.** Since this file was written: quick refresh
 fills cost type (`5f178dd`), report windows anchor on the spend-weighted edge (`180e3d2`),
@@ -24,7 +64,7 @@ paging surveys; they are not repeated here. `HANDOVER-2026-09-28.md` is older st
 **Start here:** §0 (rules), §4 (decisions Ravi has already made — do not reopen them),
 §6 (what is left). §9 is the literal first moves.
 
-**State (2 Oct 15:00 IST):** nothing in flight. No server, test run, deploy or build is
+**Historical state (2 Oct 15:00 IST; superseded by release outcome above):** nothing in flight. No server, test run, deploy or build is
 running. `main` is pushed up to `180e3d2`; this handover update is the only commit on top.
 Scale runs `180e3d2` (deployed 1 Oct 21:31 IST) plus `CLOUDLENS_FX_ROLLUP=true`. Every item on the 30 Sep pending list is
 either done, decided against by Ravi, or listed in §6.
@@ -218,7 +258,8 @@ cost type on live; Ravi's sign-in cannot refresh them (local `admin` can, with t
 | **Window end day = spend-weighted majority** (not subscription majority, not "every sub") | 1 Oct | `180e3d2` |
 | **Quick refresh: fetch `ChargeType`**, not a filter-bar note | 1 Oct | `5f178dd` |
 | **Restore Scale to B2** after the F1 downgrade | 2 Oct | Done 14:00 IST |
-| **Retarget both legacy focus browser suites to Cost data; remove the dead renderer** | 2 Oct | Implemented locally; uncommitted, no deployment |
+| **Retarget both legacy focus browser suites to Cost data; remove the dead renderer** | 2 Oct | `bc3de92`, deployed to Scale |
+| **Commit, deploy Scale, measure today's archive and push backup branch** | 2 Oct 18:17 IST | Release deployed; production measurement blocked by storage network and synchronous API gateway limit (see release outcome) |
 
 ---
 
@@ -250,11 +291,11 @@ cost type on live; Ravi's sign-in cannot refresh them (local `admin` can, with t
 | # | Item | Waits on |
 |---|---|---|
 | ~~1~~ | ~~Login page for the demo account~~ — **closed 1 Oct 16:40 IST, not a bug.** Live `/login` returns 200 and renders our page; App Service auth is off; nothing in `app/` or `web/login.html` redirects to Microsoft on its own; sign-out clears the session (`/api/auth/me` → `authenticated: false`); "Sign in with a local account" reveals the form in one click. The "bounce" was the 1 Oct chat firing sign-out, navigate, click and snapshot in parallel — the snapshot caught the old dashboard mid-navigation. The demo account's real failure was the INR timeout, fixed by `CLOUDLENS_FX_ROLLUP` (§5) | — |
-| ~~2~~ | ~~Browser suites~~ — **closed locally: 31/31 pass through the standard runner**, 2 Oct. Fixtures updated, focus suites retargeted and unused renderer removed. Cold Executive still has its existing 30s application limit; harness now surfaces startup errors promptly instead of masking them. No commit/push/deploy | — |
+| ~~2~~ | ~~Browser suites~~ — **closed: 31/31 pass through the standard runner**, 2 Oct. Fixtures updated, focus suites retargeted and unused renderer removed; committed/deployed as `bc3de92`. Cold Executive still has its existing 30s application limit; harness now surfaces startup errors promptly instead of masking them | — |
 | ~~3~~ | ~~Quick refresh and `ChargeCategory`~~ — **closed, `5f178dd`** (§3a). `bd2e809d`/`616dc9b8` still need a quick refresh on live to pick it up | Admin password for those two |
 | ~~4~~ | ~~Window anchoring~~ — **closed, `180e3d2`** (§3a) | — |
 | ~~4a~~ | ~~Run the PostgreSQL suite on `180e3d2`~~ — **closed 2 Oct: 447 passed, 1 skipped, 0 failed** in 598.63s. `pytest -q -n 4 -m "postgres and not azure"` against isolated schemas in local `postgres` (PostgreSQL 18.6); app/tests on HEAD match `180e3d2`. The retention skip requires the parent's explicitly isolated `cloudlens_envfx_test_6282cfcc` database. No live changes | — |
-| ~~4b~~ | ~~Archive timeout~~ — **remediation implemented locally, 2 Oct**: named server cursor, no whole-estate sort/count, finite bulk limits, worker extraction and atomic block upload. Local regressions pass; **not deployed or production-scale measured**, no missed snapshot replay (details below) | Deployment requires Ravi's approval |
+| 4b | **Archive timeout remediation deployed, `bc3de92`**: named server cursor, no whole-estate sort/count, finite bulk limits, worker extraction and atomic block upload. Local regressions pass. Today's production attempt hit the 240s gateway limit; extraction continued, but storage is 403/unreachable. **Successful complete production archive still unverified**; no missed snapshot replay | Approval for storage connectivity and a long-running archive execution/status path |
 
 **Dashboard browser suite (2 Oct, local changes only):**
 
@@ -567,12 +608,14 @@ New on 1–2 October evening:
 
 ## 9. First moves in the new chat
 
-1. `git status` (clean, or only `tools/bench-tabs-latest.json`) and `git log --oneline -6`
-   — top should be this handover update, then `180e3d2`, `5f178dd`, `59e1e20`, `332c9e1`,
-   `226acb9`. Check Scale is still B2 and Running (§3a outage).
+1. `git status` (clean) and `git log --oneline -6`
+   — top should be the release-outcome handover, then `bc3de92`, `50c9442`,
+   `180e3d2`, `5f178dd`. Scale application runs `bc3de92`; the top commit only
+   documents the release. Check Scale is still B2 and Running (§3a outage).
    `git rev-list --count backup/cloud-lens-v2/main..main` shows what is unpushed.
 2. If touching live: start the database if stopped (§1); confirm the firewall IP.
-3. Items 1, 2, 3, 4, 4a, 4b are closed locally. Browser/renderer/archive/handover
-   edits are uncommitted and not deployed. Archive still needs a controlled
-   production-scale run after approved deployment; ask Ravi before any push.
+3. Items 1, 2, 3, 4, 4a are closed. Browser/renderer/archive changes are committed
+   and deployed. Item 4b needs reachable blob storage and an execution/status path
+   beyond the front-end's 240s limit; read the actual production attempt above.
+   Ask Ravi before infrastructure changes or any additional push.
 4. Before believing any number, read §7.
