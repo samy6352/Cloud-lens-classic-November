@@ -598,9 +598,14 @@ async def _archive_after_ingest(metric: str, source: str | None = None) -> None:
         return
 
     try:
-        written = await archive.archive_current(metric, source=source)
-        warehouse.state = {**warehouse.state, "archive": written}
-        log.info("archive written: %s (%s bytes)", written["name"], written["bytes"])
+        from . import archive_jobs
+        record = await offload(archive_jobs.create, metric, source=source or "after ingest",
+                               identity="workload")
+        archive_jobs.launch(record)
+        warehouse.state = {**warehouse.state, "archive": {
+            "job_id": record["job_id"], "status": record["status"],
+            "name": record["payload"]["name"]}}
+        log.info("archive queued: %s", record["job_id"])
     except Exception as exc:  # noqa: BLE001 - a refresh that worked must not report failure
         log.warning("archive failed: %s", str(exc)[:300])
         warehouse.state = {**warehouse.state,
@@ -2687,7 +2692,7 @@ async def onboarding_dismiss(request: Request) -> JSONResponse:
 
 
 @app.get("/api/archive")
-async def archive_status(request: Request, limit: int = 20) -> JSONResponse:
+async def archive_status(request: Request, limit: int = 20, jobs_only: bool = False) -> JSONResponse:
     """What the daily archive holds, and whether it can be reached.
 
     Not admin-only: knowing whether a copy of today's numbers exists is part of trusting the
@@ -2695,25 +2700,55 @@ async def archive_status(request: Request, limit: int = 20) -> JSONResponse:
     """
     from . import archive
 
-    current_user(request)
-    return JSONResponse(await archive.status(limit=max(1, min(limit, 200))))
+    user = current_user(request)
+    from . import archive_jobs, jobs
+    records = await offload(jobs.listing, limit=200, kind="archive")
+    visible = []
+    for record in records:
+        if record["kind"] != "archive":
+            continue
+        if record["payload"].get("requested_by") == archive_jobs.owner(user) or (
+                record["identity"] == "workload" and user.admin):
+            try:
+                visible.append(await _authorized_job(record["job_id"], user))
+            except HTTPException as exc:
+                if exc.status_code != 404:
+                    raise
+        if len(visible) >= 10:
+            break
+    result = ({"enabled": archive.enabled(), "account": archive.ACCOUNT,
+               "container": archive.CONTAINER} if jobs_only else
+              await archive.status(limit=max(1, min(limit, 200))))
+    return JSONResponse({**result, "jobs": visible, "read_only": read_only_mode()})
 
 
 @app.post("/api/archive")
-async def archive_now(request: Request, metric: str = "FocusCost") -> JSONResponse:
+async def archive_now(request: Request, metric: str = "FocusCost", scope: str = "",
+                      idempotency_key: str = "") -> JSONResponse:
     """Write today's archive from whatever the warehouse currently holds.
 
     A refresh archives on its own, so this exists for the case where the refresh succeeded but
     the archive did not — a storage outage, a role granted five minutes too late — and someone
     wants today's copy without reloading gigabytes of cost data to get it.
     """
-    from . import archive
+    from . import archive, archive_jobs
 
-    require_admin(request)
+    user = require_admin(request)
+    if read_only_mode():
+        raise HTTPException(403, "This deployment is read-only; archive workers are disabled.")
+    picked = selected_scope(scope.split(","), await permitted(user)) if scope else None
     try:
-        return JSONResponse(await archive.archive_current(metric, source="manual"))
+        async with as_user(user):
+            record = await offload(archive_jobs.create, metric, scope=picked,
+                                   requested_by=archive_jobs.owner(user),
+                                   idempotency_key=idempotency_key or None)
+            archive_jobs.launch(record)
+        return JSONResponse(record, status_code=202,
+                            headers={"Location": f"/api/jobs/{record['job_id']}"})
     except archive.ArchiveError as exc:
         raise HTTPException(400, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         log.warning("manual archive failed: %s", str(exc)[:300])
         raise HTTPException(502, f"Could not write the archive: {str(exc)[:300]}") from exc
@@ -3189,11 +3224,20 @@ async def start_focus_job(body: FocusJobRequest, request: Request) -> JSONRespon
 
 async def _authorized_job(job_id: str, user: User) -> dict:
     from . import jobs
-    allowed = await permitted(user)
     record = await offload(jobs.get, job_id)
+    if record and record["kind"] == "archive":
+        from . import archive_jobs
+        if not user.admin or (record["identity"] != "workload"
+                and record["payload"].get("requested_by") != archive_jobs.owner(user)):
+            raise HTTPException(404, "Job not found in your scope.")
+        if not record["scope"]:
+            return await offload(archive_jobs.describe, record)
+    allowed = await permitted(user)
     if not record or (allowed is not None and (not record["scope"] or
             not set(record["scope"]).issubset({s.lower() for s in allowed}))):
         raise HTTPException(404, "Job not found in your scope.")
+    if record["kind"] == "archive":
+        return await offload(archive_jobs.describe, record)
     return record
 
 
@@ -3216,7 +3260,17 @@ async def focus_job_status(job_id: str, request: Request) -> JSONResponse:
 async def resume_ingest_job(job_id: str, request: Request) -> JSONResponse:
     from . import ingest_jobs, jobs
     user = require_admin(request)
+    if read_only_mode():
+        raise HTTPException(403, "This deployment is read-only.")
     record = await _authorized_job(job_id, user)
+    if record["kind"] == "archive":
+        from . import archive_jobs
+        try:
+            async with as_user(user):
+                record = await archive_jobs.resume(record)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return JSONResponse(record, status_code=202)
     if record["kind"].startswith("focus-"):
         return await resume_focus_job(job_id, request)
     if not record["tasks"] and ingest_jobs.resumable_request(record):
@@ -3239,6 +3293,21 @@ async def resume_ingest_job(job_id: str, request: Request) -> JSONResponse:
         jobs.spawn(record, lambda: ingest_jobs.ingest(
             subs, 1, first["metric"], quick=first["kind"] == "quick"))
     return JSONResponse(record, status_code=202)
+
+
+@app.post("/api/archive/jobs/{job_id}/cancel")
+async def cancel_archive_job(job_id: str, request: Request) -> JSONResponse:
+    from . import archive_jobs
+    user = require_admin(request)
+    if read_only_mode():
+        raise HTTPException(403, "This deployment is read-only.")
+    record = await _authorized_job(job_id, user)
+    if record["kind"] != "archive":
+        raise HTTPException(404, "Archive job not found.")
+    try:
+        return JSONResponse(await archive_jobs.cancel(record), status_code=202)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.post("/api/focus/jobs/{job_id}/resume")

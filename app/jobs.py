@@ -17,6 +17,7 @@ TERMINAL = frozenset({"ready", "partial", "failed", "cancelled"})
 ACTIVE = frozenset({"queued", "waiting-for-Azure", "downloading", "validating",
                     "committing", "warming-cache", "running"})
 LEASE_SECONDS = 300
+HEARTBEAT_SECONDS = 30
 GENERATION_KEY = "data_generation"
 ROLLUP_GENERATION_KEY = "data_rollup_generation"
 ROLLUP_TABLES_KEY = "data_rollup_tables"
@@ -435,7 +436,7 @@ def find_request(kind: str, scope: list[str], idempotency_key: str) -> dict | No
 
 
 def listing(scope: list[str] | None = None, *, active_only: bool = False,
-            limit: int = 50) -> list[dict]:
+            limit: int = 50, kind: str | None = None) -> list[dict]:
     from .warehouse import warehouse
 
     # Filter before limiting: unrelated tenants' jobs must not crowd out this scope.
@@ -447,6 +448,8 @@ def listing(scope: list[str] | None = None, *, active_only: bool = False,
         while batch := cursor.fetchmany(100):
             for row in batch:
                 record = json.loads(row[0])
+                if kind is not None and record["kind"] != kind:
+                    continue
                 if allowed is not None and (not record["scope"] or
                                              not set(record["scope"]).issubset(allowed)):
                     continue
@@ -469,6 +472,10 @@ def update(job_id: str, *, task_id: str | None = None, **values: Any) -> dict:
         # Job identity and original request never change during a retry.
         for name in ("job_id", "started", "scope", "created_at", "task_id", "identity", "kind", "payload"):
             values.pop(name, None)
+        if (record["kind"] == "archive" and "progress" in values
+                and record.get("progress", {}).get("phase") == "publishing"
+                and values["progress"].get("phase") in {"extracting", "uploading"}):
+            values["progress"] = {**values["progress"], "phase": "publishing"}
         target.update(values)
         record["updated_at"] = now()
         _put(con, "job:" + job_id, record)
@@ -512,14 +519,22 @@ async def run(job_id: str, factory: Any) -> Any:
     from .job_policy import require_writable
     require_writable()
     owner = str(uuid4())
-    while not await asyncio.to_thread(claim, job_id, owner):
-        await asyncio.sleep(2)
     try:
+        while True:
+            claiming = asyncio.create_task(asyncio.to_thread(claim, job_id, owner))
+            try:
+                claimed = await asyncio.shield(claiming)
+            except asyncio.CancelledError:
+                await _settle(claiming)
+                raise
+            if claimed:
+                break
+            await asyncio.sleep(2)
         record = await asyncio.to_thread(get, job_id)
         if record is None:
             raise ValueError("Job not found.")
     except BaseException:
-        await asyncio.shield(asyncio.to_thread(release, owner))
+        await _settle(asyncio.create_task(asyncio.to_thread(release, owner)))
         raise
     if record["status"] in TERMINAL:
         await asyncio.to_thread(release, owner)
@@ -531,17 +546,27 @@ async def run(job_id: str, factory: Any) -> Any:
     if record.get("identity") == "workload":
         from . import cost
         identity_tokens = (cost._caller.set(None), cost._caller_id.set("server"))
+    worker = asyncio.current_task()
 
     async def heartbeat():
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(HEARTBEAT_SECONDS)
             if not await asyncio.to_thread(claim, job_id, owner):
                 raise RuntimeError("Lost job lease.")
-            await asyncio.to_thread(update, job_id, progress=dict(progress))
+            saved = await asyncio.to_thread(update, job_id, progress=dict(progress))
+            if record.get("kind") == "archive" and saved.get("cancel_requested"):
+                worker.cancel()
+                return
 
     beat = asyncio.create_task(heartbeat())
+    def heartbeat_finished(done):
+        if record.get("kind") == "archive" and not done.cancelled() and done.exception():
+            worker.cancel()
+    beat.add_done_callback(heartbeat_finished)
     try:
         await asyncio.to_thread(update, job_id, status="running")
+        if record.get("kind") == "archive" and record.get("cancel_requested"):
+            raise asyncio.CancelledError
         result = await factory()
         state = result if isinstance(result, dict) and result.get("status") else progress
         status = state.get("status", "ready")
@@ -552,24 +577,48 @@ async def run(job_id: str, factory: Any) -> Any:
                                 finished=now() if status in TERMINAL else None)
         return result
     except asyncio.CancelledError:
-        await asyncio.shield(asyncio.to_thread(
-            update, job_id, status="queued", detail="Interrupted; awaiting authorized resumption.",
-            progress=dict(progress)))
+        async def interrupted():
+            saved = await asyncio.to_thread(get, job_id)
+            cancelled = record.get("kind") == "archive" and saved.get("cancel_requested")
+            try:
+                await asyncio.to_thread(
+                    update, job_id, status="cancelled" if cancelled else "queued",
+                    detail="Cancelled by requester." if cancelled else "Interrupted; awaiting authorized resumption.",
+                    finished=now() if cancelled else None, progress=dict(progress))
+            except RuntimeError:
+                # A replacement owner must never have its ledger overwritten.
+                if record.get("kind") != "archive":
+                    raise
+        await _settle(asyncio.create_task(interrupted()))
         raise
     except Exception as exc:
-        await asyncio.to_thread(update, job_id, status="failed", detail=str(exc)[:500],
+        saved = await asyncio.to_thread(get, job_id) if record.get("kind") == "archive" else {}
+        cancelled = saved.get("cancel_requested", False)
+        await asyncio.to_thread(update, job_id, status="cancelled" if cancelled else "failed", detail=str(exc)[:500],
                                 finished=now(), progress=dict(progress))
         raise
     finally:
-        beat.cancel()
-        await asyncio.gather(beat, return_exceptions=True)
-        await asyncio.shield(asyncio.to_thread(release, owner))
+        async def cleanup():
+            beat.cancel()
+            await asyncio.gather(beat, return_exceptions=True)
+            await asyncio.to_thread(release, owner)
+        await _settle(asyncio.create_task(cleanup()))
         current_progress.reset(tokens[2])
         current_lease.reset(tokens[1])
         current_job.reset(tokens[0])
         if identity_tokens:
             cost._caller_id.reset(identity_tokens[1])
             cost._caller.reset(identity_tokens[0])
+
+
+async def _settle(task: asyncio.Task) -> Any:
+    """Finish lease/ledger cleanup even if shutdown cancels the worker repeatedly."""
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                return task.result()
 
 
 def spawn(record: dict, factory: Any) -> asyncio.Task:

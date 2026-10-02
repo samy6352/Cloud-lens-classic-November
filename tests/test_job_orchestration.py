@@ -447,10 +447,12 @@ def test_reports_workflow_offers_preview_and_keeps_populated_view():
     from pathlib import Path
     source = (Path(__file__).resolve().parents[1] / "web" / "assets" / "dashboard-reports.js").read_text(
         encoding="utf-8")
-    assert "Initial FOCUS load (last 90 days)" in source
+    assert "Choose how much history to import" in source
+    assert '["90","90 days — recommended"]' in source
     assert "crypto.randomUUID()" in source
-    assert "Resume failed or pending chunks" in source
-    assert 'notice.textContent = `Job ${job.job_id} accepted.' in source
+    assert "Retry missing work" in source
+    assert "Setup queued. You can close this browser" in source
+    assert 'preview_token: plan.preview_token' in source
     assert "Newly covered days are separate from restatements" in source
 
 

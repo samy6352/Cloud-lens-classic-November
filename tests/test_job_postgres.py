@@ -12,6 +12,29 @@ import pytest
 pytestmark = pytest.mark.postgres
 
 
+def test_archive_deduplication_and_terminal_outcome_persist_in_postgres(postgres_warehouse, monkeypatch):
+    from app import archive, archive_jobs, jobs
+
+    monkeypatch.setattr(archive, "ACCOUNT", "offline")
+    monkeypatch.setattr(archive, "CONTAINER", "archive")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        records = list(executor.map(lambda _: archive_jobs.create(
+            "ActualCost", requested_by="file:admin", idempotency_key="same-approval"), range(2)))
+    assert records[0]["job_id"] == records[1]["job_id"]
+    record = records[0]
+    monkeypatch.setattr(archive, "archive_current", AsyncMock(return_value={
+        "name": record["payload"]["name"], "rows": 50000, "bytes": 12345}))
+    asyncio.run(jobs.run(record["job_id"], lambda: archive_jobs.run(record)))
+    stored = jobs.get(record["job_id"])
+    assert stored["status"] == "ready" and stored["finished"]
+    assert stored["result"]["rows"] == 50000 and stored["progress"]["uploaded_bytes"] == 12345
+    assert archive_jobs.create("ActualCost", requested_by="file:admin",
+                               idempotency_key="same-approval")["job_id"] == record["job_id"]
+    assert archive_jobs.launch(stored) is None
+    with postgres_warehouse.connect(read_only=True) as con:
+        assert con.execute("SELECT count(*) FROM meta WHERE key='jobs:lease'").fetchone()[0] == 0
+
+
 def test_cross_worker_lease_and_persisted_identity(postgres_warehouse):
     from app import jobs
     record = jobs.create("refresh", ["sub-a"], idempotency_key="same-request")

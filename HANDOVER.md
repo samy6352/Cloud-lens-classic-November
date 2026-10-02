@@ -1,4 +1,41 @@
-# CloudLens — handover, 1 October 2026 (16:00 IST), updated 2 October 18:55 IST
+# CloudLens — handover, updated 3 October 2026
+
+**Current local work, 3 Oct (not committed/deployed): durable archive jobs completed
+and locally validated.** The released app is still `bc3de92`; remote/source HEAD is
+`70b6365`. New work covers HTTP 202 queueing, scoped ownership, persisted progress,
+failure/cancellation, same-day recovery and atomic-publication fencing using the
+existing job ledger and writer lease. Post-ingest archives now queue instead of
+holding the ingest request open. Workload jobs recover automatically; interactive
+jobs require an authorized resume. Old UTC-day requests cannot recreate old snapshots.
+
+- Archive controls are a lazy `dashboard-archive.js` leaf, not extra shell weight.
+  Job-only polling is independent of blocked Blob Storage. Explicit approvals carry
+  an idempotency key, retry it unchanged, and show queueing rather than completion.
+  Read-only/non-admin controls are hidden; repaint generations prevent stale polls
+  from overwriting new controls. Cleanup survives repeated cancellation before lease
+  release or file cleanup.
+- Final targeted local run: **143 passed**, covering real-browser archive controls,
+  isolated PostgreSQL durable deduplication/results, streaming, lease/orchestration,
+  cancellation/recovery and existing shell/Cost data behavior. Ruff clean. This is
+  not a new full 31-suite run or a production archive proof.
+- Read-only ARM checks: app Running; storage Succeeded with public access Disabled,
+  no private endpoints; app no VNet integration; no Scale VNet/private DNS zone.
+  **PostgreSQL is now Stopped** (overnight). No restart or live change was made.
+- Proposed narrow remediation: one new VNet with a delegated App Service subnet
+  and separate private-endpoint subnet, one Blob private endpoint, private Blob DNS
+  zone/link, and Scale outbound VNet integration. Preserve PostgreSQL's existing
+  public topology and storage public-access Disabled. Do not switch the whole-stack
+  `networkIsolation` flag on existing Scale: it also changes PostgreSQL topology.
+- Indicative additional network list-price baseline: **USD 7.80/month** at 730h:
+  standard Private Endpoint USD 0.01/hour plus Private DNS zone USD 0.50.
+  Add Private Link processing (first tier USD 0.01/GB), DNS queries
+  (USD 0.40/million), storage transactions/capacity and tax. Existing compute/database
+  costs are separate; restarting PostgreSQL resumes its compute billing. Prices
+  checked through `https://prices.azure.com/api/retail/prices`; agreement rates may differ.
+- **Waiting for approval:** storage-only live network change, PostgreSQL restart,
+  durable-job release and one current-day whole-estate archive/read-back measurement.
+  A fresh billable customer validation deployment needs its own scoped estimate/approval.
+  No new commit, push, deployment or live data/settings changes in this local phase.
 
 **Release approved, 2 Oct 18:17 IST:** Ravi approved committing these browser/archive
 changes, deploying **Scale only**, taking a new whole-estate archive today (not

@@ -85,6 +85,35 @@ def test_archive_stream_respects_scoped_view(postgres_warehouse, tmp_path, monke
     assert rows == 2 and {row["SubAccountId"] for row in records} == {"b"}
 
 
+def test_durable_archive_job_completes_with_parquet_readback(postgres_warehouse, tmp_path, monkeypatch):
+    from app import archive_jobs, jobs
+    _seed(postgres_warehouse)
+    monkeypatch.setattr(archive, "ACCOUNT", "offline")
+    monkeypatch.setattr(archive, "CONTAINER", "cloudlens")
+    monkeypatch.setattr(archive, "_ROW_BATCH", 2)
+    result_path = tmp_path / "readback.parquet"
+    class Writer:
+        async def put_file(self, name, path, content_type):
+            import shutil
+            shutil.copyfile(path, result_path)
+            return {"name": name, "bytes": path.stat().st_size, "etag": "verified"}
+        async def close(self):
+            pass
+    monkeypatch.setattr(archive, "BlobWriter", Writer)
+    record = archive_jobs.create("FocusCost", requested_by="file:admin")
+    async def scenario():
+        task = archive_jobs.launch(record)
+        await task
+    asyncio.run(scenario())
+    saved = jobs.get(record["job_id"])
+    table = pq.read_table(result_path)
+    assert saved["status"] == "ready" and saved["result"]["rows"] == table.num_rows == 5
+    assert saved["result"]["bytes"] == result_path.stat().st_size
+    assert saved["result"]["etag"] == "verified"
+    assert set(table["SubAccountId"].to_pylist()) == {"a", "b"}
+    assert saved["result"]["scope"] is None and "-selected-" not in saved["result"]["name"]
+
+
 def test_archive_timeout_rolls_back_and_returns_connection(postgres_warehouse, tmp_path, monkeypatch):
     wh = postgres_warehouse
     _seed(wh)

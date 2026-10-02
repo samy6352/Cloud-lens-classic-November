@@ -252,6 +252,24 @@ all blocks succeed; empty exports and failed staging never overwrite a good arch
 Cancelled work joins its file-owning threads before temporary-file cleanup. This bounds
 memory, not local disk: enough temporary space for the compressed archive is still required.
 
+Archive requests are durable background jobs, not long-running HTTP uploads.
+`POST /api/archive` returns HTTP 202, a `job_id` and a `Location` pointing to
+`GET /api/jobs/{job_id}`. An application administrator may request the whole estate
+(default) or an explicitly authorized `scope`; scoped copies have separate names and do
+not overwrite the daily estate snapshot. Supply `idempotency_key` to retry an approval
+without queueing another job. Progress records extraction rows, upload bytes and publication;
+only a completed block-list commit produces a ready result.
+
+`GET /api/archive?jobs_only=true` polls authorized job status without contacting Blob
+Storage. The dashboard provides queue, resume and cancel controls independently of storage
+reachability. `POST /api/jobs/{job_id}/resume` resumes authorized interrupted work;
+`POST /api/archive/jobs/{job_id}/cancel` requests cancellation before atomic publication.
+Archives share the existing durable job ledger and deployment writer lease with ingest.
+Automatic post-ingest archives recover under the workload identity; interactive archives
+require an authorized resume after interruption. A request from an earlier UTC day is
+refused rather than falsely reconstructing that historical snapshot from today's data.
+Read-only deployments cannot create, resume or cancel archive work.
+
 API: `GET /api/cost-data` returns scoped saved state and coverage;
 `POST /api/cost-data/preview` reviews `scope`, `action` (setup/schedule/frequency/refresh/reconcile),
 `cadence`, `start` and `end`; `POST /api/cost-data/setup` requires that stable preview token

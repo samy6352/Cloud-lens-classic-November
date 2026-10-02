@@ -151,6 +151,8 @@ async def recover() -> None:
     """Resume only explicitly workload-owned tasks; interactive jobs require a fresh caller."""
     if read_only_mode():
         return
+    from . import archive_jobs
+    await archive_jobs.recover()
     records = await asyncio.to_thread(jobs.listing, active_only=True, limit=500)
     running = {getattr(task, "job_id", None) for task in jobs._workers}
     for record in records:

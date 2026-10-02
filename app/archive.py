@@ -220,12 +220,34 @@ class BlobWriter:
                     ElementTree.SubElement(blocks, "Latest").text = block
                     uploaded += len(chunk)
                     index += 1
+                    _job_progress(phase="uploading", uploaded_bytes=uploaded, total_bytes=size)
             if uploaded != size:
                 raise ArchiveError("Archive file changed during upload; the previous blob was not replaced.")
-            r = await client.put(self._url(name, "comp=blocklist"),
-                                 headers={**headers, "Content-Type": "application/xml",
-                                          "x-ms-blob-content-type": content_type},
-                                 content=ElementTree.tostring(blocks, encoding="utf-8"))
+            from . import jobs
+            if jobs.current_job.get():
+                _job_progress(phase="publishing")
+                def fence():
+                    with jobs.transaction() as con:
+                        jobs.assert_lease(con)
+                        record = jobs._read(con, "job:" + jobs.current_job.get())
+                        if record.get("cancel_requested"):
+                            raise ArchiveError("Archive cancelled before publication.")
+                        record["progress"] = {**record.get("progress", {}), "phase": "publishing"}
+                        jobs._put(con, "job:" + record["job_id"], record)
+                        lease = jobs._read(con, "jobs:lease")
+                        clock = float(con.execute("SELECT extract(epoch FROM clock_timestamp())").fetchone()[0])
+                        lease["expires"] = clock + jobs.LEASE_SECONDS
+                        jobs._put(con, "jobs:lease", lease)
+                await asyncio.to_thread(fence)
+            async def publish():
+                # Shorter than the refreshed writer lease; shutdown must observe the outcome.
+                async with asyncio.timeout(60):
+                    return await client.put(self._url(name, "comp=blocklist"),
+                                            headers={**headers, "Content-Type": "application/xml",
+                                                     "x-ms-blob-content-type": content_type},
+                                            content=ElementTree.tostring(blocks, encoding="utf-8"))
+            publication = asyncio.create_task(publish())
+            r = await jobs._settle(publication)
             if r.status_code != 201:
                 raise ArchiveError(_explain(r.status_code, r.text, self.account))
             return {"name": name, "bytes": uploaded, "url": self._url(name),
@@ -387,6 +409,13 @@ def _archive_limits() -> tuple[int, int]:
     return values[0], values[1]
 
 
+def _job_progress(**values: Any) -> None:
+    from . import jobs
+    progress = jobs.current_progress.get()
+    if progress is not None:
+        progress.update(values)
+
+
 def _write_archive(destination: Path, fmt: str, con: Any,
                    cancel: threading.Event | None = None) -> tuple[int, int]:
     """One cursor snapshot, counted while writing, without a whole-estate sort."""
@@ -420,6 +449,7 @@ def _write_archive(destination: Path, fmt: str, con: Any,
                     break
                 rows += len(batch)
                 yield batch
+                _job_progress(phase="extracting", rows=rows)
             if time.monotonic() > deadline:
                 raise ArchiveError("Archive extraction exceeded its total time limit.")
 
@@ -650,6 +680,7 @@ async def archive_current(metric: str, *, when: date | None = None,
                 "The warehouse is empty, so there is nothing to archive. The refresh that "
                 "triggered this loaded no rows."
             )
+        _job_progress(phase="uploading", rows=rows, total_bytes=size, uploaded_bytes=0)
         writer = BlobWriter()
         try:
             async with asyncio.timeout(_archive_limits()[1]):

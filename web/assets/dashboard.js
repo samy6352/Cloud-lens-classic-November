@@ -1540,29 +1540,9 @@ async function startLatestFocus() {
  * invisible until someone went looking for a file that was never written.
  */
 async function paintArchiveNote() {
-  const host = $("archiveNote");
-  if (!host) return;
-  host.innerHTML = `<span class="muted">Checking the archive…</span>`;
-  try {
-    const a = await get("/api/archive?limit=6", { timeout: 30000 });
-    if (!a.enabled) {
-      host.innerHTML = `<span class="muted">No archive configured.</span>`;
-      return;
-    }
-    if (!a.reachable) {
-      host.innerHTML = `<span class="bad">Archive unreachable</span>
-        <span class="muted">${esc(a.error || "")}</span>`;
-      return;
-    }
-    const names = Object.keys(a.latest || {});
-    const last = names.length
-      ? names.map((k) => `${esc(k)} · ${esc((a.latest[k].name || "").split("/").pop())}`).join("<br>")
-      : "nothing archived yet";
-    host.innerHTML = `<span class="ok">Archiving to ${esc(a.account)}/${esc(a.container)}</span>
-      <span class="muted">One file per dataset per day. Latest:<br>${last}</span>`;
-  } catch {
-    host.innerHTML = `<span class="muted">Could not read the archive status.</span>`;
-  }
+  if (!$("archiveNote")) return;
+  const { createArchiveStatus } = await import("./dashboard-archive.js");
+  await createArchiveStatus({ $, get, whoAmI, esc, toast }).render();
 }
 
 async function startIngest(url, method, body) {
@@ -1675,7 +1655,9 @@ async function watchIngest(runStarted) {
     const arch = state.archive;
     if (arch?.error) {
       toast(`Data loaded, but the daily archive failed. ${arch.error}`, "err");
-    } else if (arch?.name) {
+    } else if (arch?.job_id && arch.status !== "ready") {
+      toast(`Data loaded; daily archive queued (${arch.job_id}).`);
+    } else if (arch?.name && arch?.bytes) {
       toast(`Archived ${(arch.rows || 0).toLocaleString()} rows to ${arch.name}.`);
     }
     clearCache();
