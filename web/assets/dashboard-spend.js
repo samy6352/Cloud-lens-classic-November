@@ -186,12 +186,12 @@ function renderNativeCurrencies(data) {
         ${table(`Services · ${label}`, bucket.services || [], [
           { label: "Service", cell: row => esc(row.name || "—") },
           { label: `Cost · ${label}`, num: true, value: row => row.cost, cell: row => amount(row.cost) },
-        ])}
+        ], undefined, { currency })}
         ${bucket.resources_top?.length ? table(`Resources · ${label}`, bucket.resources_top, [
           { label: "Resource", cell: row => esc(row.name || "—") },
           { label: "Resource group", cell: row => esc(row.grp || "—") },
           { label: `Cost · ${label}`, num: true, value: row => row.cost, cell: row => amount(row.cost) },
-        ]) : ""}
+        ], undefined, { currency }) : ""}
       </section>`;
     }).join("")}</div>`);
   buckets.forEach((bucket, index) => {

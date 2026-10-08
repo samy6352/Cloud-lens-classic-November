@@ -1140,6 +1140,8 @@ function table(title, rows, columns, note, opts = {}) {
     searchRows: null,
     viewCache: null,
     outlier: opts.highlightOutliers === false ? null : outlierThreshold(rows, columns),
+    // Rows of a native-currency table do not carry their currency; the table does.
+    currency: /^[A-Z]{3}$/.test(opts.currency || "") ? opts.currency : null,
   });
   const state = TABLES.get(id);
   state.page = Math.min(state.page, Math.max(0, Math.ceil(view(state).length / pageSize) - 1));
@@ -1262,7 +1264,9 @@ function rowDetailMarkup(id, row, rowKey) {
       <div class="explore-links">
       ${links.map(link => `<a href="${esc(link.url)}" target="_blank" rel="noopener noreferrer">Open ${esc(link.label.toLowerCase())} in Azure ↗</a>`).join("")}
       ${area ? `<button type="button" class="linkish" data-explore-tab="${esc(area.id)}">Explore ${esc(area.label)}</button>` : ""}
-      </div>${rowDetailsMarkup(row, { currency: row.currency, stateKey: `${id}-${rowKey}` })}
+      </div>${rowDetailsMarkup(row, {
+        currency: row.currency || t.currency || readStore("costCurrency", "") || null,
+        stateKey: `${id}-${rowKey}` })}
     </section></td></tr>`;
 }
 

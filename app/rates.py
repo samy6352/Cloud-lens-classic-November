@@ -122,7 +122,9 @@ async def commitment_comparison(subscription_ids: list[str] | None = None,
                                 baseline_annual: float | None = None,
                                 baseline_days: int | None = None, *,
                                 baseline_currency: str | None = None,
-                                display_currency: str | None = None) -> dict[str, Any]:
+                                display_currency: str | None = None,
+                                baseline_by_currency: dict[str, float] | None = None,
+                                baseline_unavailable: dict[str, str] | None = None) -> dict[str, Any]:
     """Pay-as-you-go against each commitment Azure will actually recommend for this estate.
 
     From Advisor, for the reason the module docstring gives at length: the Cost Management
@@ -139,6 +141,8 @@ async def commitment_comparison(subscription_ids: list[str] | None = None,
     `baseline_annual` is the estate's own on-demand run rate, supplied by the caller from the
     warehouse because that is where a correctly-scoped figure lives. Without it the table still
     ranks the options; it just cannot say what fraction of the bill they remove.
+    `baseline_by_currency` offers each native currency's figure for a mixed-currency estate,
+    and `baseline_unavailable` says why a currency (or, under "", the scope) has none.
     """
     subs = subscription_ids or [s["id"] for s in (await list_subscriptions())["subscriptions"]]
     if not subs:
@@ -146,12 +150,16 @@ async def commitment_comparison(subscription_ids: list[str] | None = None,
 
     rows = await _arg(ADVISOR_COST_QUERY, subs, top=1000)
     return _comparison(rows, subs, baseline_annual, baseline_days,
-                       baseline_currency, display_currency)
+                       baseline_currency, display_currency,
+                       baseline_by_currency=baseline_by_currency,
+                       baseline_unavailable=baseline_unavailable)
 
 
 def _comparison(rows: list[dict[str, Any]], subs: list[str],
                 baseline_annual: float | None, baseline_days: int | None,
-                baseline_currency: str | None, display_currency: str | None) -> dict[str, Any]:
+                baseline_currency: str | None, display_currency: str | None, *,
+                baseline_by_currency: dict[str, float] | None = None,
+                baseline_unavailable: dict[str, str] | None = None) -> dict[str, Any]:
     from . import currency as fx
 
     scanned = len(rows)
@@ -161,7 +169,9 @@ def _comparison(rows: list[dict[str, Any]], subs: list[str],
     if not target and len(codes - {None}) > 1:
         groups = {
             code: _comparison([r for r in eligible if fx.currency_code(r.get("currency")) == code],
-                              subs, baseline_annual, baseline_days, baseline_currency, code)
+                              subs, baseline_annual, baseline_days, baseline_currency, code,
+                              baseline_by_currency=baseline_by_currency,
+                              baseline_unavailable=baseline_unavailable)
             for code in sorted(codes - {None})
         }
         return {
@@ -186,11 +196,20 @@ def _comparison(rows: list[dict[str, Any]], subs: list[str],
                           "savings": monthly if monthly is not None else annual / 12,
                           "currency": target})
     rows = converted
+    if baseline_annual is None and target and target in (baseline_by_currency or {}):
+        # The native baseline in exactly the currency being compared; never a conversion
+        # of another currency's figure, which would need a rate this path does not check.
+        baseline_annual, baseline_currency = baseline_by_currency[target], target
     baseline_supplied = baseline_annual is not None
     baseline_annual = fx.convert_amount(baseline_annual, baseline_currency, target)
+    unavailable = baseline_unavailable or {}
     baseline_reason = (
         "The on-demand baseline requires its source currency and an available exchange rate."
-        if baseline_supplied and baseline_annual is None else None)
+        if baseline_supplied and baseline_annual is None
+        else None if baseline_supplied
+        else unavailable.get(target or "") or unavailable.get("") or (
+            "The on-demand baseline is not available for this currency."
+            if baseline_by_currency else None))
 
     # Grouped by the decision somebody actually makes — buy this kind, for this term — and
     # summed across subscriptions, because one savings plan covers an estate rather than a
@@ -385,7 +404,7 @@ def _verdict(best: dict[str, Any] | None, baseline_annual: float | None,
     if baseline_annual and best.get("annual_cost") is not None:
         ceiling = (f" The same workload would run at {cur} {best['annual_cost']:,.0f} a year "
                    f"instead of {cur} {baseline_annual:,.0f}.")
-    return (f"A {best['term']} {kind} is the best offer on this estate: "
+    return (f"A {best['term']} {kind} is the best offer on this estate: it saves about "
             f"{cur} {best['annual_saving']:,.0f} a year{share}.{ceiling}{flex}")
 
 

@@ -65,6 +65,30 @@ SCAN_SOURCES = ("waste", "rightsizing", "shutdown", "advisor")
 _SOURCE_TIMEOUT_SECONDS = 120.0
 
 
+def _issue_text(issue: Any, limit: int = 200) -> str:
+    """A source's problem as a sentence a reader can act on.
+
+    Sources report problems as a string, a list of strings, or a mapping from check to
+    reason. `str()` of the last two put Python's own `['...']` and `{'...': '...'}` on
+    the Savings banner, and a fixed slice then cut it mid-word.
+    """
+    def flat(value: Any) -> list[str]:
+        if isinstance(value, dict):
+            return [f"{str(key).replace('_', ' ')}: {'; '.join(flat(item)) or 'failed'}"
+                    for key, item in value.items()]
+        if isinstance(value, (list, tuple, set)):
+            return [part for item in value for part in flat(item)]
+        text = str(value).strip() if value is not None else ""
+        return [text] if text else []
+
+    text = "; ".join(flat(issue))
+    if len(text) <= limit:
+        return text
+    cut = text[:limit - 1]
+    space = cut.rfind(" ")
+    return (cut[:space] if space > limit // 2 else cut).rstrip(" ;:,") + "…"
+
+
 def _num(v: Any) -> float:
     """Money, or zero. Azure sends nulls, empty strings and occasionally strings with commas."""
     if v is None or v is True or v is False:
@@ -764,7 +788,7 @@ async def build(subs: list[str] | None, days: int,
             name, res = await finished
             completed.append(name)
             if isinstance(res, Exception):
-                failed[name] = (str(res) or type(res).__name__)[:200]
+                failed[name] = _issue_text(str(res) or type(res).__name__)
             elif not isinstance(res, dict):
                 failed[name] = "The source returned an invalid response."
             else:
@@ -772,7 +796,7 @@ async def build(subs: list[str] | None, days: int,
                 issue = (res.get("error") or res.get("errors") or res.get("unavailable")
                          or ("The source returned partial results." if res.get("partial") else None))
                 if issue:
-                    failed[name] = str(issue)[:200]
+                    failed[name] = _issue_text(issue)
             if name in failed:
                 log.warning("savings: %s unavailable: %s", name, failed[name])
             # Rebuild from raw inputs, never incrementally mutate the previous merge: a late
@@ -805,7 +829,8 @@ def assemble(data: dict[str, Any], failed: dict[str, str], days: int,
              currency: str | None = None, *, took_ms: int = 0) -> dict[str, Any]:
     """Merge any completed subset using the same deterministic precedence as a full scan."""
     source_failures = {
-        name: str(payload.get("error") or payload.get("errors") or "Source scan is incomplete.")[:400]
+        name: _issue_text(payload.get("error") or payload.get("errors")
+                          or "Source scan is incomplete.", 400)
         for name, payload in data.items()
         if isinstance(payload, dict) and (payload.get("error") or payload.get("errors") or payload.get("partial"))
     }

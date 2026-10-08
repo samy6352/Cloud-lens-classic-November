@@ -534,6 +534,39 @@ def test_a_slow_environment_tag_does_not_take_the_other_filters_with_it(monkeypa
     assert "unavailable" not in payload
 
 
+def test_scoped_filter_bar_dates_come_from_the_rollup_not_the_detail_view(monkeypatch):
+    """Under a scope `costs` is a view over the detail table. On the 16.9M-row estate
+    `max("ChargePeriodStart")` over it hit FILTER_BUDGET_MS for any selection -- even a
+    single subscription -- and, being outside the per-dimension guard, emptied the bar."""
+    from app import main, warehouse
+    monkeypatch.setattr(main, "current_user", lambda request: SimpleNamespace(admin=True))
+    monkeypatch.setattr(main, "permitted", AsyncMock(return_value=["a", "b"]))
+    dated = []
+
+    @contextmanager
+    def reader(scope, currency=None, budget_ms=None):
+        assert scope == ["a"]
+
+        def rows(sql, *args):
+            if "max(" in sql:
+                dated.append(sql)
+                if "FROM costs_rollup" not in sql:
+                    raise RuntimeError("canceling statement due to statement timeout")
+                return [{"d": "2026-09-28"}]
+            if "'env'" in sql:
+                return []
+            return [{"d": "service", "v": "Storage", "currency": "INR", "c": 5}]
+        yield SimpleNamespace(rows=rows, agg="costs_rollup")
+
+    monkeypatch.setattr(warehouse.warehouse, "reader", reader)
+    response = asyncio.run(main.filter_values(SimpleNamespace(), scope="a"))
+    import json
+    payload = json.loads(response.body)
+    assert "unavailable" not in payload
+    assert payload["dimensions"]["service"][0]["value"] == "Storage"
+    assert dated and all("FROM costs_rollup" in sql for sql in dated)
+
+
 def test_csv_disconnect_waits_for_fetch_before_closing_context(monkeypatch):
     from app import main, warehouse
     fetching, release, closed = threading.Event(), threading.Event(), threading.Event()
@@ -748,7 +781,8 @@ def test_commitment_baseline_never_substitutes_display_for_unknown_source(
         assert active.get()
         assert scope == ["a"]
         assert kwargs == {"baseline_annual": annual, "baseline_days": 3,
-                          "baseline_currency": None, "display_currency": "EUR"}
+                          "baseline_currency": None, "display_currency": "EUR",
+                          "baseline_by_currency": {}, "baseline_unavailable": {}}
         return {"options": []}
     compare = AsyncMock(side_effect=comparison)
     monkeypatch.setattr(rates, "commitment_comparison", compare)
@@ -757,3 +791,70 @@ def test_commitment_baseline_never_substitutes_display_for_unknown_source(
     assert json.loads(response.body)["comparison"] == {"options": []}
     compare.assert_awaited_once()
     spot.assert_called_once_with(["a"], days=3, currency="EUR")
+
+
+def test_mixed_currency_commitment_baseline_is_offered_per_currency_with_reasons(
+        financial_route_context, monkeypatch):
+    """Live Scale: INR + USD estate, flat split `{}`, so every annual cost read "—" and
+    the page never said why. Each native currency now offers its own baseline or reason."""
+    import json
+    from unittest.mock import Mock
+
+    from app import commitments, rates
+    main, _ = financial_route_context
+    model = SimpleNamespace(
+        coverage=lambda *args, **kwargs: {
+            "empty": False, "currency": None, "split": {}, "mixed_currency": True,
+            "by_currency": {"INR": {"split": {"on demand": 300.0, "committed": 9.0}},
+                            "USD": {"split": {"unknown": 2471.11}},
+                            "EUR": {"split": {"committed": 5.0}}}},
+        spot_savings=Mock(return_value={}), inventory=lambda *args, **kwargs: {})
+    monkeypatch.setattr(commitments, "get_commitments", lambda: model)
+    seen = {}
+
+    async def comparison(scope, **kwargs):
+        seen.update(kwargs)
+        return {"options": []}
+    monkeypatch.setattr(rates, "commitment_comparison", AsyncMock(side_effect=comparison))
+    response = asyncio.run(main.dashboard_commitments(SimpleNamespace(), days=30, scope="a"))
+    assert response.status_code == 200
+    assert seen["baseline_annual"] is None
+    assert seen["baseline_by_currency"] == {"INR": 300.0 * 365 / 30}
+    assert "pricing model is not recorded" in seen["baseline_unavailable"]["USD"]
+    assert "No on-demand spend" in seen["baseline_unavailable"]["EUR"]
+    assert json.loads(response.body)["comparison"] == {"options": []}
+
+
+def test_commitment_inventory_timeout_is_a_named_gap_not_a_500(financial_route_context, monkeypatch):
+    """Live Scale, currency=USD: `inventory()` hit `statement timeout` (QueryCanceled) and the
+    exception escaped the route, so the whole Commitments tab returned HTTP 500 after ~100s."""
+    import json
+
+    from app import commitments, rates
+    main, _ = financial_route_context
+
+    class QueryCanceled(Exception):
+        pass
+
+    def inventory(*args, **kwargs):
+        raise QueryCanceled("canceling statement due to statement timeout")
+
+    def spot(*args, **kwargs):
+        raise RuntimeError("connection reset")
+
+    model = SimpleNamespace(
+        coverage=lambda *args, **kwargs: {"empty": False, "currency": "USD",
+                                          "split": {"on demand": 30.0}},
+        spot_savings=spot, inventory=inventory)
+    monkeypatch.setattr(commitments, "get_commitments", lambda: model)
+    monkeypatch.setattr(rates, "commitment_comparison", AsyncMock(return_value={"options": []}))
+    response = asyncio.run(main.dashboard_commitments(SimpleNamespace(), days=30, scope="a",
+                                                      currency="USD"))
+    assert response.status_code == 200
+    body = json.loads(response.body)
+    assert body["coverage"]["split"] == {"on demand": 30.0}
+    assert body["inventory"]["unavailable"] is True
+    assert "took too long" in body["inventory"]["error"]
+    assert "As billed" in body["inventory"]["error"]
+    assert body["spot"]["unavailable"] is True
+    assert "could not be read" in body["spot"]["error"]

@@ -291,3 +291,22 @@ def test_unresolved_scope_member_does_not_silently_narrow_summary(overview, rows
         payload(rows, subscriptions_requested=1, subscriptions_read=1), ["a", "missing"],
     )
     assert answer["budget_status"] == ("partial" if rows else "unavailable")
+
+
+def test_full_forecast_carries_no_note(overview):
+    assert overview(payload())["forecast_note"] is None
+
+
+@pytest.mark.parametrize("fc,expected", [
+    # Live Scale: a cost-data-only selection made `_resolve` refuse, the tile read "—" while
+    # still captioned "next 30 days, from Azure".
+    (cost.CostError("None of ['x'] match a subscription you can see. Available: A"),
+     "not readable live"),
+    (cost.CostError("Azure returned 429"), "Azure forecast unavailable"),
+    ({"projected_total": None, "mixed_currency": True}, "across currencies"),
+    ({"projected_total": 5, "subscriptions_included": 1, "no_forecast_available": ["B"]},
+     "1 of 2 subscriptions"),
+])
+def test_forecast_note_names_why_the_tile_is_empty_or_partial(fc, expected):
+    assert expected in cost._forecast_note(fc)
+    assert "Available:" not in cost._forecast_note(fc)

@@ -695,7 +695,7 @@ async function loadGlance(attempt = 0) {
     setKpi(tiles[2], {
       key: "Forecast 30d",
       value: money(o.forecast_30d, cur),
-      sub: "next 30 days, from Azure",
+      sub: o.forecast_note || "next 30 days, from Azure",
     });
 
     // Month on month, paced.
@@ -707,11 +707,21 @@ async function loadGlance(attempt = 0) {
     // Only from the second day, because one day extrapolated thirty times is noise with a
     // decimal point on it.
     const now = new Date();
-    const elapsed = now.getDate();
     const inMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+    // Pace by the days the figure actually covers. The warehouse can end mid-month (here: data
+    // loaded to 1 Oct, viewed on 8 Oct); dividing one day's spend by eight elapsed days and
+    // projecting a month from it reported a -100% "saving" in green.
+    let elapsed = now.getDate();
+    const dataTo = o.source === "warehouse" && /^\d{4}-\d{2}-\d{2}/.test(o.data_to || "")
+      ? o.data_to.slice(0, 10) : "";
+    const thisMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+    const partial = dataTo.startsWith(thisMonth) && Number(dataTo.slice(8, 10)) < elapsed;
+    if (partial) elapsed = Number(dataTo.slice(8, 10));
+    const nativeBoth = (o.month_to_date_by_currency || []).length && (o.last_month_by_currency || []).length;
     if (o.month_to_date != null && o.last_month) {
       if (elapsed < 2) {
-        setKpi(tiles[3], { key: "Month on month", value: "—", sub: "too early in the month" });
+        setKpi(tiles[3], { key: "Month on month", value: "—",
+          sub: partial ? `only ${elapsed} day of this month loaded` : "too early in the month" });
       } else {
         const paced = (o.month_to_date / elapsed) * inMonth;
         const pct = ((paced - o.last_month) / o.last_month) * 100;
@@ -723,9 +733,12 @@ async function loadGlance(attempt = 0) {
           value: `${pct > 0 ? "+" : ""}${pct.toFixed(1)}%`,
           tone: mood === "bad" ? "warn" : "",
           delta: { text: money(Math.abs(paced - o.last_month), cur), up: pct > 0, mood },
-          sub: `${money(paced, cur)} projected · ${elapsed}/${inMonth} days`,
+          sub: `${money(paced, cur)} projected · ${elapsed}/${inMonth} days${partial ? " loaded" : ""}`,
         });
       }
+    } else if (nativeBoth) {
+      setKpi(tiles[3], { key: "Month on month", value: "—",
+        sub: "per currency; choose a display currency" });
     } else {
       setKpi(tiles[3], { key: "Month on month", value: "—", sub: "needs both months" });
     }
@@ -1173,7 +1186,7 @@ function renderPicker() {
     b.innerHTML =
       `<span class="box" aria-hidden="true">${on ? "✓" : ""}</span>` +
       `<span class="nm">${esc(s.name || s.id)}</span>` +
-      `<span class="amt">${s.cost != null ? money(s.cost) : "—"}</span>`;
+      `<span class="amt">${pickerAmount(s)}</span>`;
     b.onclick = () => toggleSub(s.id);
     list.appendChild(b);
   });
@@ -1193,6 +1206,15 @@ function renderPicker() {
 
   describeScope(all, label);
   if (focused) [...list.querySelectorAll(".pick")].find(node => node.dataset.subscriptionId === focused)?.focus();
+}
+
+function pickerAmount(s) {
+  // Each subscription's own billing currency. `money()` defaults to USD, which printed
+  // rupee totals with a dollar sign; an amount whose currency is unknown gets no symbol.
+  if (s.cost == null || Number.isNaN(Number(s.cost))) return "—";
+  return /^[A-Z]{3}$/.test(s.currency || "")
+    ? money(s.cost, s.currency)
+    : esc(Math.round(Number(s.cost)).toLocaleString());
 }
 
 function openPicker(open) {

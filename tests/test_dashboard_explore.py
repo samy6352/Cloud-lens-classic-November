@@ -227,3 +227,20 @@ assert.doesNotMatch(text, /<script>/);
 assert.match(rowDetailsMarkup({empty:{}, list:[]}), /No displayable fields/);
 assert.match(rowDetailsMarkup({empty:{}, list:[]}), /No items/);
 """)
+
+
+def test_service_row_details_read_as_labelled_money_and_percent():
+    # Live Scale Overview "Services · INR" > Details showed "Change pct 12.3",
+    # "Share pct 28.8" and bare "58,778,400.07" with no currency.
+    run_node(r"""
+const row = {name:"Azure Databricks", cost:58778400.07, previous:52341481.48,
+  delta:6436918.59, change_pct:12.3, share_pct:28.8, count:4};
+const html = rowDetailsMarkup(row, {currency:"INR"});
+assert.match(html, /<dt>Change<\/dt><dd><span class="explore-value">12\.3%</);
+assert.match(html, /<dt>Share of total<\/dt><dd><span class="explore-value">28\.8%</);
+assert.match(html, /<dt>Previous period<\/dt><dd><span class="explore-value">\u20b952,341,481\.48</);
+assert.match(html, /<dt>Delta<\/dt><dd><span class="explore-value">\u20b96,436,918\.59</);
+assert.match(html, /<dt>Cost<\/dt><dd><span class="explore-value">\u20b958,778,400\.07</);
+assert.match(html, /<dt>Count<\/dt><dd><span class="explore-value">4</);
+assert.doesNotMatch(html, /pct/i);
+""")

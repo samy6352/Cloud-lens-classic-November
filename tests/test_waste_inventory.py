@@ -156,6 +156,33 @@ class ResourceGraphPagingTests(unittest.TestCase):
                 self.assertRaisesRegex(waste.CostError, "upstream unavailable"):
             asyncio.run(waste._arg("Resources", ["sub-a"], top=2000))
 
+    def test_no_visible_subscription_is_one_plain_reason_not_sixteen_raw_400s(self):
+        """Live Scale: a selection of only cost-data subscriptions made every rule log
+        `Azure returned 400: {"error":...NoValidSubscriptionsInQueryRequest...}`."""
+        raw = ('Azure returned 400: {"error":{"code":"BadRequest","message":"Please provide '
+               'below info when asking for support: timestamp = 2026-10-08T11:25:35Z, '
+               'correlationId = x.","details":[{"code":"NoValidSubscriptionsInQueryRequest",'
+               '"message":"There must be at least one subscription that')
+        request = AsyncMock(side_effect=waste.CostError(raw, status_code=400))
+        with patch.object(waste.azure, "request", new=request), \
+                self.assertRaises(waste.NoVisibleSubscriptions) as raised:
+            asyncio.run(waste._arg("Resources", ["sub-a"]))
+        self.assertNotIn("{", str(raised.exception))
+        self.assertIn("can be read live", str(raised.exception))
+
+        with patch.object(waste.azure, "request", new=request), \
+                patch.object(waste, "_costs_for", side_effect=AssertionError("no cost read")), \
+                self.assertRaises(waste.NoVisibleSubscriptions):
+            asyncio.run(waste.find_waste(subscription_ids=["demo-only"]))
+
+    def test_other_400s_are_still_reported_as_they_are(self):
+        request = AsyncMock(side_effect=waste.CostError("Azure returned 400: bad query",
+                                                        status_code=400))
+        with patch.object(waste.azure, "request", new=request), \
+                self.assertRaisesRegex(waste.CostError, "bad query") as raised:
+            asyncio.run(waste._arg("Resources", ["sub-a"]))
+        self.assertNotIsInstance(raised.exception, waste.NoVisibleSubscriptions)
+
 
 if __name__ == "__main__":
     unittest.main()

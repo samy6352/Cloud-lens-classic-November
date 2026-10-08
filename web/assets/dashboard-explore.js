@@ -160,17 +160,25 @@ function fieldLabel(key) {
     grp: "Resource group", rg: "Resource group", resourceid: "Resource ID",
     subscriptionid: "Subscription ID", resourcegroup: "Resource group",
     pct: "Percent", sku: "SKU", id: "ID", cpu: "CPU", ram: "RAM",
+    changepct: "Change", sharepct: "Share of total", previous: "Previous period",
   };
   const label = words(key);
   return known[label.toLowerCase().replaceAll(" ", "")]
     || (label.charAt(0).toUpperCase() + label.slice(1))
+      .replace(/\s+pct$/i, " %")
       .replace(/\b(id|ids|cpu|ram|sku|vm|vms|url|uri|ip|os|gb|mb|usd)\b/gi, word => word.toUpperCase());
 }
 
 function numericText(value, key, currency) {
   if (!Number.isFinite(value)) return String(value);
   const label = words(key).toLowerCase();
-  const money = /(?:cost|spend|saving|price|charge|amount|budget|balance)/.test(label)
+  if (/(?:^|\s)(?:pct|percent)$/.test(label)) {
+    return `${new Intl.NumberFormat("en-US", { maximumSignificantDigits: 15 }).format(value)}%`;
+  }
+  // `previous` and `delta` sit beside `cost` in spend rows and are the same money; printed
+  // bare they read as a different, unlabelled quantity.
+  const money = (/(?:cost|spend|saving|price|charge|amount|budget|balance)/.test(label)
+      || /^(?:previous|delta|baseline|impact)$/.test(label))
     && !/(?:percent|pct|ratio|count|hours|days)/.test(label);
   if (currency && money) {
     try {

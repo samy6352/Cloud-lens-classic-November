@@ -126,6 +126,11 @@ await tabs.renderBudgets(1);
 assert.equal(gets.length,1);
 assert.match(gets[0], /scope=one%2Ctwo/);
 assert.doesNotMatch(gets[0],/refresh=/,"normal load need not bypass Azure cache");
+// The tab dispatcher calls every renderer as (token, tabId). Live Scale sent refresh=true on
+// every Budgets visit because the id "budgets" was taken as the refresh flag.
+await tabs.renderBudgets(1, "budgets");
+assert.doesNotMatch(gets.at(-1),/refresh=/,"tab dispatch is a plain load, not a forced re-read");
+gets.length = 1;
 assert.equal(charts.length,0,"collapsed cards never draw charts");
 assert.equal(listDetails.length,4);
 assert.match(rootMarkup,/Overlapping budgets and different currencies are not summed/);

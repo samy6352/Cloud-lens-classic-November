@@ -612,6 +612,9 @@ async function loadRootCause(details) {
  * export, and a stale "you're fine" is the one answer this page must never give.
  */
 async function renderBudgets(token, refresh = false) {
+  // Tab dispatch calls every renderer as `(token, tabId)`; the id "budgets" is truthy and made
+  // each plain visit a forced live Azure re-read. Only the Refresh button asks for that.
+  refresh = refresh === true;
   const request = ++budgetRequest;
   let d;
   try {

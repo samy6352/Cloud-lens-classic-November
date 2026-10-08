@@ -274,6 +274,26 @@ def test_comparison_preserves_native_currency_groups(fx):
     assert set(result["by_currency"]) == {"USD", "EUR"}
 
 
+def test_comparison_uses_matching_native_baseline_and_names_missing_one(fx):
+    rows = [*advisor_rows(), {**advisor_rows()[0], "currency": "EUR", "annualSavings": 50}]
+    result = rates._comparison(
+        rows, [SUB_A], None, 30, None, None,
+        baseline_by_currency={"USD": 1200.0},
+        baseline_unavailable={"EUR": "The pricing model is not recorded for this spend."})
+    usd, eur = result["by_currency"]["USD"], result["by_currency"]["EUR"]
+    assert usd["baseline"]["annual"] == 1200
+    assert usd["best"]["annual_cost"] == 1080 and usd["best"]["saving_pct"] == 10
+    assert usd["baseline"]["unavailable_reason"] is None
+    assert eur["baseline"]["annual"] is None
+    assert eur["baseline"]["unavailable_reason"] == "The pricing model is not recorded for this spend."
+    assert eur["best"]["annual_cost"] is None and eur["best"]["annual_saving"] == 50
+
+
+def test_comparison_verdict_states_a_saving_not_a_price(fx):
+    result = rates._comparison(advisor_rows(), [SUB_A], None, 30, None, None)
+    assert "saves about USD 120 a year" in result["verdict"]
+
+
 def test_unpriced_recommendation_is_not_reported_as_absent(fx):
     result = rates._comparison(
         [{**advisor_rows()[0], "currency": None}], [SUB_A], 80000, 30, "INR", "INR")

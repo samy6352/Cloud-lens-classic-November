@@ -384,6 +384,33 @@ assert.equal(list.contains(doc.activeElement),true,"Escape remains within the me
 """)
 
 
+def test_subscription_picker_shows_each_amount_in_its_own_currency():
+    # Live Scale showed rupee subscriptions as "$10,54,67,629": `money(s.cost)` defaulted to USD.
+    run_node(r"""
+import assert from "node:assert/strict";
+import fs from "node:fs";
+const source=fs.readFileSync("./web/assets/app.js","utf8");
+const list={children:[],contains(){return false;},appendChild(node){this.children.push(node);},
+  querySelectorAll(){return this.children;},set innerHTML(value){this.children=[];}};
+const node=()=>({dataset:{},classList:{toggle:()=>{}},setAttribute:()=>{},focus(){}});
+const nodes=new Map(["pickerLabel","pickerBtn","pickAll"].map(id=>[id,node()]));
+nodes.set("pickerList",list);
+const money=(n,cur="USD")=>`${cur}:${n}`;
+const subs=[{id:"inr",cost:1054.4,currency:"INR"},{id:"usd",cost:27.5,currency:"USD"},
+  {id:"none",cost:12},{id:"empty"}];
+const render=new Function("$","document","allSubs","selected","esc","money","toggleSub",
+  "isAllSelected","describeScope",
+  source.slice(source.indexOf("function renderPicker"),source.indexOf("function openPicker"))+
+  ";return renderPicker;")(id=>nodes.get(id),{createElement:node,activeElement:null},subs,
+  new Set(),String,money,()=>{},()=>true,()=>{});
+render();
+const amounts=list.children.map(child=>/class="amt">([^<]*)</.exec(child.innerHTML)[1]);
+assert.deepEqual(amounts.slice(0,2),["INR:1054.4","USD:27.5"]);
+assert.ok(!amounts[2].includes("USD") && !amounts[2].includes("$"), amounts[2]);
+assert.equal(amounts[3],"—");
+""")
+
+
 def test_mixed_native_views_never_format_aggregate_null_or_add_currencies():
     run_node(HARNESS + r"""
 const formatted=[];
@@ -586,4 +613,33 @@ const state=tables.get("Clusters");
 const column=state.columns.find(column=>column.label==="Cost");
 assert.match(column.total(state.rows),/EUR EUR:20.*USD USD:10/);
 assert.deepEqual(charts.map(chart=>chart.currency),["USD","EUR"]);
+""")
+
+def test_month_on_month_paces_by_loaded_days_and_names_the_mixed_case():
+    # Live Scale on 8 Oct: data loaded to 1 Oct, so one day's spend was paced over eight
+    # days and shown as about -100%; As billed with INR+USD said "needs both months".
+    run_node(r"""
+import assert from "node:assert/strict";
+import fs from "node:fs";
+const source=fs.readFileSync("./web/assets/app.js","utf8");
+const body=source.slice(source.indexOf("    const now = new Date();"),
+  source.indexOf("    const budget = budgetPresentation(o);"));
+const RealDate=Date;
+class FixedDate extends RealDate { constructor(...a){ super(...(a.length?a:["2026-10-08T12:00:00"])); } }
+const tile=(o)=>{const tiles=[{},{},{},{}];
+  new Function("o","tiles","setKpi","money","cur","Date",body)(o,tiles,(t,v)=>Object.assign(t,v),
+    (n,c)=>`${c}:${Math.round(n)}`,o.currency,FixedDate);return tiles[3];};
+let t=tile({source:"warehouse",data_to:"2026-10-01",currency:"USD",month_to_date:20.92,last_month:2002437});
+assert.equal(t.value,"—");
+assert.match(t.sub,/only 1 day of this month loaded/);
+t=tile({source:"warehouse",data_to:"2026-10-05",currency:"USD",month_to_date:500,last_month:3100});
+assert.match(t.sub,/5\/31 days loaded/);
+assert.equal(t.value,"0.0%");
+t=tile({source:"warehouse",data_to:"2026-10-08",currency:"USD",month_to_date:800,last_month:3100});
+assert.match(t.sub,/8\/31 days$/);
+t=tile({currency:null,month_to_date:null,last_month:null,
+  month_to_date_by_currency:[{currency:"INR",cost:0}],last_month_by_currency:[{currency:"INR",cost:9}]});
+assert.match(t.sub,/per currency; choose a display currency/);
+t=tile({currency:"USD",month_to_date:null,last_month:5});
+assert.equal(t.sub,"needs both months");
 """)

@@ -105,6 +105,7 @@ _cache_tokens: dict[str, tuple[str, object]] = {}
 # entry stale forever.
 _refreshing: set[str] = set()
 _refresh_tasks: set[asyncio.Task] = set()
+_flight_tasks: set[asyncio.Task] = set()
 
 # The same idea for the *first* fetch. `_refreshing` above only covers refreshing an entry that
 # already exists, so a key nobody has fetched yet had no protection at all: every concurrent
@@ -374,6 +375,17 @@ class Azure:
     async def close(self) -> None:
         global _pool, _pool_loop
 
+        # Readers shield shared fetches, and invalidation removes their cache keys without
+        # cancelling them. Keep ownership until completion, then join them before transport close.
+        pending = set(_flight_tasks) | set(_refresh_tasks)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        _flight_tasks.clear()
+        _refresh_tasks.clear()
+        _refreshing.clear()
+        clear_cache()
+        self._token = None
         if self._credential is not None:
             await self._credential.close()
             self._credential = None
@@ -424,6 +436,8 @@ class Azure:
         if entry is None:
             task = asyncio.create_task(
                 self._fetch(key, method, url, json_body, params, attempts))
+            _flight_tasks.add(task)
+            task.add_done_callback(_flight_tasks.discard)
             _inflight[key] = (url, task)
             # Discard by identity. A replacement is only ever created once the previous task has
             # been removed, so this cannot drop a newer one -- but comparing costs nothing and
@@ -1547,6 +1561,9 @@ async def overview(scope: list[str] | None = None, *,
             budget_status = "unknown"
             budget_note = "Budgets exist, but their usage readings are unavailable."
 
+    fc = got.get("fc")
+    forecast_note = _forecast_note(fc)
+
     return {
         "subscriptions": len(in_scope) or stored["subscriptions"],
         "currency": (currency or (
@@ -1556,7 +1573,10 @@ async def overview(scope: list[str] | None = None, *,
         "month_to_date_by_currency": month_to_date_by_currency,
         "last_month_by_currency": last_month_by_currency,
         "currency_note": currency_note,
-        "forecast_30d": value(got.get("fc"), "projected_total"),
+        "forecast_30d": value(fc, "projected_total"),
+        # Why the forecast tile is empty or narrower than the selection. Azure only forecasts
+        # subscriptions this identity can read live, which a cost-data-only selection is not.
+        "forecast_note": forecast_note,
         "budget": {"name": worst["name"], "percent_used": worst["percent_used"],
                    "status": worst.get("status"),
                    "over": value(got.get("buds"), "over", default=0),
@@ -1571,6 +1591,22 @@ async def overview(scope: list[str] | None = None, *,
         "scope": scope or None,
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
     }
+
+
+def _forecast_note(fc: Any) -> str | None:
+    """Why the header's forecast is missing or covers less than the selection, if it does."""
+    if isinstance(fc, CostError) and "match a subscription you can see" in str(fc):
+        return "no forecast: these subscriptions are not readable live"
+    if isinstance(fc, Exception):
+        return "Azure forecast unavailable"
+    if isinstance(fc, dict):
+        if fc.get("mixed_currency"):
+            return "no single forecast across currencies"
+        if fc.get("no_forecast_available"):
+            included = fc.get("subscriptions_included") or 0
+            missing = len(fc["no_forecast_available"])
+            return f"from Azure, {included} of {included + missing} subscriptions"
+    return None
 
 
 async def _forecast_by_subscription(scope: list[str] | None) -> dict[str, Any]:

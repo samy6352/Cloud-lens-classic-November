@@ -175,6 +175,45 @@ class SavingsProgressTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("invalid response", result["unavailable"]["shutdown"])
         self.assertIn("cancelled", result["unavailable"]["advisor"])
 
+    async def test_structured_source_errors_read_as_sentences_not_python(self):
+        """The live Savings banner showed `['1 VM(s) ...']` and `{'unassociated_public_ips_
+        pricing': ...` cut off mid-word at a fixed 200 characters."""
+        waste_errors = {
+            "unassociated_public_ips_pricing":
+                "4 resource(s) have no complete currency-qualified billing cost.",
+            "orphaned_nics_pricing":
+                "12 resource(s) have no complete currency-qualified billing cost.",
+            "deallocated_vms_pricing":
+                "3 resource(s) have no complete currency-qualified billing cost.",
+        }
+        sources = self.sources({
+            "waste": {**DATA["waste"], "errors": waste_errors},
+            "rightsizing": {**DATA["rightsizing"],
+                            "errors": ["1 VM(s) have no complete currency-qualified billing cost."]},
+            "shutdown": DATA["shutdown"],
+            "advisor": DATA["advisor"],
+        })
+        sources.release()
+        result = await savings.build(None, 30)
+        errors = result["scan"]["errors"]
+        self.assertEqual(errors["rightsizing"],
+                         "1 VM(s) have no complete currency-qualified billing cost.")
+        self.assertTrue(errors["waste"].startswith(
+            "unassociated public ips pricing: 4 resource(s) have no complete"))
+        for text in errors.values():
+            self.assertNotRegex(text, r"[\[\]{}]|'\w")
+            self.assertLessEqual(len(text), 200)
+        self.assertTrue(errors["waste"].endswith("…"))
+        self.assertRegex(errors["waste"], r"\w…$")
+        self.assertNotRegex(errors["waste"][:-1], r"\s$")
+
+    def test_issue_text_keeps_short_text_and_cuts_long_text_at_a_word(self):
+        self.assertEqual(savings._issue_text("metrics forbidden"), "metrics forbidden")
+        self.assertEqual(savings._issue_text({"a_b": ["x", "y"]}), "a b: x; y")
+        cut = savings._issue_text("alpha " * 50, 40)
+        self.assertLessEqual(len(cut), 40)
+        self.assertTrue(cut.endswith("alpha…"))
+
     async def test_source_timeout_cancels_only_unfinished_source(self):
         sources = self.sources()
         sources.release("waste", "advisor", "shutdown")

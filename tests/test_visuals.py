@@ -338,6 +338,11 @@ check("the comparison is drawn as columns, one per pricing model",
       "function comparisonPanel" in dash and 'class="cmp-grid"' in dash)
 check("each column states what a year costs, not only what it saves",
       "m.annual_cost" in dash)
+check("and when it cannot, the panel says why rather than showing bare dashes",
+      "cmpBaselineReason" in dash and "unavailable_reason" in dash)
+check("a failed commitment inventory names its reason instead of asking for a FOCUS refresh",
+      '<p class="muted empty">${esc(inv.error)}</p>' in dash
+      and "!s.empty && !s.error" in dash)
 check("and the same three figures are drawn as bars",
       "function drawComparisonChart" in dash)
 

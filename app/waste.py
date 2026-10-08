@@ -316,6 +316,22 @@ def _evidence_type(impact: str, buckets: dict[str, float | None]) -> str:
     return "verified_cost"
 
 
+class NoVisibleSubscriptions(CostError):
+    """Resource Graph can see none of the selected subscriptions.
+
+    Azure answers 400 `NoValidSubscriptionsInQueryRequest`; surfaced raw, every rule
+    repeated the same JSON on the Savings banner and read as sixteen faults rather than one.
+    Typical cause: the selection holds only subscriptions known from cost data (demo,
+    removed or another tenant's) that this identity cannot read live.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "None of the selected subscriptions can be read live by this identity, so the "
+            "resource scan could not run. Include at least one subscription it can access.",
+            status_code=400)
+
+
 async def _arg(
     query: str, subscriptions: list[str], top: int = 500, *,
     max_records: int = 5000, max_pages: int = 100,
@@ -363,15 +379,20 @@ async def _arg_group(
         page_size = min(top, 1000, max_records - skip)
         options = {"resultFormat": "objectArray", "$top": page_size}
         options.update({"$skipToken": token} if token else {"$skip": skip})
-        payload = await azure.request(
-            "POST",
-            f"{ARM}/providers/Microsoft.ResourceGraph/resources?api-version={ARG_API}",
-            json_body={
-                "query": query,
-                "subscriptions": subscriptions,
-                "options": options,
-            },
-        )
+        try:
+            payload = await azure.request(
+                "POST",
+                f"{ARM}/providers/Microsoft.ResourceGraph/resources?api-version={ARG_API}",
+                json_body={
+                    "query": query,
+                    "subscriptions": subscriptions,
+                    "options": options,
+                },
+            )
+        except CostError as exc:
+            if "NoValidSubscriptionsInQueryRequest" in str(exc):
+                raise NoVisibleSubscriptions() from exc
+            raise
         batch = payload.get("data", []) or []
         rows.extend(batch)
         skip += len(batch)
@@ -496,6 +517,9 @@ async def find_waste(
     results = await asyncio.gather(
         *(_arg(RULES[k]["query"], subs) for k in keys), return_exceptions=True
     )
+    # One cause, said once: every rule fails identically when no subscription is visible.
+    if results and all(isinstance(res, NoVisibleSubscriptions) for res in results):
+        raise results[0]
 
     # One warehouse pass for every id found, rather than one per category.
     all_ids: list[str] = []

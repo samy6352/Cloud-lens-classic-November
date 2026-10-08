@@ -4523,12 +4523,31 @@ async def dashboard_commitments(request: Request, days: int = 30,
 
     c = get_commitments()
     days = max(1, min(days, 365))
+
+    async def secondary(name: str, call: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        # Spot and the inventory are panels beside the coverage figure, not the figure. Under
+        # a converted currency they read the detail table (the commitment summary carries no
+        # conversion factor), and on the 16.9M-row Scale estate the inventory's 90-day pass
+        # hit the server's statement timeout and turned the whole tab into HTTP 500.
+        try:
+            return await offload(call, *args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - one panel, not the tab
+            timed_out = type(exc).__name__ == "QueryCanceled" or "statement timeout" in str(exc)
+            log.warning("commitments: %s unavailable (%s)", name, type(exc).__name__)
+            reason = (f"The {name} took too long to read" if timed_out
+                      else f"The {name} could not be read") + (
+                " in a converted currency; choose As billed to see it." if currency
+                else ". Try again shortly.")
+            return {"error": reason, "unavailable": True}
+
     # Three warehouse passes, all blocking; running them off the event loop together costs the
     # slowest rather than their sum.
     cover, spot, owned = await asyncio.gather(
         offload(c.coverage, picked or None, days=days, currency=currency or None),
-        offload(c.spot_savings, picked or None, days=days, currency=currency or None),
-        offload(c.inventory, picked or None, days=max(days, 90), currency=currency or None),
+        secondary("Spot savings", c.spot_savings, picked or None, days=days,
+                  currency=currency or None),
+        secondary("commitment inventory", c.inventory, picked or None, days=max(days, 90),
+                  currency=currency or None),
     )
 
     # The baseline has to come from the warehouse rather than from Advisor. Advisor reports the
@@ -4538,6 +4557,25 @@ async def dashboard_commitments(request: Request, days: int = 30,
     baseline_annual = None
     if on_demand is not None and days:
         baseline_annual = float(on_demand) * (365.0 / days)
+    # A mixed-currency estate has no single split, so the flat figure above is absent even
+    # when one currency has a perfectly good on-demand baseline. Offer each native one, and
+    # say why a currency has none, so the comparison names its gap instead of showing blanks.
+    baseline_by_currency: dict[str, float] = {}
+    baseline_unavailable: dict[str, str] = {}
+    for code, group in (cover.get("by_currency") or {}).items():
+        split = (group or {}).get("split") or {}
+        if code == "unknown" or not days:
+            continue
+        if split.get("on demand") is not None:
+            baseline_by_currency[code] = float(split["on demand"]) * (365.0 / days)
+        elif set(split) & {"unknown", "other"}:
+            baseline_unavailable[code] = (
+                "The pricing model is not recorded for this spend, so the on-demand "
+                "baseline cannot be measured.")
+        else:
+            baseline_unavailable[code] = "No on-demand spend was billed in this period."
+    if cover.get("empty"):
+        baseline_unavailable[""] = "No billed spend is in the warehouse for this scope and period."
 
     from .rates import commitment_comparison
     try:
@@ -4545,7 +4583,9 @@ async def dashboard_commitments(request: Request, days: int = 30,
             compare = await commitment_comparison(
                 picked or None, baseline_annual=baseline_annual, baseline_days=days,
                 baseline_currency=cover.get("currency"),
-                display_currency=currency or None)
+                display_currency=currency or None,
+                baseline_by_currency=baseline_by_currency,
+                baseline_unavailable=baseline_unavailable)
     except Exception as exc:  # noqa: BLE001 - Advisor being unreachable must not blank the tab
         log.info("commitment comparison failed: %s", str(exc)[:200])
         compare = {"error": str(exc)[:300], "options": []}
@@ -5348,8 +5388,11 @@ async def filter_values(request: Request, days: int = 30, scope: str = "",
         with warehouse.reader(picked or None, currency=currency or None,
                               budget_ms=FILTER_BUDGET_MS) as r:
             # Anchored to the newest data, not to today: a warehouse that ends last Friday would
-            # otherwise offer an empty list every Monday.
-            newest = r.rows('SELECT max("ChargePeriodStart") AS d FROM costs', 1)
+            # otherwise offer an empty list every Monday. Read from the rollup: under a scope
+            # `costs` is a view over the detail table, and on a 16.9M-row estate this max()
+            # alone outlasted FILTER_BUDGET_MS for any selection -- even one subscription --
+            # and emptied the whole bar. The rollup carries the same dates in its grain.
+            newest = r.rows(f'SELECT max("ChargePeriodStart") AS d FROM {r.agg}', 1)
             hi = newest[0]["d"] if newest and newest[0]["d"] else None
             if not hi:
                 return {"dimensions": {}, "empty": True}

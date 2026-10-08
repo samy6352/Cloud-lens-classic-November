@@ -824,7 +824,7 @@ async function renderCommitments(token) {
       {
         label: "Spot",
         value: c.spot_pct == null ? "—" : `${c.spot_pct}%`,
-        sub: s.empty ? "no Spot usage" : `saved ${esc(currencyAmountList(s.totals_by_currency, "total_saved", money)
+        sub: s.error ? "Spot savings unavailable" : s.empty ? "no Spot usage" : `saved ${esc(currencyAmountList(s.totals_by_currency, "total_saved", money)
           || nativeAmount(s.total_saved, s.currency || cur, money))}`,
       },
       {
@@ -835,6 +835,7 @@ async function renderCommitments(token) {
           ? "reservations and plans" : "none returned by inventory",
       },
     ])}
+    ${s.error ? `<p class="muted warn" data-commitment-gap>${esc(s.error)}</p>` : ""}
 
     <div id="mixChart" class="card chart-card"></div>
 
@@ -897,6 +898,9 @@ async function renderCommitments(token) {
               ? ` Showing ${inv.returned_count ?? inv.commitments.length} of ${inv.count} commitment records; table totals cover shown records.` : ""}`,
             { key: `What you already hold|Benefit|Kind|Currency|Covers|Resources|Cost, ${inv.days}d` }
           )
+        : inv.error
+        ? `<section class="card"><h3>Existing commitments</h3>
+           <p class="muted empty">${esc(inv.error)}</p></section>`
         : `<section class="card"><h3>Existing commitments</h3>
            <p class="muted empty">No commitment records were returned. Missing billing attribution is not
              proof of no reservations or savings plans. Refresh FOCUS report to load effective-cost
@@ -913,7 +917,7 @@ async function renderCommitments(token) {
     }
 
     ${
-      !s.empty
+      !s.empty && !s.error
         ? table(
             "Monthly Spot savings",
             Object.keys(s.trend_by_currency || {}).length
@@ -1083,6 +1087,10 @@ function comparisonPanel(cmp, cur, suffix = "") {
       ${cmp.verdict ? `<div class="banner">${esc(cmp.verdict)}</div>` : ""}
 
       <div class="cmp-grid">${models.map(card).join("")}</div>
+      ${cmp.baseline && cmp.baseline.annual == null && cmp.baseline.unavailable_reason
+        ? `<p class="muted note" id="cmpBaselineReason${suffix}">Annual costs are not shown: ${
+            esc(cmp.baseline.unavailable_reason)}</p>`
+        : ""}
 
       <div id="cmpChart${suffix}" class="chart-card"></div>
 
