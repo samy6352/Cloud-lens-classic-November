@@ -72,7 +72,10 @@ export function savingsPresentation(data = {}, error = null, now = Date.now()) {
   const sourceErrors = Object.entries(progress.errors || {});
   const sourceNames = sourceErrors.map(([name]) => name).join(", ");
   const warning = sourceErrors.map(([name, reason]) => `${name}: ${reason || "source failed"}`).join("; ");
-  const failed = error || (progress.status === "error" ? warning || "One or more sources failed." : "");
+  // Azure refusing this identity is a finished answer, not a refresh that failed.
+  const access = !error && data.partial_basis === "access" && progress.status !== "running";
+  const failed = error || (progress.status === "error" && !access
+    ? warning || "One or more sources failed." : "");
   const generated = freshness.generated_at;
   const stamp = generated ? new Date(generated) : null;
   const validStamp = stamp && Number.isFinite(stamp.getTime());
@@ -87,10 +90,11 @@ export function savingsPresentation(data = {}, error = null, now = Date.now()) {
   let state = failed ? `Refresh failed${(data.opportunities || []).length ? " — previous results kept" : ""}`
     : running ? `${freshness.cached && stale ? "Stale cached results — refreshing"
       : freshness.cached ? "Refreshing cached results" : "Scanning"} · ${(progress.completed || []).length}/${progress.total || 4} sources complete`
-    : warning ? `Scan complete with warnings — unavailable: ${sourceNames}${stale ? " · stale results" : ""}`
+    : warning ? `${access ? "Scan complete — not readable with this identity"
+      : "Scan complete with warnings — unavailable"}: ${sourceNames}${stale ? " · stale results" : ""}`
     : stale ? "Stale results — refresh needed"
     : freshness.cached ? "Cached results" : "Scan complete";
   if (running && warning) state += ` · warnings: ${sourceNames}`;
-  return { generated, stamp, validStamp, age, ageText, stale, running, state, failed, warning,
+  return { generated, stamp, validStamp, age, ageText, stale, running, state, failed, warning, access,
     provisional: !freshness.cached && (progress.status === "running" || Boolean(freshness.refreshing)) };
 }

@@ -76,7 +76,7 @@ async function renderSavings(token) {
 
 function savingsStatusMarkup() {
   const data = savingsData || {};
-  const { generated, stamp, validStamp, ageText, running, state, failed, warning, provisional } =
+  const { generated, stamp, validStamp, ageText, running, state, failed, warning, access, provisional } =
     savingsPresentation(data, savingsError);
   return `<section class="card sv-status${failed || warning ? " sv-status-error" : ""}" id="svStatus">
     <div class="fr-actions">
@@ -89,7 +89,9 @@ function savingsStatusMarkup() {
       <button type="button" id="svRefresh" class="ghost" ${running ? "disabled" : ""}>${running ? "Refreshing…" : "Refresh scan"}</button>
     </div>
     ${failed ? `<p class="muted warn">${esc(failed)}</p>` : ""}
-    ${warning && warning !== failed ? `<p class="muted warn">Latest scan source failures: ${esc(warning)}</p>` : ""}
+    ${warning && warning !== failed ? `<p class="muted warn">${access
+      ? "Azure refused this identity, so these sources are unreadable until it can read a selected subscription —"
+      : "Latest scan source failures:"} ${esc(warning)}</p>` : ""}
     ${provisional ? '<p class="muted note">Provisional totals: incoming findings are deduplicated; counts and totals may change.</p>' : ""}
     ${running && (data.opportunities || []).length ? '<p class="muted note">Cards and inputs remain available during the scan.</p>' : ""}
   </section>`;
@@ -141,6 +143,8 @@ function paintSavings(d, token) {
       ${savingsStatusMarkup()}${kpiRow([{ label: "Opportunities", value: "0" }])}</section>
       <p class="muted empty">${d.scan?.status === "running"
         ? "Scanning — opportunities will appear as sources finish."
+        : d.partial_basis === "access"
+          ? "Azure refused this identity for some sources; the result covers only what it can read."
         : d.scan?.status === "error" || Object.keys(d.scan?.errors || {}).length
           ? "Some sources could not be read; the result is incomplete."
         : "No savings opportunities found in this scope."}

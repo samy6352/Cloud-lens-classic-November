@@ -448,6 +448,25 @@ class SavingsProgressTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sources.calls), 4)
         self.assertFalse(main._savings_pending)
 
+    async def test_a_scan_refused_only_by_access_is_a_finished_answer(self):
+        """Live Scale, 8 Oct: every source refused this identity, so the panel said "Refresh
+        failed / No completed scan yet" although the scan had finished."""
+        from app.waste import NoVisibleSubscriptions
+
+        sources = self.sources({name: NoVisibleSubscriptions() for name in savings.SCAN_SOURCES})
+        sources.release()
+        await self.poll()
+        await self.drain()
+        for _ in range(3):
+            result = await self.poll()
+            self.assertEqual(result["partial_basis"], "access")
+            self.assertEqual(result["scan"]["status"], "error")
+            self.assertIsNotNone(result["freshness"]["generated_at"])
+            self.assertTrue(result["freshness"]["cached"])
+            self.assertFalse(result["freshness"]["stale"])
+            self.assertFalse(result["freshness"]["refreshing"])
+        self.assertEqual(len(sources.calls), 4)
+
     async def test_failed_revalidation_keeps_old_data_and_throttles_retries(self):
         sources = self.sources()
         sources.release()

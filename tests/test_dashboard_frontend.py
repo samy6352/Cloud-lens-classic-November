@@ -309,6 +309,17 @@ assert.equal(status.warning, "advisor: Access denied; rightsizing: Timed out");
 assert.doesNotMatch(status.warning, /waste|old cached/);
 assert.equal(status.running, false, "source warnings still allow Refresh scan");
 assert.equal(status.provisional, false);
+const refused = {...complete, partial_basis:"access",
+  scan:{...complete.scan,status:"error",errors:{advisor:"Advisor could not be read",waste:"None readable"}}};
+status = savingsPresentation(refused, null, generated + 1000);
+assert.equal(status.failed, "", "an access refusal is a finished answer, not a failed refresh");
+assert.equal(status.access, true);
+assert.match(status.state, /^Scan complete . not readable with this identity: advisor, waste$/);
+assert.equal(status.running, false);
+assert.match(savingsPresentation(refused, "network down", generated + 1000).state, /^Refresh failed/,
+  "a request error is still a failure");
+assert.match(savingsPresentation({...refused, partial_basis:undefined}, null, generated + 1000).state,
+  /^Refresh failed/, "other all-source failures are still failures");
 
 let current = 1, now = generated, requests = 0, nextId = 0;
 const timers = new Map(), seen = [];

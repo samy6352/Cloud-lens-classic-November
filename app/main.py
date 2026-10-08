@@ -4096,7 +4096,9 @@ def _start_savings(user: User, picked: list[str], window: int, currency: str, *,
                     list(scope) or None, days=window, currency=currency, on_progress=progress)
             state.partial = result
             state.scan = {**result["scan"], "revision": state.scan["revision"] + 1}
-            if state.scan["status"] != "error":
+            # A scan Azure refused outright still finished: it is this identity's answer,
+            # not a failed refresh to hide behind older data.
+            if state.scan["status"] != "error" or result.get("partial_basis") == "access":
                 state.result = result
                 state.generated_time = asyncio.get_running_loop().time()
                 state.generated_at = datetime.now(UTC).isoformat()
