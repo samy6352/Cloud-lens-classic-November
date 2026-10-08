@@ -218,6 +218,16 @@ def _failure(exc: Exception) -> str:
     return "Azure lifecycle metadata could not be read; no permissions were changed."
 
 
+def _issue(source: str, exc: Exception) -> dict:
+    """An unavailable entry, marked when only this identity's access can change it."""
+    issue = {"source": source, "reason": _failure(exc)}
+    text = str(exc).lower()
+    if cost.access_denied(exc) or "403" in text or "authorizationfailed" in text \
+            or "forbidden" in text or "invalidauthenticationtokentenant" in text:
+        issue["access"] = True
+    return issue
+
+
 async def _get_metadata(url: str, *, params: dict | None = None) -> dict:
     """Billing metadata has its own bounded transport, not the cost-query semaphore."""
     target = urlsplit(url)
@@ -352,7 +362,7 @@ async def build(scopes: list[str], currency: str | None = None, *, days: int = 3
                 return
             except Exception as exc:
                 last = exc
-        issue = {"source": "benefit metadata", "reason": _failure(last)}
+        issue = _issue("benefit metadata", last)
         # Never disclose identifiers for failed, not-yet-attributed purchased benefits.
         if observed:
             issue["id"] = rid
@@ -412,7 +422,7 @@ async def build(scopes: list[str], currency: str | None = None, *, days: int = 3
         try:
             await collection(path, token)
         except Exception as exc:
-            unavailable.append({"source": path, "reason": _failure(exc)})
+            unavailable.append(_issue(path, exc))
 
     try:
         async with asyncio.timeout(LIFECYCLE_TIMEOUT):

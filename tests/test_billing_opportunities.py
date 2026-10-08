@@ -191,6 +191,42 @@ class OpportunityTests(unittest.IsolatedAsyncioTestCase):
     async def test_all_source_failure_is_not_zero(self):
         result = await self.run_build(unavailable={"advisor": "403", "waste": "timeout"})
         self.assertIsNone(result["potential"]["monthly"])
+        self.assertNotIn("partial_basis", result, "an undeclared scan gap stays retryable")
+
+    async def test_gaps_that_are_all_access_refusals_are_declared(self):
+        # Live Scale, 8 Oct: the scan was refused by tenant/visibility and reservation
+        # metadata by 403, so this report was "Refresh failed" on every view.
+        denied = {"advisor": "Advisor could not be read for any selected subscription."}
+        refused = [{"source": "benefit metadata", "reason": "Azure denied read access (403).",
+                    "access": True},
+                   {"source": "Microsoft.Capacity", "id": RI, "fields": ["expires_on"],
+                    "reason": "Expiry/utilisation not supplied or not safely scope-attributable."}]
+        self.inventory.return_value = {"items": [{"id": RI}], "unavailable": refused,
+                                       "partial": True, "native_billing_currencies": ["USD"]}
+        result = await self.run_build(unavailable=denied, partial=True, partial_basis="access")
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["partial_basis"], "access")
+        for inventory_gap, scan in (
+            ({"source": "lifecycle", "reason": "The bounded Azure lifecycle read timed out."},
+             {"partial_basis": "access"}),
+            ({"source": "warehouse", "reason": "Observed commitment inventory is unavailable."},
+             {"partial_basis": "access"}),
+            (None, {}),
+        ):
+            with self.subTest(inventory_gap=inventory_gap, scan=scan):
+                self.inventory.return_value = {
+                    "items": [{"id": RI}], "partial": True, "native_billing_currencies": ["USD"],
+                    "unavailable": refused + ([inventory_gap] if inventory_gap else [])}
+                result = await self.run_build(unavailable=denied, partial=True, **scan)
+                self.assertNotIn("partial_basis", result)
+
+    def test_only_refused_provider_reads_are_marked_as_access(self):
+        self.assertTrue(lifecycle._issue("x", RuntimeError("HTTP 403 Forbidden"))["access"])
+        self.assertTrue(lifecycle._issue("x", cost.CostError(
+            "InvalidAuthenticationTokenTenant", status_code=401))["access"])
+        for exc in (TimeoutError(), RuntimeError("HTTP 500"),
+                    cost.CostError("expired token (401)", status_code=401)):
+            self.assertNotIn("access", lifecycle._issue("x", exc))
 
     async def test_outer_scan_failure_preserves_inventory(self):
         self.scan.side_effect = RuntimeError("offline")

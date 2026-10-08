@@ -219,6 +219,24 @@ def _lifecycle_opportunities(inventory: dict, target: str | None) -> list[dict]:
     return rows
 
 
+def _access_only(scan_result: dict, scan_failed: bool, inventory: dict, unknown: bool) -> bool:
+    """Every gap is Azure refusing this identity, so a retry returns the same report.
+
+    Live Scale, 8 Oct: cost-only subscriptions (401 wrong tenant, no Resource Graph
+    visibility) and reservation metadata (403) left this report partial on every view; the
+    snapshot cache then treated it as a failed refresh and the page polled it for minutes.
+    A timeout, throttle, unpriced row or warehouse gap is not access and keeps that retry.
+    """
+    if scan_failed or unknown:
+        return False
+    if ((scan_result.get("unavailable") or scan_result.get("partial"))
+            and scan_result.get("partial_basis") != "access"):
+        return False
+    entries = inventory.get("unavailable") or []
+    return all(isinstance(e, dict) and (e.get("access") is True or bool(e.get("fields")))
+               for e in entries)
+
+
 async def build(scopes: list[str], currency: str | None = None, *, days: int = 30) -> dict[str, Any]:
     """Called inside main.as_user, with an explicit, already-authorized subscription set."""
     if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 365:
@@ -312,9 +330,11 @@ async def build(scopes: list[str], currency: str | None = None, *, days: int = 3
         warnings.append("Some opportunities have unavailable prices/currency; potential is only the priced subset.")
     rows.extend(_lifecycle_opportunities(inventory, target))
     partial = bool(source_failed or unknown or inventory.get("partial"))
+    access = partial and _access_only(scan_result, scan_failed, inventory, unknown)
     return {
         "status": "error" if (scan_failed or (scan_result.get("scan") or {}).get("status") == "error")
         and not inventory.get("items") else "partial" if partial else "ok",
+        **({"partial_basis": "access"} if access else {}),
         "opportunities": rows,
         "potential": {
             "monthly": _money(monthly), "annual": _money(annual), "currency": target,

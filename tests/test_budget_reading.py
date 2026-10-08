@@ -276,7 +276,8 @@ class BudgetReads(unittest.IsolatedAsyncioTestCase):
             response = await main.list_budgets(
                 SimpleNamespace(state=SimpleNamespace()), scope=",".join(ids))
         result = json.loads(response.body)
-        self.assertEqual(result, {"budgets": [], "count": 0, "unreadable": message})
+        self.assertEqual(result, {"budgets": [], "count": 0, "unreadable": message,
+                                  "partial_basis": "access"})
         self.assertTrue(_cacheable_report(result))
         self.assertFalse(_cacheable_report({"budgets": [], "count": 0, "error": message}))
 

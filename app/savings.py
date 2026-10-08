@@ -759,6 +759,7 @@ async def build(subs: list[str] | None, days: int,
     """
     from . import shutdown as shutdown_mod
     from . import waste as waste_mod
+    from .cost import access_denied
 
     jobs = {
         "waste": waste_mod.find_waste(subscription_ids=subs, days=days, top=60),
@@ -769,6 +770,7 @@ async def build(subs: list[str] | None, days: int,
     started = time.monotonic()
     data: dict[str, Any] = {}
     failed: dict[str, str] = {}
+    denied: set[str] = set()
     completed: list[str] = []
 
     async def read(name: str, job: Any) -> tuple[str, Any]:
@@ -789,6 +791,8 @@ async def build(subs: list[str] | None, days: int,
             completed.append(name)
             if isinstance(res, Exception):
                 failed[name] = _issue_text(str(res) or type(res).__name__)
+                if access_denied(res):
+                    denied.add(name)
             elif not isinstance(res, dict):
                 failed[name] = "The source returned an invalid response."
             else:
@@ -797,6 +801,11 @@ async def build(subs: list[str] | None, days: int,
                          or ("The source returned partial results." if res.get("partial") else None))
                 if issue:
                     failed[name] = _issue_text(issue)
+                    errors = res.get("errors")
+                    if (isinstance(errors, list) and errors
+                            and all(isinstance(e, dict) and e.get("access_denied") is True
+                                    for e in errors)):
+                        denied.add(name)
             if name in failed:
                 log.warning("savings: %s unavailable: %s", name, failed[name])
             # Rebuild from raw inputs, never incrementally mutate the previous merge: a late
@@ -815,6 +824,9 @@ async def build(subs: list[str] | None, days: int,
                 "status": status, "completed": list(completed), "total": len(SCAN_SOURCES),
                 "errors": dict(result["unavailable"]), "revision": len(completed),
             }
+            if status != "running" and access_only(result, denied):
+                # Asking again gives the same answer until access changes; see snapshot_cache.
+                result["partial_basis"] = "access"
             if on_progress:
                 on_progress(result)
         return result
@@ -823,6 +835,13 @@ async def build(subs: list[str] | None, days: int,
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def access_only(result: dict[str, Any], denied: set[str]) -> bool:
+    """Partial only because Azure refused this identity, never for a cause that can clear."""
+    unavailable = result.get("unavailable") or {}
+    return bool(result.get("partial") and unavailable and set(unavailable) <= denied
+                and not result.get("unpriced_count") and not result.get("unconverted"))
 
 
 def assemble(data: dict[str, Any], failed: dict[str, str], days: int,

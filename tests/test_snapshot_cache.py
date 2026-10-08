@@ -879,10 +879,56 @@ def test_partial_coverage_the_data_itself_explains_is_kept_until_the_data_change
 
 
 @pytest.mark.parametrize("body", [
+    # Savings on live Scale, 8 Oct: every source refused this identity; scan.status "error".
+    {"opportunities": [], "count": 0, "partial": True, "partial_basis": "access",
+     "unavailable": {"advisor": "Advisor could not be read for any selected subscription."},
+     "scan": {"status": "error", "completed": ["advisor"], "total": 1,
+              "errors": {"advisor": "Advisor could not be read for any selected subscription."}}},
+    # Billing opportunities: reservation metadata 403 and no priced row.
+    {"status": "partial", "partial_basis": "access", "opportunities": [],
+     "potential": {"monthly": None, "annual": None, "partial": True},
+     "commitments": {"items": [], "partial": True, "unavailable": [
+         {"source": "benefit metadata", "reason": "Azure denied read access (403).",
+          "access": True}]}},
+    {"budgets": [], "count": 0, "unreadable": "None of the 2 selected subscriptions can be "
+     "read live by this identity.", "partial_basis": "access"},
+])
+def test_access_refusals_are_kept_for_the_partial_window_not_re_polled(body):
+    """Live Scale, 8 Oct: these came back `source_incomplete` on every view, so the status
+    line said "Refresh failed" and the page re-polled answers no retry could change."""
+    from app.snapshot_cache import PARTIAL_TTL
+
+    async def scenario():
+        now = [1000.0]
+        store, auth, calls = MemoryStore(), Authorize(), []
+        cache = SnapshotCache(store, version="calculation-v1",
+                              policies={PATH: Policy("monitor", 86400, 604800)},
+                              clock=lambda: now[0])
+
+        async def origin():
+            calls.append(1)
+            return JSONResponse(body)
+
+        first = await cache.get(request(), origin, auth)
+        assert "x-cloudlens-refresh-error" not in first.headers
+        item = next(iter(store.rows.values()))
+        assert item.expires == item.created + min(86400, PARTIAL_TTL)
+        hit = await cache.get(request(), origin, auth)
+        assert hit.headers["x-cloudlens-cache"] == "hit"
+        assert "x-cloudlens-refresh-error" not in hit.headers
+        assert calls == [1]
+        await cache.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("body", [
     {"anomalies": [], "partial": True, "unavailable": True, "partial_basis": "source"},
     {"anomalies": [], "partial": True, "unavailable": True},
     {"anomalies": [], "partial": True, "partial_basis": "data", "error": "receipts unreadable"},
     {"status": "running", "partial": True, "partial_basis": "data"},
+    {"partial": True, "partial_basis": "access", "error": "Azure refused"},
+    {"partial": True, "partial_basis": "access", "scan": {"status": "running"}},
 ])
 def test_only_a_clean_data_basis_makes_an_empty_partial_report_cacheable(body):
     async def scenario():

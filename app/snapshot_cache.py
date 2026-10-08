@@ -12,6 +12,8 @@ requests await source completion. Coverage is independent of freshness: complete
 partial reports retain their original evidence and X-CloudLens-Coverage=partial.
 A report whose partial coverage is a property of the committed data declares
 `"partial_basis": "data"` and is kept like any complete answer until the data changes.
+One partial only because Azure refused this identity declares `"access"` and is kept
+for PARTIAL_TTL, so a view does not re-poll an answer no retry can change.
 Poll using ETag plus As-Of/Stale/Revalidating headers, including on HTTP 304.
 
 AI Billing alone reuses a whole report until the scoped imported data day changes
@@ -666,7 +668,17 @@ def _has_evidence(value: Any, *, row=False) -> bool:
 
 
 def _cacheable_report(value: Any) -> bool:
-    if not isinstance(value, (dict, list)) or not _safe_content(value) or _unfinished(value):
+    if not isinstance(value, (dict, list)) or not _safe_content(value):
+        return False
+    # Partial because Azure refused this identity -- not readable live, a missing role,
+    # another tenant's token. A failed source is named in the report, not still running, and
+    # asking again returns the same report until access changes, so it is kept (for
+    # PARTIAL_TTL, see `_eligible`) instead of being re-polled as a failed refresh.
+    if (isinstance(value, dict) and value.get("partial_basis") == "access"
+            and not _unfinished(value, states=_ACTIVE)
+            and not any(value.get(key) for key in ("error", "errors", "problem"))):
+        return True
+    if _unfinished(value):
         return False
     if isinstance(value, dict) and any(value.get(key) for key in ("error", "errors", "problem")):
         return False
@@ -779,6 +791,11 @@ def _eligible(response: Response, limit: int, old_body: bytes | None, full_ttl: 
     """
     body = _body(response, limit)
     ttl = full_ttl
+    complete = body is not None
+    if body is not None and _access_basis(body):
+        # Kept like a complete answer, but only as long as a partial one: access is granted
+        # outside this app, and the view should notice within the hour that it was.
+        ttl = min(full_ttl, PARTIAL_TTL)
     if body is None and not _pending_body(response, limit):
         # A complete answer about incomplete evidence -- one subscription
         # throttled, some days not yet verified -- is still the answer the
@@ -796,10 +813,21 @@ def _eligible(response: Response, limit: int, old_body: bytes | None, full_ttl: 
         value["snapshot"] = {"cadence": "data-day", "data_day": data_day}
         response.body = json.dumps(value, separators=(",", ":"), ensure_ascii=True).encode()
         response.headers["Content-Length"] = str(len(response.body))
-        body = (_body(response, limit) if ttl == full_ttl
+        body = (_body(response, limit) if complete
                 else _partial_body(response, limit))
     pending = body is None and _pending_body(response, limit)
     return body, ttl, pending
+
+
+def _access_basis(body: bytes) -> bool:
+    """The report declares its gaps are access refusals (see `_cacheable_report`)."""
+    if b'"partial_basis"' not in body:
+        return False
+    try:
+        value = json.loads(body)
+    except (ValueError, UnicodeError):
+        return False
+    return isinstance(value, dict) and value.get("partial_basis") == "access"
 
 
 def _pending_body(response: Response, limit: int) -> bool:

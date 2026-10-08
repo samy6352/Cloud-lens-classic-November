@@ -19,7 +19,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .cost import ARM, CostError, azure, list_subscriptions
+from .cost import ARM, CostError, access_denied, azure, list_subscriptions
 
 log = logging.getLogger("cloudlens.waste")
 
@@ -325,11 +325,16 @@ class NoVisibleSubscriptions(CostError):
     removed or another tenant's) that this identity cannot read live.
     """
 
+    denied_access = True
+
     def __init__(self) -> None:
         super().__init__(
             "None of the selected subscriptions can be read live by this identity, so the "
             "resource scan could not run. Include at least one subscription it can access.",
             status_code=400)
+
+    def __reduce__(self):
+        return (type(self), ())
 
 
 async def _arg(
@@ -885,7 +890,7 @@ async def advisor_recommendations(subscription_ids: list[str] | None = None,
 
     results = await asyncio.gather(*(one(s) for s in subs), return_exceptions=True)
     recs = [r for res in results if isinstance(res, list) for r in res]
-    errors = [{"subscription_id": sub, "error": str(result)}
+    errors = [{"subscription_id": sub, "error": str(result), "access_denied": access_denied(result)}
               for sub, result in zip(subs, results) if isinstance(result, Exception)]
     recs.sort(key=lambda r: r["annual_savings"] or 0, reverse=True)
 

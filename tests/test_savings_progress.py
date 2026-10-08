@@ -207,6 +207,80 @@ class SavingsProgressTests(unittest.IsolatedAsyncioTestCase):
         self.assertRegex(errors["waste"], r"\w…$")
         self.assertNotRegex(errors["waste"][:-1], r"\s$")
 
+    async def test_a_scan_refused_only_by_access_declares_it_for_the_snapshot_cache(self):
+        """Live Scale, 8 Oct: cost-only subscriptions are another tenant's (401) and invisible
+        to Resource Graph, so every source failed the same way on every view."""
+        from app.cost import CostError, SubscriptionsNotReadable
+        from app.waste import NoVisibleSubscriptions
+
+        wrong_tenant = CostError("Azure rejected the credential (401). Azure said: "
+                                 '{"error":{"code":"InvalidAuthenticationTokenTenant"}}',
+                                 status_code=401)
+        sources = self.sources({
+            "waste": NoVisibleSubscriptions(),
+            "rightsizing": NoVisibleSubscriptions(),
+            "shutdown": SubscriptionsNotReadable(2, ["Host"]),
+            "advisor": {"recommendations": [], "partial": True,
+                        "error": "Advisor could not be read for any selected subscription.",
+                        "errors": [{"subscription_id": "a", "error": str(wrong_tenant),
+                                    "access_denied": True}]},
+        })
+        sources.release()
+        result = await savings.build(None, 30)
+        self.assertEqual(result["scan"]["status"], "error")
+        self.assertEqual(result["partial_basis"], "access")
+
+    async def test_any_retryable_failure_keeps_the_scan_retryable(self):
+        from app.cost import CostError
+        from app.waste import NoVisibleSubscriptions
+
+        for advisor in (
+            CostError("Azure is still rate-limiting cost queries", status_code=429),
+            CostError("Azure rejected the credential (401): token expired", status_code=401),
+            {"recommendations": [], "partial": True, "errors": [
+                {"subscription_id": "a", "error": "denied", "access_denied": True},
+                {"subscription_id": "b", "error": "timed out", "access_denied": False}]},
+            TimeoutError("slow"),
+        ):
+            with self.subTest(advisor=advisor):
+                sources = self.sources({
+                    "waste": NoVisibleSubscriptions(),
+                    "rightsizing": NoVisibleSubscriptions(),
+                    "shutdown": NoVisibleSubscriptions(),
+                    "advisor": advisor,
+                })
+                sources.release()
+                result = await savings.build(None, 30)
+                self.assertNotIn("partial_basis", result)
+
+    def test_access_denied_names_only_refusals_that_cannot_clear_on_their_own(self):
+        from app.cost import CostError, SubscriptionsNotReadable, access_denied
+        from app.waste import NoVisibleSubscriptions
+
+        self.assertTrue(access_denied(NoVisibleSubscriptions()))
+        self.assertTrue(access_denied(SubscriptionsNotReadable(1, [])))
+        self.assertTrue(access_denied(CostError("role", status_code=403)))
+        self.assertTrue(access_denied(CostError("InvalidAuthenticationTokenTenant",
+                                                status_code=401)))
+        self.assertFalse(access_denied(CostError("token expired", status_code=401)))
+        self.assertFalse(access_denied(CostError("throttled", status_code=429)))
+        self.assertFalse(access_denied(CostError("no status")))
+        self.assertFalse(access_denied(TimeoutError("403")))
+
+    async def test_advisor_marks_each_refused_subscription(self):
+        from app.cost import CostError
+
+        failures = {"a": CostError("x InvalidAuthenticationTokenTenant", status_code=401),
+                    "b": CostError("throttled", status_code=429)}
+
+        async def refuse(method, url, params=None):
+            raise failures["a" if "/subscriptions/a/" in url else "b"]
+
+        with patch.object(waste.azure, "request", AsyncMock(side_effect=refuse)):
+            result = await waste.advisor_recommendations(subscription_ids=["a", "b"])
+        flags = {e["subscription_id"]: e["access_denied"] for e in result["errors"]}
+        self.assertEqual(flags, {"a": True, "b": False})
+
     def test_issue_text_keeps_short_text_and_cuts_long_text_at_a_word(self):
         self.assertEqual(savings._issue_text("metrics forbidden"), "metrics forbidden")
         self.assertEqual(savings._issue_text({"a_b": ["x", "y"]}), "a b: x; y")

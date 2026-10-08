@@ -199,11 +199,30 @@ def forget(url_fragment: str) -> int:
 class CostError(RuntimeError):
     """Something the caller can act on; surfaced to the model as text."""
 
+    # Set by subclasses whose cause is the identity's access, not the moment it asked.
+    denied_access = False
+
     def __init__(self, message: str, *, status_code: int | None = None,
                  retry_after: str | None = None):
         super().__init__(message)
         self.status_code = status_code
         self.retry_after = retry_after
+
+
+def access_denied(exc: BaseException) -> bool:
+    """A refusal asking again cannot change until access does.
+
+    No readable subscription, a missing role (403), or a token for another tenant (401
+    InvalidAuthenticationTokenTenant -- live Scale's cost-only subscriptions). An expired
+    token, throttling, timeouts and 5xx are not: they clear on their own, so they stay
+    failures a view retries.
+    """
+    if getattr(exc, "denied_access", False):
+        return True
+    if not isinstance(exc, CostError):
+        return False
+    return exc.status_code == 403 or (
+        exc.status_code == 401 and "InvalidAuthenticationTokenTenant" in str(exc))
 
 
 class SubscriptionsNotReadable(CostError):
@@ -214,7 +233,10 @@ class SubscriptionsNotReadable(CostError):
     and names what can be read, so the sentence says what to change.
     """
 
+    denied_access = True
+
     def __init__(self, requested: int, readable: list[str]):
+        self.requested, self.readable = requested, list(readable)
         noun = "subscription" if requested == 1 else "subscriptions"
         shown = ", ".join(readable[:10])
         more = f" and {len(readable) - 10} more" if len(readable) > 10 else ""
@@ -223,6 +245,10 @@ class SubscriptionsNotReadable(CostError):
         super().__init__(
             f"None of the {requested} selected {noun} can be read live by this identity."
             + tail)
+
+    def __reduce__(self):
+        # Exceptions copy and pickle through `args`, which holds the sentence, not these.
+        return (type(self), (self.requested, self.readable))
 
 
 # Whose Azure access a call runs under. Set per request when someone is signed in with Entra,
