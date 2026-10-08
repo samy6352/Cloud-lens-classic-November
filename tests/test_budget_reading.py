@@ -242,6 +242,81 @@ class BudgetReads(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(rows[2]["filter_exact"])
         self.assertTrue(rows[2]["trend"]["filtered_exactly"])
 
+    async def test_unreadable_selection_is_a_sentence_and_a_cacheable_answer(self):
+        # Live Scale, 8 Oct: the Budgets tab printed "None of ['4e98...', ...] match a
+        # subscription you can see", and as an `error` the snapshot cache marked it a refresh
+        # failure, so the page polled /api/budgets again and again for the same answer.
+        from app import cost, main
+        from app.snapshot_cache import _cacheable_report
+
+        ids = ["4e9813b8-a62c-4fc4-9c2e-6202d43c362c", "9d2f1355-38da-4346-abb8-67c8990e2367"]
+        with patch.object(cost, "list_subscriptions", AsyncMock(return_value={
+                "subscriptions": [{"id": "host-id", "name": "Host"}]})), \
+                self.assertRaises(cost.SubscriptionsNotReadable) as raised:
+            await cost.budgets(ids)
+        message = str(raised.exception)
+        self.assertIsInstance(raised.exception, cost.CostError)
+        self.assertIn("None of the 2 selected subscriptions can be read live", message)
+        self.assertIn("It can read: Host.", message)
+        self.assertNotIn("[", message)
+        self.assertNotIn(ids[0], message)
+        self.assertIsNone(raised.exception.status_code)
+
+        user = SimpleNamespace(admin=True, source="local", name="test", sid="test")
+
+        @asynccontextmanager
+        async def acting_as(_user):
+            yield
+
+        with patch.object(main, "current_user", return_value=user), \
+                patch.object(main, "permitted", AsyncMock(return_value=ids)), \
+                patch.object(main, "narrow", return_value=ids), \
+                patch.object(main, "as_user", acting_as), \
+                patch.object(cost, "budgets", AsyncMock(side_effect=raised.exception)):
+            response = await main.list_budgets(
+                SimpleNamespace(state=SimpleNamespace()), scope=",".join(ids))
+        result = json.loads(response.body)
+        self.assertEqual(result, {"budgets": [], "count": 0, "unreadable": message})
+        self.assertTrue(_cacheable_report(result))
+        self.assertFalse(_cacheable_report({"budgets": [], "count": 0, "error": message}))
+
+    async def test_other_budget_failures_still_report_an_error(self):
+        from app import cost, main
+
+        user = SimpleNamespace(admin=True, source="local", name="test", sid="test")
+
+        @asynccontextmanager
+        async def acting_as(_user):
+            yield
+
+        with patch.object(main, "current_user", return_value=user), \
+                patch.object(main, "permitted", AsyncMock(return_value=["a"])), \
+                patch.object(main, "narrow", return_value=["a"]), \
+                patch.object(main, "as_user", acting_as), \
+                patch.object(cost, "budgets", AsyncMock(side_effect=cost.CostError("throttled"))):
+            response = await main.list_budgets(SimpleNamespace(state=SimpleNamespace()), scope="a")
+        result = json.loads(response.body)
+        self.assertEqual(result["error"], "throttled")
+        self.assertNotIn("unreadable", result)
+
+    async def test_names_beyond_ten_are_counted_not_listed(self):
+        from app import cost
+
+        known = [{"id": f"id-{i}", "name": f"Sub {i}"} for i in range(12)]
+        with patch.object(cost, "list_subscriptions",
+                          AsyncMock(return_value={"subscriptions": known})), \
+                self.assertRaises(cost.SubscriptionsNotReadable) as raised:
+            await cost._resolve(["missing"])
+        message = str(raised.exception)
+        self.assertIn("None of the 1 selected subscription can be read", message)
+        self.assertIn("Sub 9 and 2 more.", message)
+        self.assertNotIn("Sub 10", message)
+        with patch.object(cost, "list_subscriptions",
+                          AsyncMock(return_value={"subscriptions": []})), \
+                self.assertRaises(cost.SubscriptionsNotReadable) as raised:
+            await cost._resolve(["missing"])
+        self.assertIn("cannot read any subscription live", str(raised.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

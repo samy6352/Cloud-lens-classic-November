@@ -169,11 +169,12 @@ function fieldLabel(key) {
       .replace(/\b(id|ids|cpu|ram|sku|vm|vms|url|uri|ip|os|gb|mb|usd)\b/gi, word => word.toUpperCase());
 }
 
-function numericText(value, key, currency) {
+// `locale` undefined is the browser's, as the table cells use; tests pin one to stay portable.
+function numericText(value, key, currency, locale) {
   if (!Number.isFinite(value)) return String(value);
   const label = words(key).toLowerCase();
   if (/(?:^|\s)(?:pct|percent)$/.test(label)) {
-    return `${new Intl.NumberFormat("en-US", { maximumSignificantDigits: 15 }).format(value)}%`;
+    return `${new Intl.NumberFormat(locale, { maximumSignificantDigits: 15 }).format(value)}%`;
   }
   // `previous` and `delta` sit beside `cost` in spend rows and are the same money; printed
   // bare they read as a different, unlabelled quantity.
@@ -182,18 +183,18 @@ function numericText(value, key, currency) {
     && !/(?:percent|pct|ratio|count|hours|days)/.test(label);
   if (currency && money) {
     try {
-      return new Intl.NumberFormat("en-US", {
+      return new Intl.NumberFormat(locale, {
         style: "currency", currency, maximumSignificantDigits: 15,
       }).format(value);
     } catch (error) {
       if (!(error instanceof RangeError)) throw error;
     }
   }
-  return new Intl.NumberFormat("en-US", { maximumSignificantDigits: 15 }).format(value);
+  return new Intl.NumberFormat(locale, { maximumSignificantDigits: 15 }).format(value);
 }
 
 /** Escaped definition lists with native expandable details; no DOM or network dependencies. */
-export function rowDetailsMarkup(row, { currency, title, stateKey } = {}) {
+export function rowDetailsMarkup(row, { currency, title, stateKey, locale } = {}) {
   const state = { nodes: 0, characters: 0, ancestors: new Set() };
   const safeCurrency = typeof currency === "string" && /^[a-z]{3}$/i.test(currency)
     ? currency.toUpperCase() : null;
@@ -226,7 +227,7 @@ export function rowDetailsMarkup(row, { currency, title, stateKey } = {}) {
     state.nodes++;
     if (value === null) return '<span class="explore-value">Not provided (null)</span>';
     if (typeof value !== "object") {
-      const text = typeof value === "number" ? numericText(value, key, safeCurrency)
+      const text = typeof value === "number" ? numericText(value, key, safeCurrency, locale)
         : value === true ? "True" : value === false ? "False" : value === "" ? "(empty string)" : value;
       return `<span class="explore-value">${limitedText(text)}</span>`;
     }

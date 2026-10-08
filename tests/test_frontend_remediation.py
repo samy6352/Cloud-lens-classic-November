@@ -643,3 +643,56 @@ assert.match(t.sub,/per currency; choose a display currency/);
 t=tile({currency:"USD",month_to_date:null,last_month:5});
 assert.equal(t.sub,"needs both months");
 """)
+
+
+def test_row_details_use_the_currency_the_row_was_drawn_in():
+    # Live Scale Overview "By subscription": row "\u20b93,99,88,700.96", details "39,988,700.96".
+    # The table formatted cells with the page currency but never passed it to `table()`, and
+    # with "As billed" the stored display currency is "", so the details had none.
+    run_node(r"""
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import { rowDetailsMarkup } from "./web/assets/dashboard-explore.js";
+const appSource=fs.readFileSync("./web/assets/app.js","utf8");
+const esc=v=>String(v??"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;");
+const fmt=new Function("esc",appSource.slice(appSource.indexOf("const numberFormats"),
+  appSource.indexOf("export { esc"))+";return {money,moneyHtml,probeCurrencies};")(esc);
+const source=fs.readFileSync("./web/assets/dashboard.js","utf8");
+const TABLES=new Map();
+const store={costCurrency:""};
+const api=new Function("TABLES","view","portalTargets","esc","probeCurrencies","sections",
+  "rowDetailsMarkup","readStore",
+  source.slice(source.indexOf("function tableMarkup(id)"),source.indexOf("function pagerMarkup(id)"))
+  +";return {tableMarkup,rowDetailMarkup};")(TABLES,t=>t.rows,()=>[],esc,fmt.probeCurrencies,[],
+  (row,opts)=>rowDetailsMarkup(row,{...opts,locale:"en-US"}),name=>store[name]);
+const state=(rows,columns,extra={})=>({rows,columns,pageSize:10,page:0,explore:true,
+  expanded:new Set(),rowKeys:new Map(rows.map((r,i)=>[r,`k${i}`])),scope:[],title:"By subscription",
+  currency:null,...extra});
+const cur="INR";
+const sub={name:"hbl-azure-ci-datalake-prod-subs",cost:39988700.96,previous:35883353.07,
+  delta:4105347.89,change_pct:11.4,share_pct:19.6};
+TABLES.set("t1",state([sub],[{label:"Subscription",cell:r=>esc(r.name)},
+  {label:"Cost",num:true,cell:r=>fmt.moneyHtml(r.cost,cur,2)}]));
+api.tableMarkup("t1");
+let html=api.rowDetailMarkup("t1",sub,"k0");
+assert.match(html,/<dt>Cost<\/dt><dd><span class="explore-value">\u20b939,988,700\.96</);
+assert.match(html,/<dt>Previous period<\/dt><dd><span class="explore-value">\u20b935,883,353\.07</);
+// The probe is scoped to one row's cells: nothing leaks to formatting outside a table.
+assert.equal(fmt.money(5,"EUR").includes("5"),true);
+// A row drawn in two currencies gets no symbol rather than the wrong one.
+const mixed={name:"x",cost:1,list_cost:2};
+TABLES.set("t2",state([mixed],[{label:"Cost",cell:r=>fmt.money(r.cost,"INR")},
+  {label:"List",cell:r=>fmt.money(r.list_cost,"USD")}]));
+api.tableMarkup("t2");
+html=api.rowDetailMarkup("t2",mixed,"k0");
+assert.doesNotMatch(html,/[\u20b9$]/);
+// An explicit row or table currency still wins over what the cells used.
+TABLES.set("t3",state([{...sub,currency:"USD"}],[{label:"Cost",cell:r=>fmt.money(r.cost,"INR")}]));
+api.tableMarkup("t3");
+assert.match(api.rowDetailMarkup("t3",TABLES.get("t3").rows[0],"k0"),/\$39,988,700\.96/);
+// No money cells at all: fall back to the chosen display currency.
+store.costCurrency="EUR";
+TABLES.set("t4",state([{name:"n",cost:3}],[{label:"Name",cell:r=>esc(r.name)}]));
+api.tableMarkup("t4");
+assert.match(api.rowDetailMarkup("t4",TABLES.get("t4").rows[0],"k0"),/\u20ac3/);
+""")

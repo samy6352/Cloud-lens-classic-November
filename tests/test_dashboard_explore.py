@@ -145,7 +145,7 @@ const row = {
   tags:{owner:"<a href=javascript:bad>owner</a>", environment:"production"},
   evidence:[{metric:"CPU", samples:[0, false, null]}, {message:"<svg/onload=x>"}],
 };
-const html = rowDetailsMarkup(row, {currency:"USD", title:'Details <img src=x onerror="x">'});
+const html = rowDetailsMarkup(row, {currency:"USD", locale:"en-US", title:'Details <img src=x onerror="x">'});
 assert.match(html, /class="explore-fields"/);
 assert.match(html, /<details class="explore-nested">/);
 assert.match(html, /<summary>2 items<\/summary>/);
@@ -159,8 +159,8 @@ assert.match(html, /&lt;script&gt;/); assert.match(html, /&lt;svg\/onload=x&gt;/
 assert.match(html, /&lt;img src=x onerror=&quot;x&quot;&gt;/);
 assert.doesNotMatch(html, /<script|<img|<svg|<a /);
 assert.doesNotMatch(html, /JSON\.stringify|\{"metric"/);
-assert.match(rowDetailsMarkup({cost:123.5}, {currency:"<svg/onload=x>"}), /123\.5/);
-assert.match(rowDetailsMarkup({cost:0.00000001}, {currency:"USD"}), /0\.00000001/);
+assert.match(rowDetailsMarkup({cost:123.5}, {currency:"<svg/onload=x>", locale:"en-US"}), /123\.5/);
+assert.match(rowDetailsMarkup({cost:0.00000001}, {currency:"USD", locale:"en-US"}), /0\.00000001/);
 for (const [value, text] of [[0,"0"], [false,"False"], [null,"Not provided (null)"]]) {
   assert.ok(rowDetailsMarkup(value).includes(text));
 }
@@ -235,7 +235,7 @@ def test_service_row_details_read_as_labelled_money_and_percent():
     run_node(r"""
 const row = {name:"Azure Databricks", cost:58778400.07, previous:52341481.48,
   delta:6436918.59, change_pct:12.3, share_pct:28.8, count:4};
-const html = rowDetailsMarkup(row, {currency:"INR"});
+const html = rowDetailsMarkup(row, {currency:"INR", locale:"en-US"});
 assert.match(html, /<dt>Change<\/dt><dd><span class="explore-value">12\.3%</);
 assert.match(html, /<dt>Share of total<\/dt><dd><span class="explore-value">28\.8%</);
 assert.match(html, /<dt>Previous period<\/dt><dd><span class="explore-value">\u20b952,341,481\.48</);
@@ -243,4 +243,22 @@ assert.match(html, /<dt>Delta<\/dt><dd><span class="explore-value">\u20b96,436,9
 assert.match(html, /<dt>Cost<\/dt><dd><span class="explore-value">\u20b958,778,400\.07</);
 assert.match(html, /<dt>Count<\/dt><dd><span class="explore-value">4</);
 assert.doesNotMatch(html, /pct/i);
+""")
+
+
+def test_row_details_group_digits_like_the_row_by_default():
+    # Live Scale (en-IN browser): row "\u20b93,99,88,700.96", details "39,988,700.96" -- the
+    # details hard-coded en-US grouping while the cells use the browser's locale.
+    run_node(r"""
+const value = 39988700.96;
+const html = rowDetailsMarkup({cost:value}, {currency:"INR"});
+const expected = new Intl.NumberFormat(undefined,
+  {style:"currency", currency:"INR", maximumSignificantDigits:15}).format(value);
+assert.ok(html.includes(`<span class="explore-value">${expected}<`), html);
+for (const locale of ["en-IN", "de-DE"]) {
+  const pinned = new Intl.NumberFormat(locale,
+    {style:"currency", currency:"INR", maximumSignificantDigits:15}).format(value);
+  assert.ok(rowDetailsMarkup({cost:value}, {currency:"INR", locale}).includes(pinned), locale);
+}
+assert.match(rowDetailsMarkup({cost:value}, {currency:"INR", locale:"en-IN"}), /\u20b93,99,88,700\.96/);
 """)

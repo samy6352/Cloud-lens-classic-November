@@ -302,6 +302,7 @@ def test_full_forecast_carries_no_note(overview):
     # still captioned "next 30 days, from Azure".
     (cost.CostError("None of ['x'] match a subscription you can see. Available: A"),
      "not readable live"),
+    (cost.SubscriptionsNotReadable(1, ["A"]), "not readable live"),
     (cost.CostError("Azure returned 429"), "Azure forecast unavailable"),
     ({"projected_total": None, "mixed_currency": True}, "across currencies"),
     ({"projected_total": 5, "subscriptions_included": 1, "no_forecast_available": ["B"]},

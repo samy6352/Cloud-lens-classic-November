@@ -654,7 +654,9 @@ async function renderBudgets(token, refresh = false) {
           : issue ? "Budget data incomplete" : "No budgets in scope"}</h3>${refreshButton}</div>
         ${demoMode ? `<p class="muted note">${esc(d.note
           || "Budgets are not included in the PostgreSQL demo data. No Azure budget was requested.")}</p>` : ""}
-        ${issue ? `<div class="banner warn" role="status">${esc(issue)} Retry the read; an empty result does not confirm that no budgets exist.</div>` : ""}
+        ${issue ? `<div class="banner warn" role="status">${esc(issue)} ${d?.unreadable
+          ? "Include a subscription it can read to check its budgets."
+          : "Retry the read; an empty result does not confirm that no budgets exist."}</div>` : ""}
         ${demoMode ? "" : `<p class="muted">Create a budget from your selection in
           <button type="button" class="linkish" data-goto="tags">Cost by Application /
           Tags</button>.</p>${budgetHelp}`}

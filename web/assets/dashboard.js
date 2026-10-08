@@ -8,7 +8,7 @@
  * Tab families load on demand through an explicit context, never by importing this shell.
  * Savings joins four independent live scans and paints their progress without blocking edits.
  */
-import { allSubscriptions, askAgent, drawChart, esc, freshReads, get, money, moneyHtml, onScopeChange, post, refreshHeader, scopeIds, selectSubscriptions, setGlanceSpark, whoAmI } from "./app.js";
+import { allSubscriptions, askAgent, drawChart, esc, freshReads, get, money, moneyHtml, onScopeChange, post, probeCurrencies, refreshHeader, scopeIds, selectSubscriptions, setGlanceSpark, whoAmI } from "./app.js";
 import { close as closeAnalysis, invalidate as invalidateAnalysis, isOpen as isAnalysisOpen, openAnalysis, setAnalysisContext, wireAnalysis } from "./analysis.js";
 import { mountBot, setBotState } from "./bot.js";
 import { railIcon } from "./icons.js";
@@ -1221,6 +1221,9 @@ function tableMarkup(id) {
 
   const start = t.page * t.pageSize;
   const rows = view(t);
+  // Most callers format cells with the page's currency but do not pass it to `table()`;
+  // the currency the row's own cells used is the one its detail panel must show.
+  t.rowCurrency = new Map();
   const body = rows
     .slice(start, start + t.pageSize)
     .map((r) => {
@@ -1236,8 +1239,12 @@ function tableMarkup(id) {
         ${portal ? `<a href="${esc(portal.url)}" target="_blank" rel="noopener noreferrer"
           title="Open ${esc(portal.label.toLowerCase())} in Azure Portal">${esc(portal.label)} ↗</a>` : ""}
         </td>` : "";
+      const [cells, seen] = probeCurrencies(() =>
+        t.columns.map((c) => `<td${c.num ? ' class="num"' : ""}>${c.cell(r)}</td>`).join(""));
+      // Two currencies in one row: no single symbol is right for its details.
+      if (seen.size) t.rowCurrency.set(rowKey, seen.size === 1 ? [...seen][0] : "");
       return `<tr${t.explore ? ` data-explore-row="${rowKey}"` : ""}${big ? ' class="row-high" title="Unusually high for this table"' : ""}>${
-        t.columns.map((c) => `<td${c.num ? ' class="num"' : ""}>${c.cell(r)}</td>`).join("")
+        cells
       }${controls}</tr>${t.explore && expanded ? rowDetailMarkup(id, r, rowKey) : ""}`;
     })
     .join("");
@@ -1265,9 +1272,17 @@ function rowDetailMarkup(id, row, rowKey) {
       ${links.map(link => `<a href="${esc(link.url)}" target="_blank" rel="noopener noreferrer">Open ${esc(link.label.toLowerCase())} in Azure ↗</a>`).join("")}
       ${area ? `<button type="button" class="linkish" data-explore-tab="${esc(area.id)}">Explore ${esc(area.label)}</button>` : ""}
       </div>${rowDetailsMarkup(row, {
-        currency: row.currency || t.currency || readStore("costCurrency", "") || null,
+        currency: detailCurrency(t, row, rowKey),
         stateKey: `${id}-${rowKey}` })}
     </section></td></tr>`;
+}
+
+function detailCurrency(t, row, rowKey) {
+  if (row.currency) return row.currency;
+  if (t.currency) return t.currency;
+  const seen = t.rowCurrency?.get(rowKey);
+  if (seen !== undefined) return seen || null;
+  return readStore("costCurrency", "") || null;
 }
 
 function toggleRowDetail(section, id, rowKey) {

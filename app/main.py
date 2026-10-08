@@ -4910,6 +4910,12 @@ async def list_budgets(request: Request, scope: str = "", currency: str = "",
         return JSONResponse(out)
     except HTTPException:
         raise
+    except cost.SubscriptionsNotReadable as exc:
+        # Not a failed read: asking again gives the same answer until access changes, so it
+        # is returned as an answer. As an `error` the snapshot cache flagged every view as a
+        # refresh failure and the page re-polled it for five minutes (live Scale, 8 Oct).
+        # Refresh budgets still forces a live re-read.
+        return JSONResponse({"budgets": [], "count": 0, "unreadable": str(exc)})
     except Exception as exc:  # noqa: BLE001 - retain an explicit unavailable state for the tab
         log.info("could not list budgets: %s", str(exc)[:200])
         return JSONResponse({"budgets": [], "count": 0, "error": str(exc)[:300]})

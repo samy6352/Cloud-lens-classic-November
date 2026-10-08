@@ -206,6 +206,25 @@ class CostError(RuntimeError):
         self.retry_after = retry_after
 
 
+class SubscriptionsNotReadable(CostError):
+    """None of the selected subscriptions is one this identity can read live.
+
+    The message used to embed the selection as a Python list of GUIDs, which the Budgets tab
+    and every other live read showed verbatim (live Scale, 8 Oct). It now counts the selection
+    and names what can be read, so the sentence says what to change.
+    """
+
+    def __init__(self, requested: int, readable: list[str]):
+        noun = "subscription" if requested == 1 else "subscriptions"
+        shown = ", ".join(readable[:10])
+        more = f" and {len(readable) - 10} more" if len(readable) > 10 else ""
+        tail = (f" It can read: {shown}{more}." if readable
+                else " It cannot read any subscription live.")
+        super().__init__(
+            f"None of the {requested} selected {noun} can be read live by this identity."
+            + tail)
+
+
 # Whose Azure access a call runs under. Set per request when someone is signed in with Entra,
 # unset for the server's own background work. A ContextVar rather than a parameter because it
 # has to reach every live Azure call in this module and in waste.py without threading an
@@ -888,10 +907,8 @@ async def _resolve(subscription_ids: list[str] | None) -> list[dict]:
     wanted = {s.lower() for s in subscription_ids}
     picked = [s for s in known if s["id"].lower() in wanted or (s["name"] or "").lower() in wanted]
     if not picked:
-        raise CostError(
-            f"None of {subscription_ids} match a subscription you can see. "
-            f"Available: {', '.join(s['name'] or s['id'] for s in known[:10])}"
-        )
+        raise SubscriptionsNotReadable(
+            len(subscription_ids), [s["name"] or s["id"] for s in known])
     return picked
 
 
@@ -1595,7 +1612,8 @@ async def overview(scope: list[str] | None = None, *,
 
 def _forecast_note(fc: Any) -> str | None:
     """Why the header's forecast is missing or covers less than the selection, if it does."""
-    if isinstance(fc, CostError) and "match a subscription you can see" in str(fc):
+    if isinstance(fc, SubscriptionsNotReadable) or (
+            isinstance(fc, CostError) and "match a subscription you can see" in str(fc)):
         return "no forecast: these subscriptions are not readable live"
     if isinstance(fc, Exception):
         return "Azure forecast unavailable"

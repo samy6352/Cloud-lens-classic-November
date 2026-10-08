@@ -26,6 +26,7 @@ export function matchingTagBudgets(budgets, selection, mode = "all") {
 
 export function budgetReadIssue(data) {
   if (!data || !Array.isArray(data.budgets)) return "The budget service did not return a readable list.";
+  if (typeof data.unreadable === "string" && data.unreadable) return data.unreadable;
   const failed = data.failed_subscriptions || data.unavailable_subscriptions;
   if (data.error || data.partial || data.partial_failure || data.errors?.length
       || (Array.isArray(failed) ? failed.length : Number(failed) > 0)) {

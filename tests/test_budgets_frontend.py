@@ -187,6 +187,16 @@ await elements.budgetRefresh.onclick();
 assert.match(rootMarkup,/Budget data incomplete/);
 assert.doesNotMatch(rootMarkup,/<h3>No budgets/);
 assert.match(rootMarkup,/Access denied/);
+assert.match(rootMarkup,/Retry the read/);
+// Live Scale, 8 Oct: an unreadable selection printed a Python list of GUIDs and asked for a
+// retry that could never succeed. It is now a sentence and asks for a readable subscription.
+payload={budgets:[],count:0,unreadable:"None of the 2 selected subscriptions can be read live by this identity. It can read: Host."};
+assert.equal(budgetReadIssue(payload), payload.unreadable);
+await elements.budgetRefresh.onclick();
+assert.match(rootMarkup,/Budget data incomplete/);
+assert.match(rootMarkup,/None of the 2 selected subscriptions can be read live/);
+assert.match(rootMarkup,/Include a subscription it can read/);
+assert.doesNotMatch(rootMarkup,/Retry the read|\['/);
 payload={budgets:[]};
 await elements.budgetRefresh.onclick();
 assert.match(rootMarkup,/<h3>No budgets in scope/);

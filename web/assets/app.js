@@ -73,8 +73,20 @@ function currencyFormat(cur = "USD", digits = 0) {
   return fmt;
 }
 
-const money = (n, cur = "USD", digits = 0) =>
-  n == null || Number.isNaN(n) ? "—" : currencyFormat(cur, digits).format(n);
+// While a table renders a row, the currencies its cells format in are collected here, so the
+// row's detail panel can show the same currency the row does without every caller passing it.
+let currencyProbe = null;
+function probeCurrencies(render) {
+  const outer = currencyProbe, seen = new Set();
+  currencyProbe = seen;
+  try { return [render(), seen]; } finally { currencyProbe = outer; }
+}
+
+const money = (n, cur = "USD", digits = 0) => {
+  if (n == null || Number.isNaN(n)) return "—";
+  currencyProbe?.add(cur || "USD");
+  return currencyFormat(cur, digits).format(n);
+};
 
 /**
  * The same figure, with the currency symbol marked up separately.
@@ -88,6 +100,7 @@ const money = (n, cur = "USD", digits = 0) =>
  */
 const moneyHtml = (n, cur = "USD", digits = 0) => {
   if (n == null || Number.isNaN(n)) return "—";
+  currencyProbe?.add(cur || "USD");
   const parts = currencyFormat(cur, digits).formatToParts(n);
   return parts
     .map((p) =>
@@ -98,7 +111,7 @@ const moneyHtml = (n, cur = "USD", digits = 0) => {
 
 // The dashboard needs the same formatting, fetching and charting as the chat. Exporting them
 // keeps one implementation rather than two that drift.
-export { esc, money, moneyHtml };
+export { esc, money, moneyHtml, probeCurrencies };
 
 const announce = (text) => {
   if (liveRegion) liveRegion.textContent = text;
