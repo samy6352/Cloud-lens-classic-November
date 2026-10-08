@@ -183,6 +183,36 @@ class ResourceGraphPagingTests(unittest.TestCase):
             asyncio.run(waste._arg("Resources", ["sub-a"]))
         self.assertNotIsInstance(raised.exception, waste.NoVisibleSubscriptions)
 
+    def test_no_visible_subscription_wins_over_rules_throttled_on_a_cold_start(self):
+        """Live Scale, 8 Oct: after a restart some rules were throttled before Resource Graph
+        could say the scope was invisible, so Savings never saw the access refusal."""
+        invisible = waste.NoVisibleSubscriptions()
+        throttled = waste.CostError("Azure is rate-limiting", status_code=429)
+        calls = iter([invisible, throttled] * len(waste.RULES))
+
+        async def arg(query, subs):
+            raise next(calls)
+
+        with patch.object(waste, "_arg", new=arg), \
+                patch.object(waste, "_costs_for", side_effect=AssertionError("no cost read")), \
+                self.assertRaises(waste.NoVisibleSubscriptions):
+            asyncio.run(waste.find_waste(subscription_ids=["cost-only"]))
+
+    def test_a_rule_that_succeeded_keeps_the_partial_report(self):
+        results = iter([[]] + [waste.NoVisibleSubscriptions()] * (len(waste.RULES) - 1))
+
+        async def arg(query, subs):
+            res = next(results)
+            if isinstance(res, Exception):
+                raise res
+            return res
+
+        with patch.object(waste, "_arg", new=arg), \
+                patch.object(waste, "_costs_for", return_value={}):
+            report = asyncio.run(waste.find_waste(subscription_ids=["sub-a"]))
+        self.assertTrue(report["partial"])
+        self.assertEqual(len(report["errors"]), len(waste.RULES) - 1)
+
 
 if __name__ == "__main__":
     unittest.main()

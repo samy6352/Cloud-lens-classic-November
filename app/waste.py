@@ -522,9 +522,12 @@ async def find_waste(
     results = await asyncio.gather(
         *(_arg(RULES[k]["query"], subs) for k in keys), return_exceptions=True
     )
-    # One cause, said once: every rule fails identically when no subscription is visible.
-    if results and all(isinstance(res, NoVisibleSubscriptions) for res in results):
-        raise results[0]
+    # One cause, said once: no selected subscription is visible to Resource Graph. That is a
+    # fact about the scope, not the rule, so one rule saying so settles it when none succeeded;
+    # a cold start can throttle the other rules first (live Scale, 8 Oct).
+    if (results and all(isinstance(res, Exception) for res in results)
+            and any(isinstance(res, NoVisibleSubscriptions) for res in results)):
+        raise next(res for res in results if isinstance(res, NoVisibleSubscriptions))
 
     # One warehouse pass for every id found, rather than one per category.
     all_ids: list[str] = []
