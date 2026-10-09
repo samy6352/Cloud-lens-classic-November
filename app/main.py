@@ -5329,7 +5329,8 @@ async def reporting_period(request: Request, days: int = 30, scope: str = "",
 
 @app.get("/api/filters")
 async def filter_values(request: Request, days: int = 30, scope: str = "",
-                        currency: str = "") -> JSONResponse:
+                        currency: str = "", include_env: bool = True,
+                        env_only: bool = False) -> JSONResponse:
     """What the filter bar can offer, read from the data rather than guessed.
 
     A filter listing values the estate does not contain is worse than no filter: it invites
@@ -5414,33 +5415,35 @@ async def filter_values(request: Request, days: int = 30, scope: str = "",
             # `Reader.agg` is the rollup when it can answer this connection exactly, and
             # `costs` when it cannot -- a converted currency, or a filter on `env`. Either
             # way the same query reads the same five columns; only the speed differs.
-            try:
-                absorb(r.rows(by_column(rollup_dims, r.agg, since), 10000))
-            except Exception as exc:  # noqa: BLE001 - the bar, not the page
-                unavailable.extend(key for key, _ in rollup_dims)
-                log.info("filter values: %s not available in time (%s)",
-                         ", ".join(key for key, _ in rollup_dims), str(exc)[:120])
+            if not env_only:
+                try:
+                    absorb(r.rows(by_column(rollup_dims, r.agg, since), 10000))
+                except Exception as exc:  # noqa: BLE001 - the bar, not the page
+                    unavailable.extend(key for key, _ in rollup_dims)
+                    log.info("filter values: %s not available in time (%s)",
+                             ", ".join(key for key, _ in rollup_dims), str(exc)[:120])
 
-        # Fresh environment-aware summaries avoid raw JSON entirely. Keep the raw
-        # fallback independently bounded for deployments not yet migrated and FX.
-        try:
-            with warehouse.reader(picked or None, currency=currency or None,
-                                  budget_ms=FILTER_ENV_BUDGET_MS) as r:
-                stored = (environment.ENABLED and not currency and r.agg == "costs_rollup"
-                          and warehouse._rollup_fresh(r._con, "costs_rollup"))
-                env_sql = '"Environment"' if stored else environment.RAW_SQL
-                source = r.agg if stored else "costs"
-                absorb(r.rows(ranked(
-                    f'SELECT {env_sql} AS env, "BilledCost" AS cost, '
-                    f'"BillingCurrency" AS currency FROM {source} '
-                    f'WHERE "ChargePeriodStart" > {since}',
-                    "SELECT 'env' AS d, min(env) AS v, currency, sum(cost) AS c FROM recent "
-                    "WHERE env IS NOT NULL AND env <> '' GROUP BY env, currency",
-                    50), 10000))
-        except Exception as exc:  # noqa: BLE001 - one dimension, not the whole bar
-            unavailable.append("env")
-            log.info("filter values: the environment tag was not available in time (%s)",
-                     str(exc)[:120])
+        if include_env or env_only:
+            # Environment tags can require a bounded raw-row scan. Let the UI fetch
+            # this optional dimension separately so it cannot delay the other filters.
+            try:
+                with warehouse.reader(picked or None, currency=currency or None,
+                                      budget_ms=FILTER_ENV_BUDGET_MS) as r:
+                    stored = (environment.ENABLED and not currency and r.agg == "costs_rollup"
+                              and warehouse._rollup_fresh(r._con, "costs_rollup"))
+                    env_sql = '"Environment"' if stored else environment.RAW_SQL
+                    source = r.agg if stored else "costs"
+                    absorb(r.rows(ranked(
+                        f'SELECT {env_sql} AS env, "BilledCost" AS cost, '
+                        f'"BillingCurrency" AS currency FROM {source} '
+                        f'WHERE "ChargePeriodStart" > {since}',
+                        "SELECT 'env' AS d, min(env) AS v, currency, sum(cost) AS c FROM recent "
+                        "WHERE env IS NOT NULL AND env <> '' GROUP BY env, currency",
+                        50), 10000))
+            except Exception as exc:  # noqa: BLE001 - one dimension, not the whole bar
+                unavailable.append("env")
+                log.info("filter values: the environment tag was not available in time (%s)",
+                         str(exc)[:120])
 
         for values in out.values():
             for item in values:
@@ -5449,6 +5452,8 @@ async def filter_values(request: Request, days: int = 30, scope: str = "",
         result = {"dimensions": out, "as_of": str(hi), "days": window,
                   "currency": currency.upper() or None,
                   "monetary_contract": "currency_buckets", "dimension_limit": 200}
+        if not include_env and not env_only:
+            result["deferred_dimensions"] = ["env"]
         if unavailable:
             # Named rather than silent: an empty list here would otherwise be
             # indistinguishable from a dimension the estate genuinely never uses.

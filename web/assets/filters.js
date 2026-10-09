@@ -41,6 +41,8 @@ let queuedDays;
 let queuedMonth = "";
 let changeTimer = null;
 let requestController = null;
+let environmentController = null;
+let deferredDimensions = [];
 let pendingKey = "";
 let pendingRequest = null;
 
@@ -134,6 +136,9 @@ export async function loadFilters(days, month = queuedMonth) {
   queuedDays = days ?? queuedDays;
   queuedMonth = month;
   if (!ready) return;
+  environmentController?.abort();
+  environmentController = null;
+  deferredDimensions = [];
   const scope = scopeIds();
   const requestedCurrency = currency;
   const requestKey = `${queuedDays || ""}|${queuedMonth}|${scope.join(",")}|${requestedCurrency}`;
@@ -147,6 +152,7 @@ export async function loadFilters(days, month = queuedMonth) {
     String(periodParams(queuedDays || 30, queuedMonth)),
     scope.length ? `scope=${encodeURIComponent(scope.join(","))}` : "",
     requestedCurrency ? `currency=${encodeURIComponent(requestedCurrency)}` : "",
+    "include_env=false",
   ].filter(Boolean).join("&");
   pendingRequest = get(`/api/filters${qs}`, {
     timeout: 45000,
@@ -158,13 +164,14 @@ export async function loadFilters(days, month = queuedMonth) {
     if (r.unavailable) throw new Error("Filter choices are unavailable.");
     available = r.dimensions || {};
     unavailableDimensions = (r.unavailable_dimensions || []).filter(key => DIMS.some(dim => dim.key === key));
+    deferredDimensions = (r.deferred_dimensions || []).filter(key => DIMS.some(dim => dim.key === key));
     availableCurrency = r.currency || "";
     filterError = "";
     const previous = filterQuery().join("&");
     // Anything selected that the estate no longer contains is dropped rather than kept.
     // A filter that cannot match is indistinguishable from a broken dashboard.
     for (const { key } of DIMS) {
-      if (unavailableDimensions.includes(key)) continue;
+      if (unavailableDimensions.includes(key) || deferredDimensions.includes(key)) continue;
       const have = new Set((available[key] || []).map((o) => String(o.value).toLowerCase()));
       if (chosen[key]) {
         chosen[key] = chosen[key].filter((v) => have.has(String(v).toLowerCase()));
@@ -174,6 +181,7 @@ export async function loadFilters(days, month = queuedMonth) {
     writeStore("costFilters", chosen);
     render();
     if (previous !== filterQuery().join("&")) notifyChange(true);
+    if (deferredDimensions.includes("env")) void loadEnvironmentFilters(requestKey);
   } catch (err) {
     if (controller !== requestController || controller.signal.aborted) return;
     filterError = "Filter choices could not refresh. Existing selections still apply.";
@@ -183,6 +191,46 @@ export async function loadFilters(days, month = queuedMonth) {
       pendingKey = "";
       pendingRequest = null;
     }
+  }
+}
+
+async function loadEnvironmentFilters(requestKey) {
+  const scope = scopeIds();
+  const currentKey = `${queuedDays || ""}|${queuedMonth}|${scope.join(",")}|${currency}`;
+  if (requestKey !== currentKey) return;
+  environmentController?.abort();
+  const controller = new AbortController();
+  environmentController = controller;
+  const qs = "?" + [
+    String(periodParams(queuedDays || 30, queuedMonth)),
+    scope.length ? `scope=${encodeURIComponent(scope.join(","))}` : "",
+    currency ? `currency=${encodeURIComponent(currency)}` : "",
+    "env_only=true",
+  ].filter(Boolean).join("&");
+  try {
+    const r = await get(`/api/filters${qs}`, { timeout: 12000, signal: controller.signal });
+    if (controller !== environmentController) return;
+    if (r.unavailable) throw new Error("Environment filter choices are unavailable.");
+    const previous = filterQuery().join("&");
+    available = { ...available, env: r.dimensions?.env || [] };
+    deferredDimensions = deferredDimensions.filter(key => key !== "env");
+    unavailableDimensions = unavailableDimensions.filter(key => key !== "env");
+    if ((r.unavailable_dimensions || []).includes("env")) unavailableDimensions.push("env");
+    if (!unavailableDimensions.includes("env") && chosen.env) {
+      const have = new Set(available.env.map(option => String(option.value).toLowerCase()));
+      chosen.env = chosen.env.filter(value => have.has(String(value).toLowerCase()));
+      if (!chosen.env.length) delete chosen.env;
+    }
+    writeStore("costFilters", chosen);
+    render();
+    if (previous !== filterQuery().join("&")) notifyChange(true);
+  } catch (err) {
+    if (controller !== environmentController || controller.signal.aborted) return;
+    deferredDimensions = deferredDimensions.filter(key => key !== "env");
+    if (!unavailableDimensions.includes("env")) unavailableDimensions.push("env");
+    render();
+  } finally {
+    if (controller === environmentController) environmentController = null;
   }
 }
 

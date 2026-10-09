@@ -4,7 +4,7 @@ const PATHS = new Set([
   "/api/dashboard/resources", "/api/filters",
 ]);
 const PARAMS = new Set([
-  "days", "scope", "currency", "month", "period_month",
+  "days", "scope", "currency", "month", "period_month", "include_env", "env_only",
   "rg", "service", "region", "charge", "pricing", "env",
 ]);
 const SECRET = /(?:bearer\s|eyJ[\w-]+\.[\w-]+\.[\w-]+|(?:token|password|secret|sig|cookie|session|authorization)\s*[=:])/i;
