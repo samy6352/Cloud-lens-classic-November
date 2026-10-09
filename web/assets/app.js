@@ -833,7 +833,8 @@ function loadSavingsTile(cur, request) {
     isCurrent: request.current,
     onData: s => {
       const pending = s.scan?.status === "running" || Boolean(s.freshness?.refreshing);
-      const failed = s.scan?.status === "error" || s.scan?.status === "unavailable";
+      const failed = (s.scan?.status === "error" || s.scan?.status === "unavailable")
+        && s.partial_basis !== "access";
       const unavailable = failed || s.partial || s.unpriced_count
         || s.unavailable?.length || Object.keys(s.scan?.errors || {}).length;
       tile.setAttribute("aria-busy", String(pending));

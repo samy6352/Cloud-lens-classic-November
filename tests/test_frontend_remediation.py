@@ -245,30 +245,37 @@ assert.equal(tile.value,"INR:12");
 assert.match(tile.sub,/partial/);
 assert.match(tile.title,/Partial assessment shown/);
 assert.doesNotMatch(tile.title,/Previous result/);
+scope=["access"];
+const access=api.schedule("INR");
+pending[5].resolve({count:0,total:0,currency:"INR",days:30,partial:true,partial_basis:"access",
+  unavailable:{advisor:"not readable"},scan:{status:"error",errors:{advisor:"not readable"}}});
+assert.equal(await access,true,"an access-only assessment is a completed header repaint");
+assert.equal(tile.sub,"assessment unavailable");
+assert.match(tile.title,/Partial assessment shown/);
 api.refresh();
 let settled=false;
 const running=api.schedule("INR").then(result=>{settled=true;return result;});
-assert.equal(tile.value,"INR:12","a completed partial result is retained during refresh");
-pending[5].resolve({count:1,total:12,currency:"INR",scan:{status:"running"},
+assert.equal(tile.value,"—","an access-only result is retained during refresh");
+pending[6].resolve({count:1,total:12,currency:"INR",scan:{status:"running"},
   freshness:{refreshing:true},unavailable:["waste"]});
 await flush();
 assert.equal(settled,false,"running scans must not settle the repaint promise");
 api.refresh();
 const recovered=api.schedule("INR");
 assert.equal(await running,false,"superseded scans do not certify freshness");
-pending[6].resolve({count:1,total:15,currency:"INR",days:30,scan:{status:"ready"}});
+pending[7].resolve({count:1,total:15,currency:"INR",days:30,scan:{status:"ready"}});
 assert.equal(await recovered,true);
 assert.equal(tile.value,"INR:15");
 assert.equal(tile.title,"","a recovered assessment clears the obsolete warning");
 api.refresh();
 const failed=api.schedule("INR");
-pending[7].resolve({count:1,total:15,currency:"INR",
+pending[8].resolve({count:1,total:15,currency:"INR",
   scan:{status:"error",errors:{advisor:"failed"}}});
 assert.equal(await failed,false,"genuine source failures still fail header revalidation");
 assert.match(tile.title,/Previous result shown/);
 scope=["unpriced"];
 const unpriced=api.schedule("INR");
-pending[8].resolve({count:2,total:null,currency:"INR",unpriced_count:2,partial:true,
+pending[9].resolve({count:2,total:null,currency:"INR",unpriced_count:2,partial:true,
   scan:{status:"ready"}});
 assert.equal(await unpriced,true);
 assert.equal(tile.value,"Not available","unpriced totals never render as money or zero");
@@ -276,7 +283,7 @@ assert.match(tile.sub,/partial/);
 assert.match(tile.title,/saving estimates are unavailable/);
 scope=["zero"];
 const zero=api.schedule("INR");
-pending[9].resolve({count:1,total:0,currency:"INR",unpriced_count:0,partial:false,
+pending[10].resolve({count:1,total:0,currency:"INR",unpriced_count:0,partial:false,
   scan:{status:"ready"}});
 assert.equal(await zero,true);
 assert.equal(tile.value,"INR:0","genuine known zero remains a numeric amount");
