@@ -128,7 +128,12 @@ async def run(scope: list[str], *, request_new: bool = False,
     if not scope:
         raise ValueError("Select at least one subscription.")
     from . import cost_data
-    managed = {sub for sub in scope if (await asyncio.to_thread(cost_data.read, sub)).get("version") == 2}
+    managed = set()
+    for sub in scope:
+        config = await asyncio.to_thread(cost_data.read, sub)
+        if (config.get("version") == 2 and config.get("enabled")
+                and config.get("identity") == "workload"):
+            managed.add(sub)
     if managed and request_new:
         raise ValueError("Cost data owns this subscription's update cadence. Review Refresh now there.")
     scope = [sub for sub in scope if sub not in managed]

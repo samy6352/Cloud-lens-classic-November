@@ -254,7 +254,9 @@ def test_unsupported_historical_window_stays_incomplete(pipeline):
 
 def test_legacy_import_loop_cannot_bypass_managed_weekly_cadence(pipeline):
     p = pipeline
-    p.service.write("a", {"version": 2, "cadence": "Weekly", "enabled": True})
+    p.service.write("a", {"version": 2, "cadence": "Weekly", "enabled": True,
+                          "identity": "workload"})
+    p.sync._runs = AsyncMock(return_value=[])
     assert asyncio.run(p.sync.run(["a"]))["status"] == "cancelled"
     p.sync.discover.assert_not_awaited()
     p.schedules.run_now.assert_not_awaited()
@@ -267,7 +269,12 @@ def test_failed_managed_setup_does_not_suppress_active_native_export_sync(pipeli
               "identity": "workload", "enabled": False,
               "detail": "RBACAccessDenied while updating the export"}
 
-    assert asyncio.run(pipeline.service.tick([("a", config)])) == set()
+    pipeline.service.write("a", config)
+    pipeline.sync._runs = AsyncMock(return_value=[])
+    result = asyncio.run(pipeline.sync.run(["a"]))
+    assert result["status"] == "idle"
+    pipeline.sync.discover.assert_awaited_once_with(["a"])
+    pipeline.exports.ingest_export.assert_not_awaited()
 
 
 def test_accepted_but_wrong_historical_coverage_is_partial_not_infinite_wait(pipeline, monkeypatch):
