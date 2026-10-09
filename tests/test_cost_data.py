@@ -262,6 +262,14 @@ def test_legacy_import_loop_cannot_bypass_managed_weekly_cadence(pipeline):
         asyncio.run(p.sync.run(["a"], request_new=True))
 
 
+def test_failed_managed_setup_does_not_suppress_active_native_export_sync(pipeline):
+    config = {"version": 2, "mode": "managed", "cadence": "Daily",
+              "identity": "workload", "enabled": False,
+              "detail": "RBACAccessDenied while updating the export"}
+
+    assert asyncio.run(pipeline.service.tick([("a", config)])) == set()
+
+
 def test_accepted_but_wrong_historical_coverage_is_partial_not_infinite_wait(pipeline, monkeypatch):
     p = pipeline
     record = asyncio.run(p.service.create(plan(p), "wrong-window"))

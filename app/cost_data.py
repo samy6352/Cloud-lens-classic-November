@@ -478,7 +478,12 @@ async def tick(configs: list[tuple[str, dict]]) -> set[str]:
     """Called by the existing FOCUS loop, never a second independent scheduler."""
     if read_only_mode():
         return set()
-    owned = {sub for sub, cfg in configs if cfg.get("version") == 2}
+    # Only an enabled workload configuration owns the legacy native-export sync.
+    # A failed first-time schedule setup leaves a version-2 record disabled; treating
+    # that as ownership suppresses the already-active native export indefinitely.
+    owned = {sub for sub, cfg in configs
+             if cfg.get("version") == 2 and cfg.get("enabled")
+             and cfg.get("identity") == "workload"}
     now = datetime.now(UTC)
     pending = await asyncio.to_thread(jobs.listing, active_only=True, limit=500)
     owned.update(sub for job in pending if job["kind"] == "focus-setup" for sub in job["scope"])
