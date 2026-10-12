@@ -1427,7 +1427,7 @@ FILTER_BUDGET_MS = int(os.getenv("FILTER_TIMEOUT_MS", "15000"))
 # from the primary indexed dimensions. Its result is optional and never delays the main filter
 # bar; allow enough time for the bounded scan to finish on larger estates before marking it
 # unavailable.
-FILTER_ENV_BUDGET_MS = int(os.getenv("FILTER_ENV_TIMEOUT_MS", "8000"))
+FILTER_ENV_BUDGET_MS = int(os.getenv("FILTER_ENV_TIMEOUT_MS", "12000"))
 
 
 def request_filters(request: Request) -> dict[str, list[str]] | None:

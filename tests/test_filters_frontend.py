@@ -17,6 +17,7 @@ def test_fast_filter_dimensions_render_before_environment_lookup():
     script = r"""
 import assert from "node:assert/strict";
 const requests = [];
+const timeouts = [];
 let releaseEnvironment;
 const esc = value => String(value ?? "");
 const money = value => String(value);
@@ -25,8 +26,9 @@ const readStore = () => ({});
 const scopeIds = () => ["sub-a"];
 const writeStore = () => {};
 const periodParams = days => `days=${days}`;
-const get = async url => {
+const get = async (url, options = {}) => {
   requests.push(url);
+  timeouts.push(options.timeout);
   if (url.includes("env_only=true")) {
     return new Promise(resolve => {
       releaseEnvironment = () => resolve({
@@ -61,6 +63,8 @@ ready = true;
 await loadFilters(30);
 assert.match(requests[0], /include_env=false/);
 assert.match(requests[1], /env_only=true/);
+assert.equal(timeouts[0], 45000);
+assert.equal(timeouts[1], 18000);
 assert.match(nodes.fbSlots.innerHTML, /data-dim="service"/);
 assert.doesNotMatch(nodes.fbSlots.innerHTML, /data-dim="env"/);
 assert.equal(typeof releaseEnvironment, "function");
