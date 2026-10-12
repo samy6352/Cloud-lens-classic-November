@@ -1423,12 +1423,11 @@ ENV_TAG = environment.tag_sql()
 # only removes the part of the wait that was never going to produce an answer.
 FILTER_BUDGET_MS = int(os.getenv("FILTER_TIMEOUT_MS", "15000"))
 
-# The environment tag gets a tighter bound still. It is read out of the `Tags` document per
-# row rather than from a column, so it is the one dimension that cannot be answered from an
-# index, and it is asked for separately so that when it does not arrive the other five are
-# still there. Nothing waits on it: an empty environment list is what an untagged estate
-# returns anyway, and `unavailable_dimensions` says which of the two happened.
-FILTER_ENV_BUDGET_MS = int(os.getenv("FILTER_ENV_TIMEOUT_MS", "5000"))
+# The environment tag can require reading the `Tags` document per row, so fetch it separately
+# from the primary indexed dimensions. Its result is optional and never delays the main filter
+# bar; allow enough time for the bounded scan to finish on larger estates before marking it
+# unavailable.
+FILTER_ENV_BUDGET_MS = int(os.getenv("FILTER_ENV_TIMEOUT_MS", "8000"))
 
 
 def request_filters(request: Request) -> dict[str, list[str]] | None:

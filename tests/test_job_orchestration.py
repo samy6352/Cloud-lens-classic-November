@@ -573,9 +573,12 @@ def test_filter_bar_can_defer_environment_dimension(monkeypatch):
     monkeypatch.setattr(main, "current_user", lambda request: SimpleNamespace(admin=True))
     monkeypatch.setattr(main, "permitted", AsyncMock(return_value=["a"]))
     queries = []
+    budgets = []
 
     @contextmanager
     def reader(scope, currency=None, budget_ms=None):
+        budgets.append(budget_ms)
+
         def rows(sql, *args):
             queries.append(sql)
             if "max(" in sql:
@@ -600,6 +603,7 @@ def test_filter_bar_can_defer_environment_dimension(monkeypatch):
     assert env_payload["dimensions"]["env"][0]["value"] == "prod"
     assert sum("AS env" in query for query in queries) == 1
     assert not any("GROUP BY lower(service)" in query for query in queries)
+    assert budgets[-1] == main.FILTER_ENV_BUDGET_MS
 
 
 def test_csv_disconnect_waits_for_fetch_before_closing_context(monkeypatch):
