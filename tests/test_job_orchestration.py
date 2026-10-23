@@ -570,6 +570,7 @@ def test_scoped_filter_bar_dates_come_from_the_rollup_not_the_detail_view(monkey
 def test_filter_bar_can_defer_environment_dimension(monkeypatch):
     from app import main, warehouse
 
+    monkeypatch.setattr(main.environment, "ENABLED", False)
     monkeypatch.setattr(main, "current_user", lambda request: SimpleNamespace(admin=True))
     monkeypatch.setattr(main, "permitted", AsyncMock(return_value=["a"]))
     queries = []
@@ -603,6 +604,9 @@ def test_filter_bar_can_defer_environment_dimension(monkeypatch):
     assert env_payload["dimensions"]["env"][0]["value"] == "prod"
     assert sum("AS env" in query for query in queries) == 1
     assert not any("GROUP BY lower(service)" in query for query in queries)
+    env_query = next(query for query in queries if "AS env" in query)
+    assert env_query.count('TRY_CAST("Tags" AS JSON)') == 1
+    assert "OFFSET 0" in env_query
     assert budgets[-1] == main.FILTER_ENV_BUDGET_MS
 
 

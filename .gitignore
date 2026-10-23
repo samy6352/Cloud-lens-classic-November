@@ -1,6 +1,7 @@
 # Local state, never committed.
 data/
 .env
+.copilot-azure/
 .env.*
 !.env.example
 # Wherever a developer points AUTH_DATA_DIR when they would rather not write into

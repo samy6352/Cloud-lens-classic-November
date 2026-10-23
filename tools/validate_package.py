@@ -26,17 +26,33 @@ class AssetReferences(HTMLParser):
 
 
 def validate(root: Path, files: set[str]) -> None:
+    module_files = {}
     modules = {}
     for name in sorted(files):
         if not name.startswith("app/") or not name.endswith(".py"):
             continue
-        tree = ast.parse((root / name).read_text(encoding="utf-8-sig"), filename=name)
         module = name[:-3].replace("/", ".")
         if module.endswith(".__init__"):
             module = module.removesuffix(".__init__")
-        modules[module] = (name, tree)
+        module_files[module] = name
 
-    for module, (name, tree) in modules.items():
+    def parsed(module):
+        if module not in modules:
+            name = module_files[module]
+            modules[module] = (name, ast.parse(
+                (root / name).read_text(encoding="utf-8-sig"), filename=name))
+        return modules[module]
+
+    # Follow reviewed server/operator roots; reject orphan source without reading its content.
+    pending = {"app", "app.main", "app.retention"} & module_files.keys()
+    seen = set()
+    while pending:
+        module = min(pending)
+        pending.remove(module)
+        if module in seen:
+            continue
+        seen.add(module)
+        name, tree = parsed(module)
         package = module if name.endswith("/__init__.py") else module.rpartition(".")[0]
         for node in ast.walk(tree):
             targets = []
@@ -53,9 +69,9 @@ def validate(root: Path, files: set[str]) -> None:
                     target = node.module or ""
                 targets = [target]
                 # `from . import billing` loads a child module, not just app/__init__.py.
-                if target in modules and modules[target][0].endswith("/__init__.py"):
+                if target in module_files and module_files[target].endswith("/__init__.py"):
                     exported = set()
-                    for declaration in modules[target][1].body:
+                    for declaration in parsed(target)[1].body:
                         if isinstance(declaration, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                             exported.add(declaration.name)
                         elif isinstance(declaration, (ast.Import, ast.ImportFrom)):
@@ -68,8 +84,12 @@ def validate(root: Path, files: set[str]) -> None:
                     targets += [f"{target}.{alias.name}" for alias in node.names
                                 if alias.name != "*" and alias.name not in exported]
             for target in targets:
-                if (target == "app" or target.startswith("app.")) and target not in modules:
-                    raise ValueError(f"Missing Python module: {name}:{node.lineno} -> {target}")
+                if target == "app" or target.startswith("app."):
+                    if target not in module_files:
+                        raise ValueError(f"Missing Python module: {name}:{node.lineno} -> {target}")
+                    pending.add(target)
+    if unexpected := module_files.keys() - seen:
+        raise ValueError("Unexpected unreferenced Python source: " + ", ".join(sorted(unexpected)))
 
     for name in sorted(files):
         references = []

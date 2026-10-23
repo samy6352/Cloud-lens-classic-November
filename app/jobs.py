@@ -84,6 +84,10 @@ def advance_generation(con: Any, window: tuple[date, date] | None = None, *,
         except (TypeError, ValueError) as exc:
             raise ValueError("Rebuild windows require nonempty half-open date bounds") from exc
     source, ready = _generation_pair(con)
+    from . import environment_summary
+
+    if environment_summary.enabled():
+        environment_summary.invalidate(con, affected, source)
     pending = dirty_windows(con, source, ready)
     if affected is None or pending is None:
         pending = None

@@ -199,6 +199,7 @@ class PostgresStore:
     # would turn those into AttributeError rather than the behaviour under test.
     work_mem: str = ""
     statement_timeout: str = ""
+    schema_preprovisioned: bool = False
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -230,6 +231,12 @@ class PostgresStore:
                 f"PGSCHEMA={self.schema!r} is not a plain identifier. Use letters, "
                 "digits and underscores."
             )
+        preprovisioned = os.getenv("PG_SCHEMA_PREPROVISIONED", "false").strip().lower()
+        if preprovisioned not in {"true", "false"}:
+            raise ValueError("PG_SCHEMA_PREPROVISIONED must be true or false")
+        self.schema_preprovisioned = preprovisioned == "true"
+        if self.schema_preprovisioned and not self.schema:
+            raise ValueError("PG_SCHEMA_PREPROVISIONED=true requires an explicit PGSCHEMA.")
         # How much memory one sort or hash node may use before it spills to disk.
         #
         # Opt-in, and unset means the server's own value, because the right number is a
@@ -330,7 +337,28 @@ class PostgresStore:
             # in the view to separate them.
             application_name=os.getenv("PG_APPLICATION_NAME", "cloudlens"),
         )
-        if self.schema:
+        try:
+            return self._configure_connection(conn)
+        except BaseException:
+            conn.close()
+            raise
+
+    def _configure_connection(self, conn: Any) -> Any:
+        if self.schema_preprovisioned:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT has_schema_privilege(current_user, oid, 'USAGE'), "
+                    "has_schema_privilege(current_user, oid, 'CREATE') "
+                    "FROM pg_namespace WHERE nspname = %s",
+                    (self.schema.lower(),),
+                )
+                privileges = cur.fetchone()
+            if not privileges or privileges != (True, True):
+                raise RuntimeError(
+                    "Pre-provisioned PGSCHEMA must exist and grant runtime USAGE and CREATE; "
+                    "ask the bootstrap operator to provision the dedicated application schema."
+                )
+        elif self.schema:
             # Created here rather than assumed, so pointing at an empty database is
             # enough to get a working warehouse.
             with conn.cursor() as cur:
@@ -502,8 +530,33 @@ class PostgresStore:
         `try_cast_double`, `try_cast_date` and `try_cast_json`; they have to exist
         before any query that uses them runs. Idempotent, and failure is not fatal --
         an installation whose role cannot create functions still serves every query
-        that does not need them.
+        that does not need them. Pre-provisioned mode instead verifies the existing
+        helpers and fails closed; it must never attempt bootstrap-owned DDL.
         """
+        if self.schema_preprovisioned:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT {SHIM_SCHEMA}.try_cast_double('12.5'), "
+                    f"{SHIM_SCHEMA}.try_cast_double('bad'), "
+                    f"{SHIM_SCHEMA}.try_cast_date('2026-01-01')::text, "
+                    f"{SHIM_SCHEMA}.try_cast_date('bad'), "
+                    f"{SHIM_SCHEMA}.try_cast_json('{{\"k\":\"v\"}}'), "
+                    f"{SHIM_SCHEMA}.try_cast_json('invalidJSON'), "
+                    f"{SHIM_SCHEMA}.try_cast_json('[]')"
+                )
+                if cur.fetchone() != (12.5, None, "2026-01-01", None, {"k": "v"}, None, None):
+                    raise RuntimeError("Pre-provisioned SQL shims do not match CloudLens semantics.")
+                cur.execute(
+                    "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                    "WHERE n.nspname=%s AND c.relkind IN ('r','p','m','v','f') LIMIT 1",
+                    (SHIM_SCHEMA,),
+                )
+                if cur.fetchone():
+                    raise RuntimeError(
+                        "Pre-provisioned SQL shim schema must not contain tables or views."
+                    )
+            self._shims_installed = True
+            return
         try:
             with conn.cursor() as cur:
                 cur.execute(SHIMS)

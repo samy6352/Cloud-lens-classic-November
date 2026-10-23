@@ -11,7 +11,61 @@ incur charges, including a web app, database, private storage and an AI service.
 [Full documentation](Cloudlens-Documentation.Md) |
 [Detailed deployment guide](infra/README.md)
 
+## Optional Environment-filter summary for existing installations
+
+`CLOUDLENS_ENV_SUMMARY` defaults to `false`. This separate sidecar does not
+change the ordinary rollup grain, create objects at startup or trigger a full
+historical rebuild. Do not enable `CLOUDLENS_ENV_ROLLUP` to use it.
+
+An operator must approve the target database and schema changes, then preview:
+
+```powershell
+python -m app.environment_summary --migrate
+python -m app.environment_summary --start 2026-07-01 --end 2026-07-08
+```
+
+These commands do not connect to PostgreSQL unless `--apply --acknowledgement
+environment-summary-only` is added. Migration requires an existing initialized
+CloudLens database and the operator's DDL rights; it creates only the separate
+summary/coverage tables and index and records their layout in existing metadata.
+Deploy code with the flag off, explicitly migrate, then enable the flag before
+backfill so concurrent source writes invalidate coverage. Live changes require
+their own deployment/configuration/maintenance approval.
+
+Backfill uses exclusive end dates and at most seven days per transaction.
+The default maximum is one chunk; `--max-chunks` explicitly allows up to 16.
+Every refresh locks the cost generation, uses a 15-second per-statement timeout
+and a five-second lock timeout, and publishes empty-day coverage atomically.
+This is not a cumulative wall-clock bound for the entire multi-chunk command.
+
+Reads require every requested date and a matching source generation in one
+repeatable-read snapshot. Missing or stale coverage retains the bounded raw
+fallback; FX provenance, subscription scope and currency buckets are preserved.
+Known source writes mark previously covered dates dirty. The normal post-write
+rollup refresh repairs at most four chunks per call; remaining dirty dates stay
+unavailable to the summary until repaired. Unknown writes clear coverage and
+require explicit backfill, never an automatic full-history scan.
+
+Backfill advances a filter-cache revision, so a cached unavailable option does
+not conceal newly completed coverage. Disabling the flag leaves the tables but
+uses the original raw path; subsequent writes cannot re-enable old certification.
+After a code rollback, do not drop the additive tables as part of recovery.
+
 ## Before you start
+
+For operator-bootstrapped databases, set `PG_SCHEMA_PREPROVISIONED=true` with
+an explicit `PGSCHEMA`. The operator must already have created that dedicated
+application schema, granted the runtime `USAGE` and schema-local `CREATE`,
+installed the `cloudlens_fn` cast helpers, and provisioned the isolated
+`cloudlens_query` role and membership. Database-wide `CREATE`, server administration
+and runtime `CREATEROLE` are not needed for this mode.
+
+The store verifies the schema permissions and helper semantics without creating
+schemas or replacing bootstrap-owned functions. Missing or inaccessible setup,
+incorrect helper behavior, or tables/views in the function-only helper schema
+fail closed. Application-owned table migrations and ingest DDL still run; this
+is not a read-only database mode. The default remains `false`, preserving the
+existing automatic schema/helper setup.
 
 No programming is required, but Azure permissions and service availability matter.
 An IT administrator may need to help with the initial approval.

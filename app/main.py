@@ -1308,6 +1308,15 @@ async def authorize_snapshot(request: Request) -> CacheContext:
     }
     if request.url.path in BUDGET_VIEWS:
         policy["budget_revision"] = await offload(_budget_revision)
+    if request.url.path == "/api/filters":
+        from . import environment_summary
+
+        policy["environment_summary_revision"] = "off"
+        if environment_summary.enabled():
+            from .warehouse import warehouse
+
+            policy["environment_summary_revision"] = await offload(
+                environment_summary.cache_revision, warehouse._store)
     if user.source == "entra":
         session = auth.sso.get(user.sid)
         if session is None or session.reauth_required:
@@ -1427,7 +1436,7 @@ FILTER_BUDGET_MS = int(os.getenv("FILTER_TIMEOUT_MS", "15000"))
 # from the primary indexed dimensions. Its result is optional and never delays the main filter
 # bar; allow enough time for the bounded scan to finish on larger estates before marking it
 # unavailable.
-FILTER_ENV_BUDGET_MS = int(os.getenv("FILTER_ENV_TIMEOUT_MS", "12000"))
+FILTER_ENV_BUDGET_MS = int(os.getenv("FILTER_ENV_TIMEOUT_MS", "15000"))
 
 
 def request_filters(request: Request) -> dict[str, list[str]] | None:
@@ -5346,6 +5355,9 @@ async def filter_values(request: Request, days: int = 30, scope: str = "",
     window = max(1, min(days, 365))
 
     def collect() -> dict[str, Any]:
+        from . import environment_summary
+
+        summary_enabled = environment_summary.enabled()
         out: dict[str, Any] = {}
         # Every column here is now part of the rollup's grain, so `Reader.agg` answers
         # all five exactly. Before `ChargeCategory` and `PricingModel` were added to it,
@@ -5394,7 +5406,8 @@ async def filter_values(request: Request, days: int = 30, scope: str = "",
                     for key, _ in dims),
                 200)
 
-        with warehouse.reader(picked or None, currency=currency or None,
+        with warehouse.reader(picked or None,
+                              currency=None if env_only and summary_enabled else currency or None,
                               budget_ms=FILTER_BUDGET_MS) as r:
             # Anchored to the newest data, not to today: a warehouse that ends last Friday would
             # otherwise offer an empty list every Monday. Read from the rollup: under a scope
@@ -5426,16 +5439,26 @@ async def filter_values(request: Request, days: int = 30, scope: str = "",
             # Environment tags can require a bounded raw-row scan. Let the UI fetch
             # this optional dimension separately so it cannot delay the other filters.
             try:
-                with warehouse.reader(picked or None, currency=currency or None,
-                                      budget_ms=FILTER_ENV_BUDGET_MS) as r:
+                snapshot_options = {"repeatable_read": True} if summary_enabled else {}
+                with warehouse.reader(picked or None,
+                                      currency=None if snapshot_options else currency or None,
+                                      budget_ms=FILTER_ENV_BUDGET_MS, **snapshot_options) as r:
+                    rows = (environment_summary.filter_rows(
+                        r, warehouse, hi, window, scope=bool(picked), currency=currency)
+                        if snapshot_options else None)
+                    if rows is None and snapshot_options and currency:
+                        rows = environment_summary.raw_currency_rows(r, warehouse, hi, window, currency)
                     stored = (environment.ENABLED and not currency and r.agg == "costs_rollup"
                               and warehouse._rollup_fresh(r._con, "costs_rollup"))
-                    env_sql = '"Environment"' if stored else environment.RAW_SQL
-                    source = r.agg if stored else "costs"
-                    absorb(r.rows(ranked(
-                        f'SELECT {env_sql} AS env, "BilledCost" AS cost, '
+                    source = (r.agg if stored else environment.project(
+                        "costs", ["ChargePeriodStart", "BilledCost", "BillingCurrency"]))
+                    from .reporting import until_sql
+
+                    absorb(rows if rows is not None else r.rows(ranked(
+                        'SELECT "Environment" AS env, "BilledCost" AS cost, '
                         f'"BillingCurrency" AS currency FROM {source} '
-                        f'WHERE "ChargePeriodStart" > {since}',
+                        f'WHERE "ChargePeriodStart" > {since} '
+                        f'AND "ChargePeriodStart" <= {until_sql(hi)}',
                         "SELECT 'env' AS d, min(env) AS v, currency, sum(cost) AS c FROM recent "
                         "WHERE env IS NOT NULL AND env <> '' GROUP BY env, currency",
                         50), 10000))

@@ -27,7 +27,7 @@ import os
 import re
 import time
 from collections.abc import AsyncIterator, Iterator, Sequence
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, ClassVar
 
@@ -741,6 +741,10 @@ class Warehouse:
             with self.connect() as con:
                 for module in built:
                     derived.retire(con, self._rollup_schema, module)
+        from . import environment_summary
+
+        if environment_summary.enabled():
+            environment_summary.refresh_pending(self._store)
         return counts[rollup.TABLE]
 
     async def refresh_rollup_async(self, window: tuple[Any, Any] | None = None) -> None:
@@ -1269,7 +1273,8 @@ class Warehouse:
                filters: dict[str, list[str]] | None = None,
                budget_ms: int | None = None,
                *, include_commitments: bool = False,
-               usage: tuple[str, ...] = ()) -> Iterator[Reader]:
+               usage: tuple[str, ...] = (),
+               repeatable_read: bool = False) -> Iterator[Reader]:
         """One read-only connection reused across a burst of internal queries.
 
         Opening a connection is the expensive part — and under a scope it also rebuilds the
@@ -1308,26 +1313,29 @@ class Warehouse:
                     "NULLIF(current_setting('statement_timeout'), '0')::interval, "
                     "make_interval(secs => ? / 1000.0))) * 1000)::bigint::text, false)",
                     [budget_ms])
-            aggregate, counted, named, billing = self._derived_sources(
-                con, scope, currency, filters)
             from . import read_indexes
 
-            indexable = {billing_rollup.TABLE} if con.bill_stored else set()
-            # The identity index covers date/currency/region, not scoped filter
-            # dimensions. Keep the existing plans for those narrower workloads.
-            if con.presence_stored and not scope and not filters:
-                indexable.add(presence.TABLE)
-            with read_indexes.certified(
-                    con, self._rollup_schema, indexable,
-                    [module.TABLE for module in DERIVED_MODULES]) as indexed:
-                yield Reader(
-                    con, aggregate, counted, named, billing,
-                    benefit=commitment_benefits.TABLE if include_commitments else "costs",
-                    spot=spot_rates.TABLE if include_commitments else "costs",
-                    bill_stored=con.bill_stored, bill_serving=con.bill_serving,
-                    bill_indexed=billing_rollup.TABLE in indexed,
-                    res_ordered=presence.TABLE in indexed,
-                    usage=dict(getattr(con, "usage_available", {})))
+            with con.raw.transaction() if repeatable_read else nullcontext():
+                if repeatable_read:
+                    con.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                aggregate, counted, named, billing = self._derived_sources(
+                    con, scope, currency, filters)
+                indexable = {billing_rollup.TABLE} if con.bill_stored else set()
+                # The identity index covers date/currency/region, not scoped filter
+                # dimensions. Keep the existing plans for those narrower workloads.
+                if con.presence_stored and not scope and not filters:
+                    indexable.add(presence.TABLE)
+                with read_indexes.certified(
+                        con, self._rollup_schema, indexable,
+                        [module.TABLE for module in DERIVED_MODULES]) as indexed:
+                    yield Reader(
+                        con, aggregate, counted, named, billing,
+                        benefit=commitment_benefits.TABLE if include_commitments else "costs",
+                        spot=spot_rates.TABLE if include_commitments else "costs",
+                        bill_stored=con.bill_stored, bill_serving=con.bill_serving,
+                        bill_indexed=billing_rollup.TABLE in indexed,
+                        res_ordered=presence.TABLE in indexed,
+                        usage=dict(getattr(con, "usage_available", {})))
         finally:
             con.close()
 

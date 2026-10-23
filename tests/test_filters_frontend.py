@@ -64,7 +64,7 @@ await loadFilters(30);
 assert.match(requests[0], /include_env=false/);
 assert.match(requests[1], /env_only=true/);
 assert.equal(timeouts[0], 45000);
-assert.equal(timeouts[1], 18000);
+assert.equal(timeouts[1], 22000);
 assert.match(nodes.fbSlots.innerHTML, /data-dim="service"/);
 assert.doesNotMatch(nodes.fbSlots.innerHTML, /data-dim="env"/);
 assert.equal(typeof releaseEnvironment, "function");

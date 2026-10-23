@@ -208,7 +208,7 @@ async function loadEnvironmentFilters(requestKey) {
     "env_only=true",
   ].filter(Boolean).join("&");
   try {
-    const r = await get(`/api/filters${qs}`, { timeout: 18000, signal: controller.signal });
+    const r = await get(`/api/filters${qs}`, { timeout: 22000, signal: controller.signal });
     if (controller !== environmentController) return;
     if (r.unavailable) throw new Error("Environment filter choices are unavailable.");
     const previous = filterQuery().join("&");
