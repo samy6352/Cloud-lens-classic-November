@@ -165,7 +165,16 @@ param(
 
     # Also write the compiled ARM template to infra/main.json, for customers
     # whose platform team deploys through Terraform. See infra/terraform.
-    [switch]$EmitArm
+    [switch]$EmitArm,
+
+    # PostgreSQL SKUs tried in order if Azure refuses -PostgresSku with SkuNotAvailable.
+    # The capabilities API lists SKUs a region offers but cannot see regional capacity, so
+    # this is only discoverable at deployment time. General Purpose D-series have half the
+    # memory of the default E-series; the substitution is reported when it happens.
+    [string[]]$PostgresSkuFallback = @('Standard_D2ds_v5', 'Standard_D2ads_v5'),
+
+    # Skip infra\preflight.ps1, which otherwise runs first and stops on any blocker.
+    [switch]$SkipPreflight
 )
 
 $ErrorActionPreference = 'Stop'
@@ -328,6 +337,47 @@ Assert-AzSuccess 'Reading the active Azure account'
 if (-not $account) { throw "Not signed in. Run 'az login' first." }
 Write-Host "    subscription : $($account.name) ($($account.id))"
 Write-Host "    tenant       : $($account.tenantId)"
+
+# Everything preflight can know before anything is created is checked first, so a missing
+# role, quota or capability stops the run here rather than after a long provisioning.
+if (-not $SkipPreflight) {
+    Step 'Running preflight checks'
+    $preflightArgs = @{
+        Location          = $Location
+        ResourceGroup     = $ResourceGroup
+        AiLocation        = $AiLocation
+        ModelName         = $ModelName
+        ModelSku          = $ModelSku
+        ModelCapacity     = $ModelCapacity
+        PostgresSku       = $PostgresSku
+        AppServicePlanSku = $AppServicePlanSku
+        NetworkIsolation  = $NetworkIsolation
+        VnetAddressPrefix = $VnetAddressPrefix
+    }
+    if ($CostScopeSubscriptions.Count) { $preflightArgs.CostScopeSubscriptions = $CostScopeSubscriptions }
+    & (Join-Path $PSScriptRoot 'preflight.ps1') @preflightArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Preflight reported blockers (listed above). Nothing has been created. Resolve them, or pass -SkipPreflight only if you have verified them another way.'
+    }
+}
+
+# Admin consent for delegated ARM is the last thing the installer needs and the thing most
+# often missing, so it is checked now rather than after the infrastructure exists.
+if (-not $SkipEntra -and -not $EntraClientId -and -not $AllowAppIdentityFallback) {
+    $consent = Get-CloudLensConsentCapability
+    if ($consent.Status -eq 'no') {
+        throw ("The signed-in account holds no directory role that can grant admin consent " +
+               "(needs one of: $($consent.Roles -join ', ')), and this deployment needs it for sign-in. " +
+               "Nothing has been created. Either run this as a Cloud Application Administrator, have the identity team " +
+               "create the registration and pass -EntraClientId, or pass -AllowAppIdentityFallback to deploy now with " +
+               "limited subscription visibility and have an administrator grant consent afterwards.")
+    }
+    if ($consent.Status -eq 'unknown') {
+        Write-Warning 'Could not verify that the signed-in account can grant admin consent; the consent step near the end may be refused.'
+    } else {
+        Write-Host "    consent      : $($consent.Roles -join ', ')" -ForegroundColor Green
+    }
+}
 
 # The deploying principal becomes the PostgreSQL administrator. Password
 # authentication is disabled on the server, so without this nobody -- including
@@ -527,13 +577,40 @@ if ($WhatIf) {
     return
 }
 
-$result = az deployment sub create `
-    --name $deploymentName `
-    --location $Location `
-    --template-file $templateFile `
-    --parameters $templateParameters `
-    --query properties.outputs -o json | ConvertFrom-Json
-Assert-AzSuccess 'Provisioning the infrastructure'
+$skuAttempts = @($PostgresSku) + @($PostgresSkuFallback | Where-Object { $_ -and $_ -ne $PostgresSku })
+$result = $null
+for ($i = 0; $i -lt $skuAttempts.Count; $i++) {
+    $sku = $skuAttempts[$i]
+    $attemptParameters = @($templateParameters | ForEach-Object { if ($_ -like 'postgresSku=*') { "postgresSku=$sku" } else { $_ } })
+    $attemptName = if ($i -eq 0) { $deploymentName } else { "$deploymentName-r$i" }
+    $errFile = New-TemporaryFile
+    try {
+        $raw = az deployment sub create `
+            --name $attemptName `
+            --location $Location `
+            --template-file $templateFile `
+            --parameters $attemptParameters `
+            --query properties.outputs -o json 2>$errFile
+        $exit = $LASTEXITCODE
+        $errText = Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue
+    }
+    finally { Remove-Item -LiteralPath $errFile -ErrorAction SilentlyContinue }
+
+    if ($exit -eq 0) {
+        $result = ($raw | Out-String) | ConvertFrom-Json
+        if ($i -gt 0) {
+            Write-Warning "PostgreSQL was provisioned as $sku because $($skuAttempts[0]) was refused in $Location."
+            Write-Warning "$sku is General Purpose with less memory than the E-series default; review database sizing if reports are slow."
+        }
+        break
+    }
+    if ($errText -match 'SkuNotAvailable' -and $errText -match 'flexibleServers' -and $i -lt ($skuAttempts.Count - 1)) {
+        Write-Warning "Azure refused PostgreSQL SKU $sku in $Location (SkuNotAvailable). Retrying with $($skuAttempts[$i + 1])."
+        continue
+    }
+    Write-Host $errText
+    throw 'Provisioning the infrastructure failed. Deployment is incomplete; re-running is safe and reuses what was created.'
+}
 
 if (-not $result) { throw "Deployment produced no outputs." }
 
@@ -715,11 +792,15 @@ if (-not $SkipCode) {
 
     Step "Publishing to $webAppName"
     try {
+        # The platform's own startup tracking waits ten minutes and reports a failure even
+        # when the site comes up moments later (a transient VNet or first-start failure).
+        # Upload only, then judge the result by the application's own readiness check.
         az webapp deploy `
             --resource-group $ResourceGroup `
             --name $webAppName `
             --src-path $zip `
             --type zip `
+            --track-status false `
             --only-show-errors -o none
         Assert-AzSuccess 'Publishing application code'
     } finally {
@@ -727,7 +808,19 @@ if (-not $SkipCode) {
     }
 
     Step "Checking application readiness and sign-in"
-    Wait-CloudLensApplication -BaseUrl $webAppUrl
+    try {
+        Wait-CloudLensApplication -BaseUrl $webAppUrl -TimeoutSeconds 600 -Attempts 60
+    } catch {
+        Write-Warning "The app was not ready after publishing: $($_.Exception.Message)"
+        Write-Warning 'Restarting it once; first starts occasionally fail on a transient platform error.'
+        az webapp restart --resource-group $ResourceGroup --name $webAppName --only-show-errors -o none
+        Assert-AzSuccess 'Restarting the web app'
+        try {
+            Wait-CloudLensApplication -BaseUrl $webAppUrl -TimeoutSeconds 600 -Attempts 60
+        } catch {
+            throw ("$($_.Exception.Message) Inspect startup with: az webapp log download -g $ResourceGroup -n $webAppName")
+        }
+    }
 }
 
 Step "Done"

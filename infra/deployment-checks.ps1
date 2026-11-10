@@ -27,6 +27,29 @@ function Get-CloudLensPostgresTier([string]$Sku) {
     return 'GeneralPurpose'
 }
 
+function Get-CloudLensConsentCapability {
+    # Directory roles that can grant tenant-wide admin consent for delegated permissions.
+    $roles = @('Global Administrator', 'Privileged Role Administrator',
+               'Cloud Application Administrator', 'Application Administrator')
+    $raw = az rest --method GET `
+        --url 'https://graph.microsoft.com/v1.0/me/transitiveMemberOf/microsoft.graph.directoryRole?$select=displayName' `
+        -o json 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $raw) { return @{ Status = 'unknown'; Roles = $roles } }
+    $held = @(($raw | ConvertFrom-Json).value | ForEach-Object { $_.displayName } | Where-Object { $_ -in $roles })
+    # Eligible (not yet activated) PIM roles are not listed, so 'no' means no active role.
+    if ($held.Count) { return @{ Status = 'yes'; Roles = $held } }
+    return @{ Status = 'no'; Roles = $roles }
+}
+
+function Get-CloudLensModelAlternatives($Models, $Usages, [string]$Sku, [int]$Capacity, [string[]]$Preferred) {
+    # Other models offered on the same SKU with enough free quota. Compatibility with the
+    # application is not established by this list; it only says where capacity exists.
+    foreach ($name in $Preferred) {
+        $q = Get-CloudLensModelQuota $Models $Usages $name $Sku $Capacity
+        if ($q.Status -eq 'ok') { $name }
+    }
+}
+
 function Get-CloudLensModelQuota($Models, $Usages, [string]$ModelName, [string]$Sku, [int]$Capacity) {
     $names = @($Models | Where-Object { $_.model.name -eq $ModelName } |
         ForEach-Object { $_.model.skus } |

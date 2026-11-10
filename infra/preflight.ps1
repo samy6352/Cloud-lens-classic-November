@@ -181,7 +181,16 @@ Info ""
 Info "Admin consent for delegated ARM access (user_impersonation) needs Cloud"
 Info "Application Administrator or higher, and is a one-time action per tenant."
 Info "Without it nobody can sign in, so agree who does this before deployment day."
-Warn "delegated ARM tenant consent has not been verified; subscription Owner does not establish directory consent rights"
+$consentCheck = Get-CloudLensConsentCapability
+switch ($consentCheck.Status) {
+    'yes' { Ok "signed-in account holds a role that can grant admin consent: $($consentCheck.Roles -join ', ')" }
+    'no' {
+        Warn "signed-in account holds no active role that can grant admin consent"
+        Info "Needs one of: $($consentCheck.Roles -join ', '). deploy.ps1 stops before provisioning unless"
+        Info "-AllowAppIdentityFallback or -EntraClientId is given."
+    }
+    default { Warn "could not read directory roles; admin consent rights remain unverified" }
+}
 Info ""
 Info "Where that consent cannot be obtained, deploy with -AllowAppIdentityFallback."
 Info "CloudLens then resolves who holds a cost-capable role, which needs no directory"
@@ -237,6 +246,7 @@ if ($caps) {
         ForEach-Object { $_.supportedServerSkus.name }
     if ($skus -contains $PostgresSku) {
         Ok "PostgreSQL $PostgresSku ($tier) is available in $Location"
+        Info "the capability list is not a capacity reservation; deploy.ps1 retries with -PostgresSkuFallback if Azure refuses it"
     } else {
         Bad "PostgreSQL $PostgresSku ($tier) is not offered in $Location"
         Info "available $tier SKUs: $($skus -join ', ')"
@@ -289,7 +299,16 @@ if ($offered -contains $ModelSku) {
     $quota = Get-CloudLensModelQuota $models $usages.value $ModelName $ModelSku $ModelCapacity
     switch ($quota.Status) {
         'ok' { Ok $quota.Message }
-        'blocked' { Bad $quota.Message }
+        'blocked' {
+            Bad $quota.Message
+            $alts = @(Get-CloudLensModelAlternatives $models $usages.value $ModelSku $ModelCapacity @('gpt-4.1', 'gpt-4o-mini', 'gpt-5-mini', 'gpt-5.4-mini'))
+            if ($alts.Count) {
+                Info "Models with free quota on $ModelSku in ${AiLocation}: $($alts -join ', ')"
+                Info "Pass one with -ModelName, or request more quota. Application compatibility with a different model should be verified."
+            } else {
+                Info "No alternative in the usual list has free quota in $AiLocation; try another -AiLocation or request quota."
+            }
+        }
         default { Warn $quota.Message }
     }
 }
