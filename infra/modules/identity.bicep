@@ -35,6 +35,8 @@ param uniqueName string = 'cloudlens'
 @description('Redirect URIs. Include https://<web-app>/auth/callback, and a localhost URI for development.')
 param redirectUris array
 
+param delegatedArm bool = false
+
 // Microsoft Graph, and the two delegated scopes needed to sign someone in and
 // learn their name. Nothing more: CloudLens reads cost data with its own managed
 // identity, not with the user's Graph token.
@@ -73,7 +75,7 @@ resource application 'Microsoft.Graph/applications@v1.0' = {
       enableIdTokenIssuance: false
     }
   }
-  requiredResourceAccess: [
+  requiredResourceAccess: concat([
     {
       resourceAppId: graphAppId
       resourceAccess: [
@@ -83,13 +85,14 @@ resource application 'Microsoft.Graph/applications@v1.0' = {
         { id: userReadScope, type: 'Scope' }
       ]
     }
+  ], delegatedArm ? [
     {
       resourceAppId: armAppId
       resourceAccess: [
         { id: armUserImpersonation, type: 'Scope' }
       ]
     }
-  ]
+  ] : [])
 }
 
 resource servicePrincipal 'Microsoft.Graph/servicePrincipals@v1.0' = {

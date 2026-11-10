@@ -34,6 +34,8 @@ param(
 
     [string]$ManagementGroupId = '',
 
+    [switch]$DelegatedArm,
+
     # Region for the AI Foundry account, which is deliberately not $Location:
     # App Service quota and pay-as-you-go model availability are different sets.
     [string]$AiLocation = 'eastus2',
@@ -178,21 +180,21 @@ try {
 }
 
 Info ""
-Info "Admin consent for delegated ARM access (user_impersonation) needs Cloud"
-Info "Application Administrator or higher, and is a one-time action per tenant."
-Info "Without it nobody can sign in, so agree who does this before deployment day."
+Info "Default managed-identity Azure access requests no delegated ARM permission or admin consent."
+Info "Optional -DelegatedArm requires tenant approval of user_impersonation."
+if ($DelegatedArm) {
 $consentCheck = Get-CloudLensConsentCapability
 switch ($consentCheck.Status) {
     'yes' { Ok "signed-in account holds a role that can grant admin consent: $($consentCheck.Roles -join ', ')" }
     'no' {
         Warn "signed-in account holds no active role that can grant admin consent"
-        Info "Needs one of: $($consentCheck.Roles -join ', '). deploy.ps1 stops before provisioning unless"
-        Info "-AllowAppIdentityFallback or -EntraClientId is given."
+        Info "Relevant only to optional -DelegatedArm; not a default deployment blocker."
     }
     default { Warn "could not read directory roles; admin consent rights remain unverified" }
 }
+}
 Info ""
-Info "Where that consent cannot be obtained, deploy with -AllowAppIdentityFallback."
+Info "Managed-identity mode is the default; no fallback switch is needed."
 Info "CloudLens then resolves who holds a cost-capable role, which needs no directory"
 Info "rights -- but shows only subscriptions CloudLens itself was granted Reader on."
 Info "Select each scope to be analysed with -CostScopeSubscriptions (a same-tenant"

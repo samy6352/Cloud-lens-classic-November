@@ -719,3 +719,53 @@ defaults. Check the Azure Pricing Calculator for the selected region before depl
 
 The actual total depends on region, uptime, backups, data retention and telemetry volume.
 Do not use the old B1/B1ms estimate to approve a customer deployment.
+# Staged installation and administrator handoff
+
+Managed-identity Azure access is the default (`AUTH_DELEGATED_ARM=false`).
+Entra sign-in still requires a registration, redirect URI and whatever sign-in
+approval the tenant mandates, but the default installer neither requests ARM
+`user_impersonation` nor invokes tenant-wide admin consent. `-DelegatedArm` is
+an explicit alternative; never automatically upgrade an installation after consent.
+An existing registration may retain previously requested permissions; this installer
+does not silently remove them.
+
+Reader/Contributor plus Cost Management Reader/Contributor on data subscriptions
+does **not** confer role-assignment authority. Host provisioning includes bootstrap
+RBAC and must be run by an authorised resource/RBAC administrator (or a suitably
+scoped, approved pipeline). `-SkipPreflight` cannot bypass Azure permissions.
+
+1. A hosting administrator deploys with the desired explicit
+   `-CostScopeSubscriptions @('<ssamadda-id>','<raviverma-id>','<dechow-id>')`
+   and `-DeferCostAccess`. This writes a cost-access report without attempting cost
+   grants and defers export creation. It is not complete cost coverage.
+2. A reader/contributor can generate an exact, read-only handoff for an existing
+   host without redeployment:
+
+   ```powershell
+   .\infra\grant-cost-access.ps1 -HostingSubscriptionId '<host-sub-id>' `
+     -ResourceGroup '<host-rg>' -AppName '<existing-app>' `
+     -CostScopeSubscriptions @('<selected-sub-id>') -InstructionsOnly `
+     -ReportPath '.\data\cost-access\handoff.json'
+   ```
+
+   The installer also supports `-InstructionsOnly -Location '<region>'` with the
+   same host/scope parameters (`-CostAccessReportPath` instead of `-ReportPath`).
+   No Azure changes occur in this mode. Share the report with each selected scope's
+   authorised RBAC administrator. It identifies the verified runtime principal,
+   not the sign-in registration, and supplies exact grant/verification commands.
+3. Each administrator executes only their authorised scope's commands. Resume
+   without host redeployment by repeating `grant-cost-access.ps1` with those exact
+   parameters and `-InstructionsOnly` to verify. `pending`/`blocked` is not success;
+   verify all selected scopes, including scopes owned by a different team. A
+   non-instructions run attempts missing grants and fails on required pending scopes.
+4. An authorised export/storage administrator separately runs
+   `focus-exports.ps1 -HostingSubscriptionId '<host-sub-id>' -ResourceGroup '<host-rg>'`
+   `-WebAppName '<existing-app>' -Subscriptions @('<selected-sub-id>') -RunNow`
+   if exports need provisioning. Existing FOCUS exports are not proof of readable
+   blobs, ingestion, or dashboard visibility.
+
+Reports verify role assignments, not effective data access or ingestion. Validate
+sign-in, the server-side per-user RBAC intersection, export delivery/read access,
+ingestion and user-visible data separately. Selected scopes are coverage targets,
+never authorization whitelists. Missing rights on dechow must be granted by its
+authorised administrators; ssamadda/raviverma grants do not extend there.

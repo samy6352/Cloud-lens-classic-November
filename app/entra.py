@@ -185,19 +185,10 @@ class EntraSSO:
         }
 
         self.enabled = bool(self.client_id and self.tenant)
-        # On by default. The alternative — asking Azure, as *this app*, who holds a role
-        # assignment — is bounded by what this app's own identity can read, so a person with
-        # access to thirty subscriptions sees only the ones the app also has Reader on. That
-        # undercount is silent: the dashboard looks healthy and is simply missing money. For a
-        # cost tool that is the worst failure available, so the honest default is the token that
-        # belongs to the person asking, and Azure decides.
-        #
-        # The cost is a one-time administrator approval of `user_impersonation`, without which
-        # nobody can sign in at all. That is why this is guided rather than merely documented:
-        # `consent_needed` tells the page to offer the approval link before anyone hits the wall,
-        # and a refusal at the callback offers the same link instead of a raw OAuth code.
+        # Managed identity is the default: user RBAC is intersected with runtime coverage.
+        # Delegated ARM is an explicit tenant-approved alternative, never an automatic upgrade.
         self.delegated = os.getenv(
-            "AUTH_DELEGATED_ARM", "").strip().lower() not in ("0", "false", "no")
+            "AUTH_DELEGATED_ARM", "").strip().lower() in ("1", "true", "yes")
 
         # Anyone with a work account, from any directory. The alternative — a tenant GUID — is
         # still the default, and is what an app serving one organisation should keep.

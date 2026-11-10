@@ -136,7 +136,7 @@ param modelSku string
 param modelCapacity int
 
 @description('True calls Azure as the signed-in person; false is app-identity mode. See main.bicep.')
-param authDelegatedArm bool = true
+param authDelegatedArm bool = false
 
 @description('Tags applied to every resource.')
 param tags object

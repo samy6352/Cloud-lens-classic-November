@@ -145,7 +145,7 @@ param entraAppDisplayName string = 'CloudLens'
 param entraAppUniqueName string = 'cloudlens'
 
 @description('True calls Azure as the signed-in person, so each sees exactly their own subscriptions. Needs one-time tenant admin consent for ARM `user_impersonation`; without it nobody can sign in. False is app-identity mode: the app resolves who holds a cost-capable role, bounded by the subscriptions its own identity reads.')
-param authDelegatedArm bool = true
+param authDelegatedArm bool = false
 
 @description('Tags applied to every resource.')
 param tags object = {
@@ -218,6 +218,7 @@ module entra 'modules/identity.bicep' = if (deployEntraApp) {
   params: {
     displayName: entraAppDisplayName
     uniqueName: entraAppUniqueName
+    delegatedArm: authDelegatedArm
     redirectUris: [
       '${stack.outputs.webAppUrl}/auth/callback'
       'http://localhost:8000/auth/callback'

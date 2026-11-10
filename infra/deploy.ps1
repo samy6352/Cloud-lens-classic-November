@@ -56,8 +56,20 @@ param(
     # Keep the existing default for redeployments; use a new stable value for an independent stack.
     [string]$EntraAppUniqueName = 'cloudlens',
 
-    # Explicit opt-in only: limited mode uses the application's ARM identity.
+    # Compatibility alias: managed-identity mode is now the default.
     [switch]$AllowAppIdentityFallback,
+
+    # Explicit opt-in; requires tenant approval of delegated ARM user_impersonation.
+    [switch]$DelegatedArm,
+
+    # Host provisioning still requires resource creation AND bootstrap RBAC rights.
+    # Defer only cross-subscription cost grants, not hosting permissions.
+    [switch]$DeferCostAccess,
+
+    # Read-only handoff for an existing host; never provisions or changes Azure.
+    [switch]$InstructionsOnly,
+    [string]$AppName = '',
+    [string]$HostingSubscriptionId = '',
 
     # Required when deploying as a service principal; its display name is not a user sign-in.
     [string[]]$Admins = @(),
@@ -182,6 +194,16 @@ $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'deployment-checks.ps1')
 . (Join-Path $PSScriptRoot 'cost-access.ps1')
 . (Join-Path $PSScriptRoot 'storage-naming.ps1')
+if ($DelegatedArm -and $AllowAppIdentityFallback) {
+    throw 'Choose -DelegatedArm OR managed-identity mode, not both.'
+}
+if ($InstructionsOnly) {
+    if (-not $AppName) { throw '-InstructionsOnly requires the existing -AppName.' }
+    Invoke-CloudLensCostAccess -HostingSubscriptionId $HostingSubscriptionId -ResourceGroup $ResourceGroup `
+        -AppName $AppName -CostScopeSubscriptions $CostScopeSubscriptions -CostScopeAllVisible:$CostScopeAllVisible `
+        -EnableExportManagement:$EnableExportManagement -InstructionsOnly -ReportPath $CostAccessReportPath
+    return
+}
 if ($NetworkIsolation) {
     $network = Get-CloudLensIpv4Range $VnetAddressPrefix
     $subnets = @($AppSubnetAddressPrefix, $PostgresSubnetAddressPrefix, $PrivateEndpointSubnetAddressPrefix)
@@ -353,6 +375,7 @@ if (-not $SkipPreflight) {
         AppServicePlanSku = $AppServicePlanSku
         NetworkIsolation  = $NetworkIsolation
         VnetAddressPrefix = $VnetAddressPrefix
+        DelegatedArm      = $DelegatedArm
     }
     if ($CostScopeSubscriptions.Count) { $preflightArgs.CostScopeSubscriptions = $CostScopeSubscriptions }
     & (Join-Path $PSScriptRoot 'preflight.ps1') @preflightArgs
@@ -363,14 +386,13 @@ if (-not $SkipPreflight) {
 
 # Admin consent for delegated ARM is the last thing the installer needs and the thing most
 # often missing, so it is checked now rather than after the infrastructure exists.
-if (-not $SkipEntra -and -not $EntraClientId -and -not $AllowAppIdentityFallback) {
+if ($DelegatedArm -and -not $SkipEntra -and -not $EntraClientId) {
     $consent = Get-CloudLensConsentCapability
     if ($consent.Status -eq 'no') {
         throw ("The signed-in account holds no directory role that can grant admin consent " +
                "(needs one of: $($consent.Roles -join ', ')), and this deployment needs it for sign-in. " +
                "Nothing has been created. Either run this as a Cloud Application Administrator, have the identity team " +
-               "create the registration and pass -EntraClientId, or pass -AllowAppIdentityFallback to deploy now with " +
-               "limited subscription visibility and have an administrator grant consent afterwards.")
+               "approve the registration, or rerun without -DelegatedArm for managed-identity mode.")
     }
     if ($consent.Status -eq 'unknown') {
         Write-Warning 'Could not verify that the signed-in account can grant admin consent; the consent step near the end may be refused.'
@@ -552,7 +574,7 @@ $templateParameters = @(
     "appServicePlanSku=$AppServicePlanSku"
     "entraAppUniqueName=$EntraAppUniqueName"
     "deployEntraApp=$((-not $SkipEntra -and -not $EntraClientId).ToString().ToLower())"
-    "authDelegatedArm=$((-not $AllowAppIdentityFallback).ToString().ToLower())"
+    "authDelegatedArm=$($DelegatedArm.ToString().ToLower())"
 )
 
 if ($EmitArm) {
@@ -628,9 +650,9 @@ Write-Host "    foundry      : $($result.foundryAccount.value) ($AiLocation, $Mo
 Step 'Granting managed-identity cost access'
 $costAccess = Invoke-CloudLensCostAccess -HostingSubscriptionId $account.id -ResourceGroup $ResourceGroup `
     -AppName $webAppName -CostScopeSubscriptions $CostScopeSubscriptions -CostScopeAllVisible:$CostScopeAllVisible `
-    -EnableExportManagement:$EnableExportManagement -ReportPath $CostAccessReportPath
+    -EnableExportManagement:$EnableExportManagement -InstructionsOnly:$DeferCostAccess -ReportPath $CostAccessReportPath
 if ($costAccess.pendingSubscriptions.Count) {
-    Write-Warning 'Optional cost scopes remain pending; this deployment does not have complete cost coverage. Use infra\grant-cost-access.ps1 to repair access without redeploying.'
+    Write-Warning 'Selected cost scopes remain pending; this deployment does not have complete cost coverage. Use infra\grant-cost-access.ps1 to repair access without redeploying.'
 }
 
 # ------------------------------------------------------------ FOCUS exports
@@ -646,7 +668,7 @@ if ($costAccess.pendingSubscriptions.Count) {
 #
 # Never fatal. The stack is complete and usable without exports -- Quick refresh reads cost
 # through ARM -- so a missing grant is reported and the deployment stands.
-if (-not $SkipFocusExports) {
+if (-not $SkipFocusExports -and -not $DeferCostAccess) {
     Step 'Provisioning FOCUS exports'
     $focusScope = @($costAccess.subscriptions |
         Where-Object { $_.validation -eq 'valid' } |
@@ -662,8 +684,7 @@ if (-not $SkipFocusExports) {
     } catch {
         $focusProvisioned = $false
         Write-Warning "FOCUS exports were not provisioned: $($_.Exception.Message)"
-        Write-Warning 'The deployment is complete and Quick refresh works. Hourly Billing,'
-        Write-Warning 'Applications & Tags and scheduling savings stay empty until exports exist.'
+        Write-Warning 'Data visibility is not verified. Detailed reporting requires readable exports and successful ingestion.'
         Write-Warning 'Re-run infra\focus-exports.ps1 once the reported access is granted.'
     }
 } else {
@@ -712,7 +733,7 @@ if ($clientId) {
         $armScope = @($armAccess.resourceAccess | Where-Object {
             $_.id -eq '41094075-9dad-400e-a0bd-54e686782033' -and $_.type -eq 'Scope'
         })
-        if (-not $armScope.Count) {
+        if ($DelegatedArm -and -not $armScope.Count) {
             az ad app permission add --id $clientId --api '797f4846-ba00-4fd7-ba43-dac1f8f63013' `
                 --api-permissions '41094075-9dad-400e-a0bd-54e686782033=Scope' --only-show-errors -o none
             Assert-AzSuccess 'Requesting delegated ARM permission'
@@ -732,48 +753,18 @@ if ($clientId) {
     Write-Host "    client id    : $clientId"
     Write-Host "    redirect URI : $redirectUri"
 
-    # Delegated ARM is the default, and it is the reason the subscription list is correct
-    # rather than bounded by what this app's own identity can read. It needs a one-time tenant
-    # admin consent for `user_impersonation`, without which nobody can sign in at all -- so try
-    # it here rather than leaving a deployment that looks finished and refuses everyone at the
-    # door. AUTH_DELEGATED_ARM itself is carried by the template, not patched on here.
-    Step "Granting admin consent for delegated ARM access"
-    az ad app permission admin-consent --id $clientId --only-show-errors -o none 2>$null
-    $consented = $LASTEXITCODE -eq 0
-    if ($consented -and -not $AllowAppIdentityFallback) {
-        Write-Host "    consented    : ARM user_impersonation" -ForegroundColor Green
-    }
-    elseif ($consented) {
-        # Fallback was requested but is no longer needed. Take the better mode rather than
-        # leaving a deployment permanently limited by a flag nobody remembers passing.
-        az webapp config appsettings set `
-            --resource-group $ResourceGroup `
-            --name $webAppName `
-            --settings "AUTH_DELEGATED_ARM=true" `
-            --only-show-errors -o none
-        Assert-AzSuccess 'Upgrading to delegated ARM after consent succeeded'
-        Write-Host "    consented    : ARM user_impersonation" -ForegroundColor Green
-        Write-Host "    -AllowAppIdentityFallback was not needed and has been ignored."
-    }
-    else {
-        Write-Warning "Consent was refused. This needs Cloud Application Administrator or"
-        Write-Warning "higher in $($account.tenantId), and is usually not the person who owns"
-        Write-Warning "the subscription. An administrator grants it with:"
-        Write-Warning "  az ad app permission admin-consent --id $clientId"
-        Write-Warning ""
-        if (-not $AllowAppIdentityFallback) {
-            throw 'Delegated ARM consent is required. Have the tenant administrator grant consent and rerun, or explicitly choose -AllowAppIdentityFallback for limited app-identity mode.'
+    # Consent is never attempted in the default managed-identity mode.
+    $consented = $false
+    if ($DelegatedArm) {
+        Step "Granting admin consent for delegated ARM access"
+        az ad app permission admin-consent --id $clientId --only-show-errors -o none 2>$null
+        $consented = $LASTEXITCODE -eq 0
+        if ($consented) {
+            Write-Host "    consented    : ARM user_impersonation" -ForegroundColor Green
+        } else {
+            Write-Warning "Administrator handoff: az ad app permission admin-consent --id $clientId"
+            throw 'Delegated ARM consent is required. Have the tenant administrator grant consent and rerun, or rerun without -DelegatedArm for managed-identity mode.'
         }
-
-        # Leaving delegated ARM on after a refusal ships a deployment that looks finished and
-        # turns every single person away at the sign-in page, because the authorize request
-        # asks for a scope nobody is allowed to consent to. The template already carries
-        # AUTH_DELEGATED_ARM=false for this run, so people get in, and the subscription list
-        # is bounded by what CloudLens itself holds Reader on -- visible in the UI, unlike a
-        # door that will not open.
-        Write-Warning "Continuing in app-identity mode (AUTH_DELEGATED_ARM=false). People see the"
-        Write-Warning "subscriptions they hold a cost-capable role on, among those CloudLens was"
-        Write-Warning "granted Reader on. Once consent is granted, rerun without the switch."
     }
 } else {
     Write-Host "    skipped -- the app will use a local password" -ForegroundColor DarkGray
@@ -823,7 +814,10 @@ if (-not $SkipCode) {
     }
 }
 
-Step "Done"
+Step "Installation stages finished (data visibility unverified)"
+if ($costAccess.status -ne 'complete') {
+    Write-Warning "PENDING cost access: $($costAccess.pendingSubscriptions -join ', '). Report: $($costAccess.reportPath)"
+}
 Write-Host "    $webAppUrl" -ForegroundColor Green
 Write-Host ""
 
@@ -831,10 +825,9 @@ Write-Host ""
 # still works, so "it looks fine" is exactly the wrong signal to leave someone with.
 if ($focusProvisioned) {
     Write-Host "Cost detail  : FOCUS exports provisioned. Azure delivers the first reports" -ForegroundColor Green
-    Write-Host "               within a few hours; CloudLens imports them automatically." -ForegroundColor Green
+    Write-Host "               asynchronously; delivery, ingestion and per-user visibility remain unverified." -ForegroundColor Yellow
 } else {
-    Write-Host "Cost detail  : no FOCUS exports. Quick refresh works, but Hourly Billing," -ForegroundColor Yellow
-    Write-Host "               Applications & Tags and scheduling savings will be empty." -ForegroundColor Yellow
+    Write-Host "Cost detail  : export provisioning skipped or failed; existing exports were not verified." -ForegroundColor Yellow
     Write-Host "               Fix with: infra\focus-exports.ps1 -ResourceGroup $ResourceGroup -WebAppName $webAppName -RunNow" -ForegroundColor Yellow
 }
 Write-Host ""
@@ -844,8 +837,8 @@ if ($SkipCode) {
     return
 }
 if ($clientId -and $consented) {
-    Write-Host "Sign in with the Microsoft button. Nothing further is required." -ForegroundColor Green
-} elseif ($clientId -and $AllowAppIdentityFallback) {
+    Write-Host "Delegated sign-in configured; validate sign-in and per-user data visibility." -ForegroundColor Green
+} elseif ($clientId -and -not $DelegatedArm) {
     Write-Host "Sign in with the Microsoft button. Running in app-identity mode -- see the warning above." -ForegroundColor Yellow
 } elseif ($clientId) {
     Write-Host "Sign-in is configured but not yet consented -- see the warning above." -ForegroundColor Yellow

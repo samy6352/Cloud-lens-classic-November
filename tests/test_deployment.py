@@ -145,12 +145,16 @@ function global:az {
         return (ConvertTo-Json -Depth 10 -InputObject $app)
     }
     if ($call.StartsWith('ad app update')) { return }
-    if ($call.StartsWith('ad app permission add')) { return }
+    if ($call.StartsWith('ad app permission add')) {
+        if (-not $DelegatedArm) { throw 'Default mode requested delegated ARM permission' }
+        return
+    }
     if ($call.StartsWith('webapp config appsettings set')) {
         if ($call.Contains('AUTH_DELEGATED_ARM=true')) { Write-Host 'UPGRADED_TO_DELEGATED' }
         return
     }
     if ($call.StartsWith('ad app permission admin-consent')) {
+        if (-not $DelegatedArm) { throw 'Default mode requested tenant-wide consent' }
         if ($scenario -eq 'consent-ok') { return }
         $global:LASTEXITCODE = 9
         return
@@ -167,7 +171,7 @@ class DeploymentFailures(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=ROOT / ".pytest_cache", ignore_cleanup_errors=True) as work:
             state = str(Path(work) / "storage.json").replace("'", "''")
             report = str(Path(work) / "cost-access.json").replace("'", "''")
-            command = f"$scenario = '{scenario}'\n{MOCK}\n& '{script}' -Location eastus2 -StorageNameStatePath '{state}' -CostAccessReportPath '{report}' {options}"
+            command = f"$scenario = '{scenario}'\n{MOCK}\n& '{script}' -Location eastus2 -SkipPreflight -StorageNameStatePath '{state}' -CostAccessReportPath '{report}' {options}"
             return subprocess.run([POWERSHELL, "-NoProfile", "-Command", command],
                                   capture_output=True, text=True, timeout=60)
 
@@ -196,7 +200,7 @@ class DeploymentFailures(unittest.TestCase):
         self.assertNotIn("==> Done", result.stdout)
 
     def test_consent_failure_requires_explicit_fallback(self):
-        result = self.run_deploy("consent-failure", "-SkipCode -EntraClientId fixture-client")
+        result = self.run_deploy("consent-failure", "-SkipCode -EntraClientId fixture-client -DelegatedArm")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Delegated ARM consent is required", result.stdout + result.stderr)
         self.assertNotIn("EXPLICIT_FALLBACK_APPLIED", result.stdout)
@@ -209,11 +213,12 @@ class DeploymentFailures(unittest.TestCase):
         self.assertIn("application code was not published", result.stdout)
         self.assertNotIn("Nothing further is required", result.stdout)
 
-    def test_granted_consent_overrides_a_requested_fallback(self):
+    def test_managed_identity_never_upgrades_to_delegated(self):
         result = self.run_deploy("consent-ok",
                                  "-SkipCode -EntraClientId fixture-client -AllowAppIdentityFallback")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("UPGRADED_TO_DELEGATED", result.stdout)
+        self.assertNotIn("UPGRADED_TO_DELEGATED", result.stdout)
+        self.assertNotIn("consented    :", result.stdout)
 
     # ------------------------------------------------ adopting a registration
     #
@@ -311,7 +316,20 @@ class DeploymentFailures(unittest.TestCase):
             "-SkipCode -EntraClientId fixture-client -CostScopeAllVisible -AllowAppIdentityFallback")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Pending managed-identity coverage: 99999999-9999-4999-8999-999999999999", result.stdout + result.stderr)
-        self.assertIn("Optional cost scopes remain pending", result.stdout)
+        self.assertIn("Selected cost scopes remain pending", result.stdout)
+
+    def test_deferred_required_cost_grants_remain_pending(self):
+        result = self.run_deploy("role-failure", "-SkipCode -SkipEntra -DeferCostAccess")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("pending-instructions", result.stdout)
+        self.assertIn("PENDING cost access", result.stdout)
+        self.assertNotIn("grant-failed", result.stdout)
+
+    def test_existing_host_handoff_is_read_only(self):
+        result = self.run_deploy("role-failure", "-InstructionsOnly -AppName fixture-app")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("pending-instructions", result.stdout)
+        self.assertNotIn("EXPLICIT_FALLBACK_APPLIED", result.stdout)
         self.assertIn("11111111-1111-4111-8111-111111111111 : Cost Management Reader", result.stdout)
 
     def test_readiness_retries_transient_errors_and_requires_auth(self):
