@@ -66,7 +66,7 @@ assert.match(html,/Checking for unusual spend/);
 assert.ok(html.indexOf('id="overviewAnomsBody"')<html.indexOf('class="overview-main"'),
   "the anomaly figure sits in the KPI strip, above the main row");
 await new Promise(resolve=>setTimeout(resolve,0));
-assert.deepEqual(asked,["/api/dashboard/anomalies?days=30"]);
+assert.deepEqual(asked,["/api/dashboard/advisor-score?days=30","/api/dashboard/anomalies?days=30"]);
 const value=nodes.get("overviewAnomsValue").innerHTML;
 assert.match(value,/2/,"flagged days is the headline figure");
 assert.match(value,/1 high/);

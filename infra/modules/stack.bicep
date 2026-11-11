@@ -115,6 +115,10 @@ param authAllowLocal bool = false
 @description('Local accounts as name:hash:role, PBKDF2 hashed. Never a plaintext password.')
 @secure()
 param authUsers string = ''
+param authClientId string = ''
+param authTenantId string = ''
+param authRedirectUri string = ''
+param authAdmins string = ''
 
 @description('Schema the warehouse owns. Empty uses `public`.')
 param pgSchema string = ''
@@ -136,7 +140,7 @@ param modelSku string
 param modelCapacity int
 
 @description('True calls Azure as the signed-in person; false is app-identity mode. See main.bicep.')
-param authDelegatedArm bool = false
+param authDelegatedArm bool = true
 
 @description('Tags applied to every resource.')
 param tags object
@@ -651,6 +655,22 @@ resource webApp 'Microsoft.Web/sites@2023-12-01' = {
         {
           name: 'AUTH_DISABLED'
           value: 'false'
+        }
+        {
+          name: 'AUTH_CLIENT_ID'
+          value: authClientId
+        }
+        {
+          name: 'AUTH_TENANT_ID'
+          value: authTenantId
+        }
+        {
+          name: 'AUTH_REDIRECT_URI'
+          value: authRedirectUri
+        }
+        {
+          name: 'AUTH_ADMINS'
+          value: authAdmins
         }
         {
           // The mode is set here rather than patched onto the web app afterwards, so a later

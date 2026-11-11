@@ -137,6 +137,7 @@ def test_the_endpoint_and_the_button_agree_on_the_parameter():
 
     assert "fresh: bool = False" in server
     assert "schedules.listing(picked or allowed, fresh=fresh)" in server
-    assert 'fresh ? "&fresh=true" : ""' in client
-    assert "renderSettings(ctx.loadToken, true)" in client, (
-        "the Reload button has to be the thing that asks for it")
+    inventory = client.split('$("cdLoadExports").onclick = async () => {', 1)[1].split(
+        "const visibility =", 1)[0]
+    assert '/api/schedules?scope=' in inventory and '&fresh=true' in inventory, (
+        "explicit export inventory reads must bypass the server cache")

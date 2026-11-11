@@ -171,7 +171,8 @@ class DeploymentFailures(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=ROOT / ".pytest_cache", ignore_cleanup_errors=True) as work:
             state = str(Path(work) / "storage.json").replace("'", "''")
             report = str(Path(work) / "cost-access.json").replace("'", "''")
-            command = f"$scenario = '{scenario}'\n{MOCK}\n& '{script}' -Location eastus2 -SkipPreflight -StorageNameStatePath '{state}' -CostAccessReportPath '{report}' {options}"
+            mode = "" if "-DelegatedArm" in options else "-DelegatedArm:$false"
+            command = f"$scenario = '{scenario}'\n{MOCK}\n& '{script}' -Location eastus2 -AiLocation eastus2 {mode} -SkipPreflight -StorageNameStatePath '{state}' -CostAccessReportPath '{report}' {options}"
             return subprocess.run([POWERSHELL, "-NoProfile", "-Command", command],
                                   capture_output=True, text=True, timeout=60)
 
@@ -202,7 +203,7 @@ class DeploymentFailures(unittest.TestCase):
     def test_consent_failure_requires_explicit_fallback(self):
         result = self.run_deploy("consent-failure", "-SkipCode -EntraClientId fixture-client -DelegatedArm")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Delegated ARM consent is required", result.stdout + result.stderr)
+        self.assertIn("already admin-approved registration", result.stdout + result.stderr)
         self.assertNotIn("EXPLICIT_FALLBACK_APPLIED", result.stdout)
 
     def test_explicit_limited_mode_is_reported_as_infrastructure_only(self):

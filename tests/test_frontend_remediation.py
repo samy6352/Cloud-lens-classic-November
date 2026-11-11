@@ -135,7 +135,10 @@ ctx.executiveData=async()=>({currency:"USD",days:30,kpis:{total:1,previous:1},
   trend:{labels:[],values:[],previous:[]},areas:[],services:[],regions:[],movers:[],subscriptions:[],resource_groups:[]});
 for(const view of ["overview","esu"]) {
   let resolve; let reads=0;
-  ctx.get=async()=>{reads++;return new Promise(done=>{resolve=done;});};
+  ctx.get=async url=>{
+    if(url.startsWith("/api/dashboard/advisor-score"))return {categories:[],subscriptions:[]};
+    reads++;return new Promise(done=>{resolve=done;});
+  };
   ctx.live=async()=>({currency:"USD",machines:[]});
   const family=view==="overview"?createTabs(ctx):createOptimize(ctx);
   const render=view==="overview"?"renderOverview":"renderEsu";

@@ -1,11 +1,11 @@
-"""Prove the delegated-ARM default, and that the consent it needs is guided rather than sprung.
+"""Prove managed-identity defaults and guide consent for explicit delegated ARM.
 
-The point of the default is a factual claim about what a person sees. Asking Azure *as this app*
+The choice is a factual claim about what a person sees. Asking Azure *as this app*
 which subscriptions carry a role assignment is bounded by what the app's own identity can read,
 so someone entitled to thirty subscriptions can be shown four and the dashboard will look
 perfectly healthy while missing money. Holding the person's own token has no such bound.
 
-The price is a one-time administrator approval, and until it is granted nobody can sign in at
+Explicit delegation requires a one-time administrator approval; until it is granted nobody can sign in at
 all. That is a fine trade only if the approval is impossible to miss, so this also checks the
 three places it is offered: on the sign-in page before anyone is refused, in the startup log,
 and at the callback when Entra does refuse.
@@ -63,16 +63,16 @@ ONE = {"AUTH_CLIENT_ID": "abc", "AUTH_TENANT_ID": TENANT}
 
 # ------------------------------------------------------------------ the default
 print("=" * 72)
-print("a person sees their own subscriptions unless told otherwise")
+print("managed identity is the default; delegated ARM requires explicit opt-in")
 sso, entra = fresh_sso(**ONE)
-check("delegated ARM is on by default", sso.delegated is True)
-check("so the sign-in asks for an Azure token",
-      entra.ARM_SCOPE in sso.scopes, str(sso.scopes))
+check("delegated ARM is off by default", sso.delegated is False)
+check("so sign-in does not ask for an Azure token",
+      entra.ARM_SCOPE not in sso.scopes, str(sso.scopes))
 
-for spelling in ("false", "False", "0", "no"):
+for spelling in ("", "false", "False", "0", "no"):
     s, _ = fresh_sso(**ONE, AUTH_DELEGATED_ARM=spelling)
     check(f"AUTH_DELEGATED_ARM={spelling!r} turns it off", s.delegated is False)
-for spelling in ("", "true", "1", "yes"):
+for spelling in ("true", "1", "yes"):
     s, _ = fresh_sso(**ONE, AUTH_DELEGATED_ARM=spelling)
     check(f"AUTH_DELEGATED_ARM={spelling!r} leaves it on", s.delegated is True)
 
@@ -87,29 +87,33 @@ except RuntimeError as exc:
     check("multi-tenant without delegation is still refused", True)
     check("…and says why", "delegated" in str(exc).lower(), str(exc)[:80])
 
-# The default now makes that combination work on its own, where before it was a hard stop.
+# Multi-tenant deployments must opt in explicitly.
 try:
     multi, _ = fresh_sso(AUTH_CLIENT_ID="abc", AUTH_TENANT_ID="organizations")
-    check("multi-tenant now needs no extra setting", multi.delegated is True)
+    check("multi-tenant without explicit delegation is refused", False, "no error raised")
 except RuntimeError as exc:
-    check("multi-tenant now needs no extra setting", False, str(exc)[:80])
+    check("multi-tenant without explicit delegation is refused",
+          "AUTH_DELEGATED_ARM=true" in str(exc), str(exc)[:80])
+multi, _ = fresh_sso(AUTH_CLIENT_ID="abc", AUTH_TENANT_ID="organizations",
+                     AUTH_DELEGATED_ARM="true")
+check("multi-tenant with explicit delegation works", multi.delegated is True)
 
 
 # ------------------------------------------------------------------ consent state
 print("\n" + "=" * 72)
 print("the approval is offered until it demonstrably works, then never again")
-sso, entra = fresh_sso(**ONE)
+sso, entra = fresh_sso(**ONE, AUTH_DELEGATED_ARM="true")
 from app.warehouse import warehouse  # noqa: E402
 
 warehouse.set_meta(entra.CONSENT_KEY, "not-granted")
-sso, entra = fresh_sso(**ONE)
+sso, entra = fresh_sso(**ONE, AUTH_DELEGATED_ARM="true")
 check("a fresh install asks for approval", sso.consent_needed is True)
 
 sso.record_consent()
 check("a successful delegated sign-in settles it", sso.consent_needed is False)
 check("…durably", warehouse.get_meta(entra.CONSENT_KEY) == "granted")
 
-after_restart, _ = fresh_sso(**ONE)
+after_restart, _ = fresh_sso(**ONE, AUTH_DELEGATED_ARM="true")
 check("and it stays settled across a restart", after_restart.consent_needed is False)
 
 # Nothing to approve when the app never asks for the scope.
@@ -139,7 +143,8 @@ handler = Capture()
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 try:
-    fresh_sso(**ONE, AUTH_REDIRECT_URI="https://cloudlens.contoso.com/auth/callback")
+    fresh_sso(**ONE, AUTH_DELEGATED_ARM="true",
+              AUTH_REDIRECT_URI="https://cloudlens.contoso.com/auth/callback")
     startup = " ".join(records)
     check("startup names the consent endpoint",
           "https://cloudlens.contoso.com/auth/admin-consent" in startup, startup[:120])
@@ -162,6 +167,7 @@ for leftover in ("AUTH_DISABLED", "AUTH_ALLOW_LOCAL", "AUTH_PASSWORD", "AUTH_USE
                  "AUTH_API_TOKENS", "AUTH_CLIENT_SECRET", "AUTH_DELEGATED_ARM",
                  "AUTH_HOME_TENANT", "AUTH_HIDE_WORK_SIGNIN"):
     os.environ[leftover] = ""
+os.environ["AUTH_DELEGATED_ARM"] = "true"
 
 from fastapi.testclient import TestClient  # noqa: E402
 

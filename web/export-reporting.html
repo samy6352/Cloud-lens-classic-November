@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Export-backed billing — CloudLens</title>
+  <link rel="stylesheet" href="/assets/app.css">
+  <script src="/assets/export-reporting.js" defer></script>
+</head>
+<body>
+  <main>
+    <a href="/">Back to live dashboard</a>
+    <h1>Export-backed subscription billing</h1>
+    <p>Separate immutable FOCUS reports. These subscriptions are not live Azure scopes.
+      Inventory, budgets, optimization, refresh and resource changes are unavailable here.</p>
+    <p id="identity"></p>
+    <p id="status" role="status"></p>
+    <label>Export-backed subscription <select id="datasets"><option value="">Select a report</option></select></label>
+    <section id="report" hidden>
+      <h2 id="label"></h2>
+      <p id="freshness"></p>
+      <p id="coverage"></p>
+      <p id="totals"></p>
+      <button disabled>Live refresh unavailable</button>
+      <button disabled>Resource actions unavailable</button>
+      <h3>Daily billing by service and original currency</h3>
+      <p>All charges in the pinned run, including credits. Currencies are never combined.
+        Billed cost is invoice-basis; effective cost includes amortization. This is not a final invoice.</p>
+      <table>
+        <thead><tr><th>Day</th><th>Service</th><th>Currency</th><th>Billed cost</th><th>Effective cost</th><th>Charge rows</th></tr></thead>
+        <tbody id="charges"></tbody>
+      </table>
+    </section>
+    <section id="admin" hidden>
+      <h2>App administrator: onboard an approved export</h2>
+      <p>Import validates one complete run into isolated report storage. It never grants access automatically.
+        Each new import needs fresh explicit approval. Copy the recipient's tenant/object principal from their signed-in page, not an email or an Azure owner assignment.</p>
+      <label>Operator-approved source <select id="sources"></select></label>
+      <button id="import">Import pinned run</button>
+      <h3>Grant or revoke report access</h3>
+      <label>Imported dataset <select id="managed"></select></label>
+      <label>Entra principal <input id="principal" placeholder="entra:tenant-uuid:object-uuid"></label>
+      <button id="self">Use my authenticated principal</button>
+      <button id="grant">Approve read access</button>
+      <button id="revoke">Revoke read access</button>
+      <pre id="grants"></pre>
+    </section>
+  </main>
+</body>
+</html>

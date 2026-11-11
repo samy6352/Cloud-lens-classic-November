@@ -37,7 +37,7 @@ param(
     # the regions with App Service quota and the regions offering a model on a
     # pay-as-you-go SKU are different sets, and centralindia -- the default for
     # the app -- offers gpt-4.1-mini only as reserved capacity.
-    [string]$AiLocation = 'eastus2',
+    [string]$AiLocation = '',
 
     [string]$ModelName = 'gpt-4.1-mini',
 
@@ -49,18 +49,18 @@ param(
     # client ID with -EntraClientId instead.
     [switch]$SkipEntra,
 
-    # An existing app registration to use rather than creating one. Its redirect
-    # URI is updated to match this deployment's hostname.
+    # Existing customer registration. In delegated mode it is verified read-only;
+    # the identity team must preconfigure the exact callback.
     [string]$EntraClientId = '',
 
     # Keep the existing default for redeployments; use a new stable value for an independent stack.
     [string]$EntraAppUniqueName = 'cloudlens',
 
-    # Compatibility alias: managed-identity mode is now the default.
+    # Explicit legacy mode only; not the customer delegated onboarding solution.
     [switch]$AllowAppIdentityFallback,
 
-    # Explicit opt-in; requires tenant approval of delegated ARM user_impersonation.
-    [switch]$DelegatedArm,
+    # Customer default; requires preapproved delegated ARM user_impersonation.
+    [switch]$DelegatedArm = $true,
 
     # Host provisioning still requires resource creation AND bootstrap RBAC rights.
     # Defer only cross-subscription cost grants, not hosting permissions.
@@ -183,7 +183,7 @@ param(
     # The capabilities API lists SKUs a region offers but cannot see regional capacity, so
     # this is only discoverable at deployment time. General Purpose D-series have half the
     # memory of the default E-series; the substitution is reported when it happens.
-    [string[]]$PostgresSkuFallback = @('Standard_D2ds_v5', 'Standard_D2ads_v5'),
+    [string[]]$PostgresSkuFallback = @(),
 
     # Skip infra\preflight.ps1, which otherwise runs first and stops on any blocker.
     [switch]$SkipPreflight
@@ -194,6 +194,10 @@ $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'deployment-checks.ps1')
 . (Join-Path $PSScriptRoot 'cost-access.ps1')
 . (Join-Path $PSScriptRoot 'storage-naming.ps1')
+. (Join-Path $PSScriptRoot 'delegated-consent.ps1')
+if ($AllowAppIdentityFallback -and -not $PSBoundParameters.ContainsKey('DelegatedArm')) {
+    $DelegatedArm = $false
+}
 if ($DelegatedArm -and $AllowAppIdentityFallback) {
     throw 'Choose -DelegatedArm OR managed-identity mode, not both.'
 }
@@ -203,6 +207,9 @@ if ($InstructionsOnly) {
         -AppName $AppName -CostScopeSubscriptions $CostScopeSubscriptions -CostScopeAllVisible:$CostScopeAllVisible `
         -EnableExportManagement:$EnableExportManagement -InstructionsOnly -ReportPath $CostAccessReportPath
     return
+}
+if (-not $AiLocation) {
+    throw 'Pass -AiLocation with the customer-approved AI region; no cross-region default is assumed.'
 }
 if ($NetworkIsolation) {
     $network = Get-CloudLensIpv4Range $VnetAddressPrefix
@@ -357,6 +364,14 @@ Step "Checking sign-in"
 $account = az account show -o json | ConvertFrom-Json
 Assert-AzSuccess 'Reading the active Azure account'
 if (-not $account) { throw "Not signed in. Run 'az login' first." }
+if ($DelegatedArm) {
+    if ($SkipEntra -or -not $EntraClientId -or -not $NameSuffix) {
+        throw 'Customer delegated deployment requires -EntraClientId for an already admin-approved registration and an explicit -NameSuffix for a preapproved deterministic callback. -SkipEntra is incompatible.'
+    }
+    Assert-AdoptableRegistration $EntraClientId
+    Assert-CloudLensDelegatedConsent -ClientId $EntraClientId `
+        -RedirectUri "https://$NamePrefix-web-$NameSuffix.azurewebsites.net/auth/callback"
+}
 Write-Host "    subscription : $($account.name) ($($account.id))"
 Write-Host "    tenant       : $($account.tenantId)"
 
@@ -376,28 +391,13 @@ if (-not $SkipPreflight) {
         NetworkIsolation  = $NetworkIsolation
         VnetAddressPrefix = $VnetAddressPrefix
         DelegatedArm      = $DelegatedArm
+        EntraClientId     = $EntraClientId
+        RedirectUri       = "https://$NamePrefix-web-$NameSuffix.azurewebsites.net/auth/callback"
     }
     if ($CostScopeSubscriptions.Count) { $preflightArgs.CostScopeSubscriptions = $CostScopeSubscriptions }
     & (Join-Path $PSScriptRoot 'preflight.ps1') @preflightArgs
     if ($LASTEXITCODE -ne 0) {
         throw 'Preflight reported blockers (listed above). Nothing has been created. Resolve them, or pass -SkipPreflight only if you have verified them another way.'
-    }
-}
-
-# Admin consent for delegated ARM is the last thing the installer needs and the thing most
-# often missing, so it is checked now rather than after the infrastructure exists.
-if ($DelegatedArm -and -not $SkipEntra -and -not $EntraClientId) {
-    $consent = Get-CloudLensConsentCapability
-    if ($consent.Status -eq 'no') {
-        throw ("The signed-in account holds no directory role that can grant admin consent " +
-               "(needs one of: $($consent.Roles -join ', ')), and this deployment needs it for sign-in. " +
-               "Nothing has been created. Either run this as a Cloud Application Administrator, have the identity team " +
-               "approve the registration, or rerun without -DelegatedArm for managed-identity mode.")
-    }
-    if ($consent.Status -eq 'unknown') {
-        Write-Warning 'Could not verify that the signed-in account can grant admin consent; the consent step near the end may be refused.'
-    } else {
-        Write-Host "    consent      : $($consent.Roles -join ', ')" -ForegroundColor Green
     }
 }
 
@@ -575,6 +575,10 @@ $templateParameters = @(
     "entraAppUniqueName=$EntraAppUniqueName"
     "deployEntraApp=$((-not $SkipEntra -and -not $EntraClientId).ToString().ToLower())"
     "authDelegatedArm=$($DelegatedArm.ToString().ToLower())"
+    "authClientId=$EntraClientId"
+    "authTenantId=$($account.tenantId)"
+    "authRedirectUri=$(if ($EntraClientId -and $NameSuffix) { "https://$NamePrefix-web-$NameSuffix.azurewebsites.net/auth/callback" })"
+    "authAdmins=$($Admins -join ',')"
 )
 
 if ($EmitArm) {
@@ -707,7 +711,7 @@ if (-not $clientId -and -not $SkipEntra) {
 }
 
 if ($clientId) {
-    if ($EntraClientId) {
+    if ($EntraClientId -and -not $DelegatedArm) {
         # Verify before writing. Everything below this line modifies the registration
         # or consents on its behalf, so the one chance to notice it is the wrong one
         # is here, before the first write.
@@ -756,15 +760,8 @@ if ($clientId) {
     # Consent is never attempted in the default managed-identity mode.
     $consented = $false
     if ($DelegatedArm) {
-        Step "Granting admin consent for delegated ARM access"
-        az ad app permission admin-consent --id $clientId --only-show-errors -o none 2>$null
-        $consented = $LASTEXITCODE -eq 0
-        if ($consented) {
-            Write-Host "    consented    : ARM user_impersonation" -ForegroundColor Green
-        } else {
-            Write-Warning "Administrator handoff: az ad app permission admin-consent --id $clientId"
-            throw 'Delegated ARM consent is required. Have the tenant administrator grant consent and rerun, or rerun without -DelegatedArm for managed-identity mode.'
-        }
+        Assert-CloudLensDelegatedConsent -ClientId $clientId -RedirectUri $redirectUri
+        $consented = $true
     }
 } else {
     Write-Host "    skipped -- the app will use a local password" -ForegroundColor DarkGray

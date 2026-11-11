@@ -27,9 +27,7 @@ import { createViewRevalidation } from "./dashboard-freshness.js";
 
 const $ = (id) => document.getElementById(id);
 
-// Always Overview on a fresh load — a dashboard opens on its headline the same way a site
-// opens on its front page, regardless of which tab a previous visit happened to end on. Only
-// the period and scope are remembered across a reload; which tab is showing is not.
+// Fresh loads open Overview; only period and subscription scope persist.
 let current = "overview";
 let days = Number(readStore("costDays", 30));
 if (!ROLLING_DAYS.includes(days)) days = 30;
@@ -54,6 +52,7 @@ let tabRendering = Promise.resolve();
 const views = createViewCache(40);
 const familyInstances = new Map();
 const TAB_MODULES = {
+  advisorScore: () => import("./advisor-score.js"),
   spend: () => import("./dashboard-spend.js"),
   optimize: () => import("./dashboard-optimize.js"),
   monitor: () => import("./dashboard-monitor.js"),
@@ -65,6 +64,7 @@ const TAB_MODULES = {
   ai: () => import("./dashboard-ai.js"),
 };
 const TAB_RENDERERS = {
+  "advisor-score": ["advisorScore", "renderAdvisorScore"],
   overview: ["spend", "renderOverview"], tags: ["spend", "renderTags"],
   resources: ["resources", "renderResources"], uptime: ["spend", "renderUptime"],
   aks: ["spend", "renderAksView"], savings: ["optimize", "renderSavings"],
@@ -371,6 +371,7 @@ function updateSections(data, me, { retainCurrent = false } = {}) {
     // Purchase commitments stay separate from reversible operational savings.
     { id: "commitments", label: "Reservation & Savings", live: true },
     { id: "governance", label: "Governance", live: true },
+    { id: "advisor-score", label: "Advisor Score", live: true },
     { id: "esu", label: "End of support", live: true },
     { id: "health", label: "Retirements", live: true },
     // Admin-only, and left off the rail entirely for anyone else rather than shown and then

@@ -22,14 +22,14 @@ const expected = {
   resources:["resources"],
   savings:["savings","commitments"],
   monitor:["changes","performance","anomalies","azure-updates"],
-  governance:["governance","esu","health","audit"],
+  governance:["governance","advisor-score","esu","health","audit"],
   reports:["report","settings"],
 };
 assert.deepEqual(PRIMARY_SECTIONS.map(s=>s.label),["Overview","Billing","All resources","Savings","Monitor","Governance","Reports"]);
 assert.deepEqual(Object.fromEntries(PRIMARY_SECTIONS.map(s=>[s.id,s.members])),expected);
 const ids=PRIMARY_SECTIONS.flatMap(s=>s.members);
-assert.equal(ids.length,19);
-assert.equal(new Set(ids).size,19);
+assert.equal(ids.length,20);
+assert.equal(new Set(ids).size,20);
 assert.ok(PRIMARY_SECTIONS.every(section=>hasRailIcon(section.icon)));
 assert.equal(PRIMARY_SECTIONS.find(section=>section.id==="governance").icon,"security");
 assert.equal(PRIMARY_SECTIONS.find(section=>section.id==="reports").icon,"reports");

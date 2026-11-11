@@ -6,6 +6,7 @@ import { revealOverviewTarget, subscriptionDrillIds } from "./dashboard-drilldow
 import { budgetReadIssue, matchingTagBudgets } from "./budget-context.js";
 import { currencyAmountList, nativeAmount, nativeRowTotal } from "./dashboard-currencies.js";
 import { loadBudgetTrend as loadBudgetTrendChart } from "./budget-chart.js";
+import { mountAdvisorScore } from "./advisor-score.js";
 
 /** Select existing cost signals without treating missing values as zero or changing source order. */
 export function overviewHighlights(data) {
@@ -162,10 +163,10 @@ export function createTabs(ctx) {
   let trendDays = [];
   let trendSelect = null;
 
-function renderNativeCurrencies(data) {
+function renderNativeCurrencies(data, advisor = false) {
   if (!data.mixed_currency && (data.empty || /^[A-Z]{3}$/.test(data.currency || ""))) return false;
   const buckets = data.by_currency?.length ? data.by_currency : data.mixed_currency ? [] : [data];
-  setContent($("tabBody"), `<section class="card">
+  setContent($("tabBody"), `${advisor ? '<div id="overviewAdvisorScore"></div>' : ""}<section class="card">
     <h3>Spend by billing currency</h3>
     <p class="muted">Native billing currencies are shown separately, never added together.
       Choose a display currency in the toolbar for a combined view with unified charts and drilldowns.</p>
@@ -210,7 +211,8 @@ async function renderSection(token, id) {
   if (token !== ctx.loadToken) return;
   if (renderNativeCurrencies(d)) return;
   if (d.empty) {
-    setContent($("tabBody"), emptyState());
+    setContent($("tabBody"), '<div id="overviewAdvisorScore"></div>' + emptyState());
+    mountAdvisorScore(ctx, token, $("overviewAdvisorScore"), true);
     wireEmptyState();
     return;
   }
@@ -334,7 +336,10 @@ function wireEmptyState() {
 async function renderOverview(token) {
   const d = await executiveData(ctx.tabsController?.signal);
   if (token !== ctx.loadToken) return;
-  if (renderNativeCurrencies(d)) return;
+  if (renderNativeCurrencies(d, true)) {
+    mountAdvisorScore(ctx, token, $("overviewAdvisorScore"), true);
+    return;
+  }
   if (d.empty) {
     setContent($("tabBody"), emptyState());
     wireEmptyState();
@@ -387,6 +392,7 @@ async function renderOverview(token) {
 
   setContent($("tabBody"), `
     <div class="overview-home" id="overviewHome">
+    <div id="overviewAdvisorScore"></div>
     <section class="overview-summary" aria-label="Selected-period cost summary">
       <div class="overview-toolbar">
         <div class="overview-context">
@@ -618,6 +624,7 @@ async function renderOverview(token) {
   `);
 
   const home = $("overviewHome");
+  mountAdvisorScore(ctx, token, $("overviewAdvisorScore"), true);
   home.querySelector("#overviewAnalysis").onclick = () => ctx.openAnalysis();
   loadOverviewAnomalies(token, cur);
   for (const button of home.querySelectorAll("[data-overview-tab]")) {

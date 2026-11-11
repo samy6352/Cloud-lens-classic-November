@@ -34,11 +34,14 @@ param(
 
     [string]$ManagementGroupId = '',
 
-    [switch]$DelegatedArm,
+    [switch]$DelegatedArm = $true,
+    [string]$EntraClientId = '',
+    [string]$RedirectUri = '',
 
     # Region for the AI Foundry account, which is deliberately not $Location:
     # App Service quota and pay-as-you-go model availability are different sets.
-    [string]$AiLocation = 'eastus2',
+    [Parameter(Mandatory)]
+    [string]$AiLocation,
 
     [string]$ModelName = 'gpt-4.1-mini',
 
@@ -153,6 +156,7 @@ Section "Directory rights for the sign-in app registration"
 # "not required to deploy" here sent people into a deployment that then failed on the
 # one step this section exists to warn about.
 $canCreateApps = $false
+if (-not $EntraClientId -and -not $DelegatedArm) {
 try {
     # Creating an app registration is normally open to every user, but a tenant
     # can turn that off. There is no read-only "may I" API, so this reads the
@@ -178,23 +182,24 @@ try {
 } catch {
     Warn "could not read the tenant's app registration policy"
 }
+}
 
 Info ""
-Info "Default managed-identity Azure access requests no delegated ARM permission or admin consent."
-Info "Optional -DelegatedArm requires tenant approval of user_impersonation."
+Info "Customer deployment requires preapproved delegated ARM user_impersonation."
 if ($DelegatedArm) {
-$consentCheck = Get-CloudLensConsentCapability
-switch ($consentCheck.Status) {
-    'yes' { Ok "signed-in account holds a role that can grant admin consent: $($consentCheck.Roles -join ', ')" }
-    'no' {
-        Warn "signed-in account holds no active role that can grant admin consent"
-        Info "Relevant only to optional -DelegatedArm; not a default deployment blocker."
+    try {
+        . (Join-Path $PSScriptRoot 'delegated-consent.ps1')
+        if (-not $EntraClientId -or -not $RedirectUri) {
+            throw 'Pass -EntraClientId and the exact -RedirectUri approved by the identity team.'
+        }
+        Assert-CloudLensDelegatedConsent -ClientId $EntraClientId -RedirectUri $RedirectUri
+        Ok 'Exact customer service-principal ARM consent verified; no directory admin role needed to deploy.'
+    } catch {
+        Bad $_.Exception.Message
     }
-    default { Warn "could not read directory roles; admin consent rights remain unverified" }
-}
 }
 Info ""
-Info "Managed-identity mode is the default; no fallback switch is needed."
+Info "Managed identity remains necessary for unattended ingestion, separately from user delegation."
 Info "CloudLens then resolves who holds a cost-capable role, which needs no directory"
 Info "rights -- but shows only subscriptions CloudLens itself was granted Reader on."
 Info "Select each scope to be analysed with -CostScopeSubscriptions (a same-tenant"

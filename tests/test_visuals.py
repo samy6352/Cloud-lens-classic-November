@@ -277,8 +277,8 @@ check("no tab is filed twice",
 # `me.user.admin` is true for, so unlike every entry above it, this one is invisible to the
 # population the ceiling below actually protects the experience of.
 # Azure Updates adds one requested destination, consolidating announcements, status and health.
-check("nineteen views are organized under seven primary destinations",
-      len(listed) == 19 and len(groups) == 7)
+check("twenty views including Advisor Score are organized under seven primary destinations",
+      len(listed) == 20 and len(groups) == 7 and "advisor-score" in listed)
 check("the alternative grouped rail reuses available section views",
       "group.sections.flatMap(id => sectionViews(id, views))" in navigation)
 check("the layout toggle is placed before the separate collapse control",
@@ -1028,7 +1028,7 @@ check("it is not narrowed to the caller's own subscriptions like every other tab
 check("the tab is only ever listed for an admin, and left off the rail entirely for anyone else",
       bool(re.search(r'me\?\.user\?\.admin\s*\?\s*\[\{ id: "audit"', dash)))
 check("filed under Govern, beside the other lifecycle-and-compliance tabs",
-      bool(re.search(r'members:\s*\["governance",\s*"esu",\s*"health",\s*"audit"\]', dash)))
+      bool(re.search(r'members:\s*\["governance",\s*"advisor-score",\s*"esu",\s*"health",\s*"audit"\]', dash)))
 check("the renderer is dispatched from the tab switch, not left unreachable",
       'audit: ["monitor", "renderAuditLog"]' in dash)
 check("it has its own rail icon rather than falling back to the placeholder dot",

@@ -49,6 +49,7 @@ from .canonical import CanonicalOriginMiddleware, validate_public_base_url
 from .entra import needs_admin_consent as entra_needs_consent
 from .entra import normalise_email as entra_email
 from .entra import sign as entra_sign
+from .export_reporting import install as install_export_reporting
 from .snapshot_cache import (
     WARM_SCOPE_KEY,
     CacheContext,
@@ -60,6 +61,7 @@ from .snapshot_cache import (
 )
 from .snapshot_warmer import SnapshotWarmer
 from .store import PoolBusy
+from .telemetry import instrument as instrument_telemetry
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("cloudlens")
@@ -881,6 +883,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="CloudLens", version="1.0.0", lifespan=lifespan)
+instrument_telemetry(app)
 
 # SSE is already chunked and must not be buffered, so exclude it by minimum size rather than
 # compressing everything: JSON and the HTML/CSS/JS bundle benefit, the event stream is unaffected
@@ -4296,6 +4299,30 @@ async def dashboard_whatif(request: Request, days: int = 30, scope: str = "") ->
         raise HTTPException(502, str(exc)[:300]) from exc
 
 
+@app.get("/api/dashboard/advisor-score")
+async def dashboard_advisor_score(request: Request, scope: str = "") -> JSONResponse:
+    """Live subscription RBAC only; export-backed reporting grants do not apply."""
+    from . import cost
+    from .advisor_score import read_scores
+
+    user = current_user(request)
+    allowed = await permitted(user)
+    requested = [s.strip() for s in scope.split(",") if s.strip()]
+    if allowed is not None and any(s.lower() not in {a.lower() for a in allowed} for s in requested):
+        raise HTTPException(403, "One or more selected subscriptions are not permitted.")
+    picked = narrow(requested, allowed)
+    async with as_user(user):
+        if not picked:
+            if allowed is not None:
+                raise HTTPException(403, "Select a permitted live subscription.")
+            picked = [s["id"] for s in (await cost.list_subscriptions())["subscriptions"]]
+        try:
+            result = await read_scores(picked)
+        except ValueError as exc:
+            raise HTTPException(400, "Invalid subscription identifier.") from exc
+    return JSONResponse(result, headers={"Cache-Control": "private, no-store"})
+
+
 @app.get("/api/dashboard/advisor")
 async def dashboard_advisor(request: Request, category: str = "Cost",
                             scope: str = "", currency: str = "") -> JSONResponse:
@@ -5585,3 +5612,5 @@ async def index() -> Response:
 
 
 install_snapshot_routes(app, lambda: _snapshot_cache, authorize_snapshot)
+
+install_export_reporting(app, current_user=current_user, auth_service=auth_service, web=WEB)

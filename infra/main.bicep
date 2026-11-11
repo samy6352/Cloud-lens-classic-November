@@ -124,7 +124,7 @@ param pgSchema string = ''
 param postgresStorageGb int = 128
 
 @description('Region for the AI Foundry account. Rarely the same as `location`: the regions with App Service quota and the regions offering a model on a pay-as-you-go SKU are different sets.')
-param aiLocation string = 'eastus2'
+param aiLocation string
 
 @description('Model deployed for the chat agent.')
 param modelName string = 'gpt-4.1-mini'
@@ -145,7 +145,11 @@ param entraAppDisplayName string = 'CloudLens'
 param entraAppUniqueName string = 'cloudlens'
 
 @description('True calls Azure as the signed-in person, so each sees exactly their own subscriptions. Needs one-time tenant admin consent for ARM `user_impersonation`; without it nobody can sign in. False is app-identity mode: the app resolves who holds a cost-capable role, bounded by the subscriptions its own identity reads.')
-param authDelegatedArm bool = false
+param authDelegatedArm bool = true
+param authClientId string = ''
+param authTenantId string = ''
+param authRedirectUri string = ''
+param authAdmins string = ''
 
 @description('Tags applied to every resource.')
 param tags object = {
@@ -198,6 +202,10 @@ module stack 'modules/stack.bicep' = {
     modelSku: modelSku
     modelCapacity: modelCapacity
     authDelegatedArm: authDelegatedArm
+    authClientId: authClientId
+    authTenantId: authTenantId
+    authRedirectUri: authRedirectUri
+    authAdmins: authAdmins
     tags: tags
   }
 }
@@ -209,9 +217,9 @@ module stack 'modules/stack.bicep' = {
 // Taking it from the stack's own output is the only way to get it right without
 // recomputing the name suffix here and hoping the two agree.
 //
-// AUTH_CLIENT_ID and friends are then set on the web app by deploy.ps1. They
-// cannot be set in stack.bicep: the app settings live on the resource this
-// module depends on, so reading the client ID there would be a cycle.
+// Preapproved customer registration settings are supplied to stack at creation.
+// Only the optional legacy registration-creation path needs a later settings update:
+// reading this module's new client ID inside stack would introduce a cycle.
 module entra 'modules/identity.bicep' = if (deployEntraApp) {
   name: 'cloudlens-entra'
   scope: rg

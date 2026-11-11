@@ -1014,7 +1014,7 @@ function wireCostData() {
     const button = $("cdLoadExports");
     button.disabled = true;
     try {
-      const result = await get(`/api/schedules?scope=${encodeURIComponent(scope.join(","))}`, { timeout: 45000 });
+      const result = await get(`/api/schedules?scope=${encodeURIComponent(scope.join(","))}&fresh=true`, { timeout: 45000 });
       if (active()) $("cdExports").innerHTML = (result.schedules || []).map(s => scheduleRow(s, false)).join("") ||
         '<p class="muted note">No exports found.</p>';
     } catch (error) { if (active()) notice.textContent = scheduleReadError(error); }

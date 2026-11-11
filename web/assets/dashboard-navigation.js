@@ -5,7 +5,7 @@ export const PRIMARY_SECTIONS = [
   { id: "resources", label: "All resources", icon: "resources", members: ["resources"] },
   { id: "savings", label: "Savings", icon: "savings", members: ["savings", "commitments"] },
   { id: "monitor", label: "Monitor", icon: "performance", members: ["changes", "performance", "anomalies", "azure-updates"] },
-  { id: "governance", label: "Governance", icon: "security", members: ["governance", "esu", "health", "audit"] },
+  { id: "governance", label: "Governance", icon: "security", members: ["governance", "advisor-score", "esu", "health", "audit"] },
   { id: "reports", label: "Reports", icon: "reports", members: ["report", "settings"] },
 ];
 

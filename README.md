@@ -11,6 +11,46 @@ incur charges, including a web app, database, private storage and an AI service.
 [Full documentation](Cloudlens-Documentation.Md) |
 [Detailed deployment guide](infra/README.md)
 
+### AI chat model compatibility
+
+Chat keeps `temperature=0.1` for models that support it. If the inference API
+explicitly rejects that parameter as unsupported, chat retries once without it,
+using the model's default. Deployment aliases do not identify model capabilities.
+Other errors and failures after streaming starts are not retried by this fallback.
+`/healthz` and `/readyz` establish service/database readiness, not successful model
+inference; verify AI acceptance with a signed-in question at `/api/ask`.
+
+**Customer release gate:** tenant administrator approval of delegated ARM
+`user_impersonation` on a customer-owned single-tenant public-client registration
+is required **before provisioning**. The installer reads the exact grant and callback;
+it does not grant consent or modify the preapproved registration. A subscription
+operator need not hold a directory administrator role, but must be able to read
+the registration, service principals and consent grants. The identity team must
+enable public-client PKCE, disable implicit grants, register the final HTTPS
+callback and approve the requested ARM scope. Actual sign-in, user RBAC, ingestion
+and AI acceptance remain customer deployment gates.
+
+Build a source-only customer handoff (no Azure calls):
+`python .\tools\customer_release.py --destination .\dist\customer-release`.
+The outer ZIP includes a runtime ZIP, deployment tools, manifests, deployment,
+readiness, handoff and operational runbook documents. Export-backed reporting
+remains disabled and is not the customer access solution.
+
+After verifying the delivered customer ZIP checksum and extracting it completely,
+open its root directory and run the guided installer with one line:
+
+```powershell
+pwsh -NoProfile -File .\install.ps1
+```
+
+Requires PowerShell 7, Azure CLI with Bicep, and Python 3.11+. The installer asks
+for approved inputs, displays all effective deployment parameters, runs the
+existing exact-consent/preflight/What-If gates, then requires explicit `DEPLOY`
+confirmation. `CANCEL` or Ctrl+C stops; cancelling apply does not roll back
+resources already created. No hosted download URL, automatic consent, dependency
+installation, or unapproved region/SKU fallback is assumed. See bundled
+`DEPLOYMENT.md` and `READINESS.md`; provisioning is not customer acceptance.
+
 ## Optional Environment-filter summary for existing installations
 
 `CLOUDLENS_ENV_SUMMARY` defaults to `false`. This separate sidecar does not
@@ -138,20 +178,22 @@ this is where CloudLens will create resources and generate charges.
 A **resource group** is the Azure folder that will contain this installation.
 Choose a new name using letters, numbers and hyphens, for example `cloudlens-myteam`.
 
-The example below places the app and database in **Central India**, and the AI service
-in **East US 2**. Use these only if approved by your organisation. Ask IT for different
-Azure region codes if necessary, then change the two region values before running.
+Obtain approved region codes from the customer before continuing. AI model SKU,
+data residency, network ranges and ongoing charges need explicit approval.
 
 ```powershell
 $resourceGroup = Read-Host "Enter a NEW resource group name, for example cloudlens-myteam"
-$appRegion = "centralindia"
-$aiRegion = "eastus2"
+$appRegion = Read-Host "Approved app/database Azure region code"
+$aiRegion = Read-Host "Approved AI Azure region code (confirm model residency and SKU)"
+$nameSuffix = Read-Host "Approved lowercase deployment suffix"
+$clientId = Read-Host "Customer-owned preapproved Entra application client ID"
+$redirectUri = "https://cloudlens-web-$nameSuffix.azurewebsites.net/auth/callback"
 
 $exists = az group exists --name $resourceGroup --subscription $subscriptionId --output tsv
 if ($LASTEXITCODE -ne 0) { throw "Could not check the resource group. Stop and ask your administrator." }
 if ($exists -ne "false") { throw "That resource group already exists. Choose a NEW name for this guide." }
 
-.\infra\preflight.ps1 -Location $appRegion -AiLocation $aiRegion -ResourceGroup $resourceGroup
+.\infra\preflight.ps1 -Location $appRegion -AiLocation $aiRegion -ResourceGroup $resourceGroup -EntraClientId $clientId -RedirectUri $redirectUri
 ```
 
 This checks access, service availability and network settings without creating Azure resources.
@@ -166,8 +208,7 @@ Keep the same terminal open so the values entered above remain available.
 First, preview the resources:
 
 ```powershell
-.\infra\deploy.ps1 -Location $appRegion -AiLocation $aiRegion `
-  -ResourceGroup $resourceGroup -EntraAppUniqueName $resourceGroup -WhatIf
+.\infra\deploy.ps1 -Location $appRegion -AiLocation $aiRegion -ResourceGroup $resourceGroup -NameSuffix $nameSuffix -EntraClientId $clientId -WhatIf
 ```
 
 Check that the preview names your new resource group. The preview saves a local storage-name
@@ -176,8 +217,7 @@ file but does not create Azure resources. Keep that file and the downloaded fold
 When the preview and required approvals are satisfactory, install:
 
 ```powershell
-.\infra\deploy.ps1 -Location $appRegion -AiLocation $aiRegion `
-  -ResourceGroup $resourceGroup -EntraAppUniqueName $resourceGroup
+.\infra\deploy.ps1 -Location $appRegion -AiLocation $aiRegion -ResourceGroup $resourceGroup -NameSuffix $nameSuffix -EntraClientId $clientId
 ```
 
 Leave the terminal open. Installation can take **20-40 minutes or longer**, depending on
@@ -387,9 +427,40 @@ to clear a diagnostic warning.
 
 ## More information
 
+
 - [Cloudlens-Documentation.Md](Cloudlens-Documentation.Md): complete product, architecture, configuration and developer documentation, preserved from the original README.
 - [Deployment guide](infra/README.md): permissions, regions, private networking, exports, upgrades and troubleshooting.
 - [Test guide](tests/README.md): for developers maintaining CloudLens.
 
 Terraform is currently an advanced infrastructure wrapper, **not** the recommended complete
 installer. Use the Bicep/PowerShell steps above for a new installation.
+# Operational fixes and release verification
+
+Customer handoffs must be rebuilt from the intended working tree after application
+changes. Preserve previous releases for rollback; do not identify a bundle as current
+from its filename alone. Build and verify with:
+
+```powershell
+python tools\customer_release.py --destination dist\customer-release-<unique-version>
+python tools\customer_release.py --verify-current dist\customer-release-<unique-version>\cloudlens-customer.zip
+```
+
+Verification checks source hashes as well as ZIP integrity and rejects missing Python
+modules. Customer sign-in, financial reconciliation and restore acceptance remain separate.
+
+Scheduled refresh and durable FOCUS recovery run inside the web process. Production
+App Service deployments require a paid plan with **Always On enabled**; the infrastructure
+template enables it on non-F1 plans. Always On prevents idle unloading, not platform
+outages: monitor job failures and data freshness and verify an unattended cycle after
+deployment. F1 is not an unattended-ingestion hosting option.
+
+`APPLICATIONINSIGHTS_CONNECTION_STRING` now enables Azure Monitor OpenTelemetry request,
+dependency and `cloudlens` log collection. Without it telemetry remains disabled.
+The exporter authenticates with Entra credentials, selecting the user-assigned managed
+identity through `AZURE_CLIENT_ID` in Azure. The infrastructure disables telemetry key
+authentication and grants that identity Monitoring Metrics Publisher on Application Insights.
+Invalid configured telemetry fails startup explicitly. Authentication endpoints are
+excluded from request tracing; request/response bodies and identity headers are not
+captured by this setup. Apply normal restricted-access and retention policies to the
+telemetry resource. After deployment, generate traffic and verify requests, traces and
+dependencies in Application Insights; a configured connection string is not delivery proof.

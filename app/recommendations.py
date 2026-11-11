@@ -19,6 +19,8 @@ import json
 import logging
 from typing import Any
 
+from .model_compatibility import create_completion
+
 log = logging.getLogger("cloudlens.recommendations")
 
 # How many of the ranked opportunities the model actually sees. The list itself can run past a
@@ -122,7 +124,8 @@ async def synthesize(agent: Any, *, savings: dict[str, Any],
 
     try:
         client = await agent._openai()
-        response = await client.chat.completions.create(
+        response = await create_completion(
+            client,
             model=agent.model,
             messages=[
                 {"role": "system", "content": PROMPT},

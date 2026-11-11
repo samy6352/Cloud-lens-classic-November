@@ -20,6 +20,7 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from . import budgets, cost, waste
+from .model_compatibility import create_completion
 
 log = logging.getLogger("cloudlens.agent")
 
@@ -746,6 +747,16 @@ class CostAgent:
         return {"status": "ok", "model": self.model, "subscriptions": subs["count"],
                 "tools": list(HANDLERS)}
 
+    async def _chat_stream(self, client: Any, messages: list[dict[str, Any]]) -> Any:
+        options = {
+            "model": self.model,
+            "messages": messages,
+            "tools": [tool for tool in TOOLS if tool["function"]["name"] != "create_budget"],
+            "tool_choice": "auto",
+            "stream": True,
+        }
+        return await create_completion(client, **options, temperature=0.1)
+
     async def ask(self, question: str, history: list[dict] | None = None,
                   scope: list[str] | None = None,
                   scope_names: list[str] | None = None,
@@ -829,11 +840,7 @@ class CostAgent:
 
         for _ in range(MAX_ROUNDS):
             try:
-                stream = await client.chat.completions.create(
-                    model=self.model, messages=messages,
-                    tools=[tool for tool in TOOLS if tool["function"]["name"] != "create_budget"],
-                    tool_choice="auto", temperature=0.1, stream=True,
-                )
+                stream = await self._chat_stream(client, messages)
             except Exception as exc:  # noqa: BLE001
                 yield Event("error", {"message": _friendly(exc)})
                 return

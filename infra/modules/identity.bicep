@@ -35,7 +35,7 @@ param uniqueName string = 'cloudlens'
 @description('Redirect URIs. Include https://<web-app>/auth/callback, and a localhost URI for development.')
 param redirectUris array
 
-param delegatedArm bool = false
+param delegatedArm bool = true
 
 // Microsoft Graph, and the two delegated scopes needed to sign someone in and
 // learn their name. Nothing more: CloudLens reads cost data with its own managed

@@ -511,14 +511,17 @@ def test_startup_sas_requires_focus_and_falls_back_explicitly(monkeypatch, memor
 def test_frontend_choices_approval_legacy_and_archive_mapping():
     root = Path(__file__).resolve().parents[1]
     ui = (root / "web/assets/dashboard-reports.js").read_text(encoding="utf-8")
-    select = ui.split('<select id="sMetric">', 1)[1].split("</select>", 1)[0]
-    assert select.count("<option") == 1 and 'value="FocusCost"' in select
+    settings = ui.split("async function renderSettings(", 1)[1]
+    assert '<select id="sMetric">' not in settings
     for cadence in schedules.RECURRENCE:
-        assert f'value="{cadence}"' in ui
-    assert ui.count("window.confirm(") >= 3
-    assert "Edit cadence" in ui and "Legacy / external" in ui
-    assert "s.can_write === true" in ui and "sub.can_write === true" in ui
-    assert "Daily — recommended" in ui and '"/api/schedules/refresh"' in ui
+        assert f'["{cadence}",' in settings
+    assert 'focusPost("/api/cost-data/preview", body)' in settings
+    assert 'focusPost("/api/cost-data/setup"' in settings
+    assert "preview_token: plan.preview_token" in settings
+    assert "idempotency_key: idempotency" in settings
+    assert "Legacy and external export inventory (read only)" in settings
+    assert 'scheduleRow(s, false)' in settings
+    assert "Recommended" in settings
     assert 'focus: "FOCUS", amortized: "Amortized", actual: "Actual"' in ui
     refresh = (root / "web/assets/dashboard.js").read_text(encoding="utf-8")
     menu = refresh.split("function buildRefreshMenu()", 1)[1].split("menu.innerHTML = `", 1)[1].split("`;", 1)[0]

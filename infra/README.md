@@ -1,13 +1,14 @@
 # Deploying CloudLens
 
-CloudLens deploys into a single resource group and is described entirely in Bicep, so a
-customer deployment is one command against an empty subscription.
+CloudLens deploys into a single resource group using Bicep. Customer deployment
+requires an existing customer-owned Entra registration with verified tenant-wide
+delegated ARM consent **before** provisioning. See the [guided customer steps](../README.md#install-cloudlens)
+and the generated customer release's deployment and acceptance documents.
 
 ```powershell
-az login
-az account set --subscription <subscription-id>
-./infra/preflight.ps1 -Location centralindia    # read-only; checks what would block
-./infra/deploy.ps1    -Location centralindia
+# Use the values collected and verified in the guided customer steps.
+.\infra\preflight.ps1 -Location $appRegion -AiLocation $aiRegion -EntraClientId $clientId -RedirectUri $redirectUri
+.\infra\deploy.ps1 -Location $appRegion -AiLocation $aiRegion -NameSuffix $nameSuffix -EntraClientId $clientId -WhatIf
 ```
 
 `deploy.ps1` provisions the infrastructure, grants the app the cost access it needs, wires
@@ -16,10 +17,8 @@ sign-in, publishes the code, and polls `/readyz` plus an unauthenticated sign-in
 ## Common commands
 
 ```powershell
-./infra/deploy.ps1 -Location centralindia -WhatIf     # preview only, deploys nothing
-./infra/deploy.ps1 -Location centralindia             # infra + code, idempotent
-./infra/deploy.ps1 -Location centralindia -SkipCode   # infra only
-./infra/deploy.ps1 -Location centralindia -EmitArm    # also write infra/main.json
+.\infra\deploy.ps1 -Location $appRegion -AiLocation $aiRegion -NameSuffix $nameSuffix -EntraClientId $clientId -SkipCode
+.\infra\deploy.ps1 -Location $appRegion -AiLocation $aiRegion -NameSuffix $nameSuffix -EntraClientId $clientId -EmitArm
 ```
 
 ## Custom domain
@@ -77,8 +76,9 @@ client secret** to create, store or rotate. A tenant that forbids app secrets is
 
 | Need | When |
 |---|---|
-| App registration exists, or **Application Developer** to create one | always |
-| **Cloud Application Administrator** or higher | one-time admin consent, for delegated mode |
+| Customer-owned single-tenant public-client registration already exists | before deployment |
+| Tenant administrator approves ARM delegated `user_impersonation` on the exact service principal | before provisioning |
+| Operator can read registration, service principals and OAuth grants | verification; no directory admin role needed to deploy |
 
 ## The two access modes
 
@@ -93,11 +93,12 @@ consent is usually granted by someone other than the subscription owner.
 
 **Delegated is the default and the better answer.** Each person's own token asks ARM, so
 Azure decides and nothing is bounded by what CloudLens itself was granted. Until an
-administrator consents, *nobody can sign in at all*, so `deploy.ps1` attempts the consent and
-stops the deployment if it is refused.
+administrator consents, delegated sign-in is blocked. `deploy.ps1` verifies actual
+tenant-wide consent and the exact callback before provisioning, even with
+`-SkipPreflight`. It never consents or edits an existing registration in this mode.
 
-**App-identity mode is the explicit exception.** Pass `-AllowAppIdentityFallback` where the
-consent cannot be obtained. CloudLens then asks Azure which subscriptions carry a
+**Legacy app-identity mode is not the customer onboarding solution.** Existing
+installations may explicitly retain `-AllowAppIdentityFallback`. CloudLens then asks Azure which subscriptions carry a
 **cost-capable** role assignment for that person — Owner, Contributor, Reader, Cost
 Management Reader/Contributor, Billing Reader, or a custom role granting cost actions. The
 check is transitive, so group-granted access counts.
@@ -122,15 +123,16 @@ and Reader on each scope. Grant them everywhere people will analyse:
 ```
 
 The mode is carried by the template (`authDelegatedArm`), not patched onto the web app
-afterwards, so an infrastructure-only redeploy cannot silently flip it back. If consent
-later succeeds while the switch is still being passed, `deploy.ps1` upgrades to delegated
-mode and says so.
+afterwards. No automatic fallback or upgrade occurs. Existing MI deployments must
+explicitly retain their mode on redeployment; customer delegation does not remove
+the managed identity or its separate unattended-ingestion grants.
 
-To move to delegated mode after the fact:
+To move an existing installation to delegated mode, have the identity team
+preapprove its exact registration and callback, then use the guided deployment
+parameters with explicit delegated mode. Do not blanket-consent unreviewed permissions.
 
 ```powershell
-az ad app permission admin-consent --id <client-id>
-./infra/deploy.ps1 -Location centralindia        # rerun without the switch
+.\infra\deploy.ps1 -Location $appRegion -AiLocation $aiRegion -NameSuffix $nameSuffix -EntraClientId $clientId -DelegatedArm -WhatIf
 ```
 
 ## Naming and networks
@@ -445,9 +447,13 @@ signing key it cannot read.
 ### Staged rollout when matching an existing deployment
 
 Use separate provisioning, identity, publication and acceptance gates when a customer must
-retain an existing sign-in policy. The normal `deploy.ps1` path attempts admin consent and
-can upgrade app-identity mode to delegated mode; **do not use that branch to reproduce an
-existing app-identity configuration unchanged**.
+retain an existing sign-in policy. The customer `deploy.ps1` path now requires
+preapproved delegated consent and never upgrades or grants consent automatically.
+An existing app-identity installation must explicitly retain its approved mode.
+Direct Bicep callers must explicitly pass `authDelegatedArm=false` to retain that
+legacy mode; deployment templates now default to delegated. Bare ARM/Bicep does
+not perform the installer's Graph consent check: run the verified installer
+preflight and preserve its evidence before an advanced direct-template deployment.
 
 1. Establish the final subscription, tenant, resource group, names, regions and address
    ranges before creating the managed identity. Record its principal ID, not just its name.
@@ -721,11 +727,10 @@ The actual total depends on region, uptime, backups, data retention and telemetr
 Do not use the old B1/B1ms estimate to approve a customer deployment.
 # Staged installation and administrator handoff
 
-Managed-identity Azure access is the default (`AUTH_DELEGATED_ARM=false`).
-Entra sign-in still requires a registration, redirect URI and whatever sign-in
-approval the tenant mandates, but the default installer neither requests ARM
-`user_impersonation` nor invokes tenant-wide admin consent. `-DelegatedArm` is
-an explicit alternative; never automatically upgrade an installation after consent.
+The runtime's legacy unset `AUTH_DELEGATED_ARM` behavior remains app-identity
+for compatibility. The customer installer explicitly sets it to `true` by default
+and requires preapproved ARM `user_impersonation` before provisioning. It does
+not invoke tenant-wide admin consent. Never automatically switch modes.
 An existing registration may retain previously requested permissions; this installer
 does not silently remove them.
 

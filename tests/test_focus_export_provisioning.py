@@ -147,7 +147,7 @@ def deploy() -> str:
 
 def test_deployment_provisions_exports_by_default(deploy):
     assert "focus-exports.ps1" in deploy, "deployment never provisions the data path"
-    assert "if (-not $SkipFocusExports)" in deploy, (
+    assert "if (-not $SkipFocusExports -and -not $DeferCostAccess)" in deploy, (
         "provisioning must be the default, not an opt-in nobody discovers")
     assert "[switch]$SkipFocusExports" in deploy, "there must be a way to defer it"
 
@@ -169,15 +169,17 @@ def test_a_failed_provision_does_not_fail_the_deployment(deploy):
 
 def test_the_deployment_says_which_state_it_left_behind(deploy):
     """'It looks fine' is the wrong signal when the hourly views are empty."""
-    tail = deploy[deploy.index('Step "Done"'):]
+    tail = deploy[deploy.index('Step "Installation stages finished (data visibility unverified)"'):]
     assert "$focusProvisioned" in tail, "the summary does not report the data path"
-    assert "Hourly Billing" in tail, "the summary does not say what is affected"
+    assert "Cost detail" in tail, "the summary does not say what is affected"
+    assert "remain unverified" in tail
     assert "focus-exports.ps1" in tail, "the summary does not say how to fix it"
 
 
 def test_every_path_sets_the_flag_the_summary_reads(deploy):
     """An unset variable would make a skipped provision read as a successful one."""
-    section = deploy[deploy.index("if (-not $SkipFocusExports)"):deploy.index('Step "Done"')]
+    section = deploy[deploy.index("if (-not $SkipFocusExports -and -not $DeferCostAccess)"):
+                     deploy.index('Step "Installation stages finished (data visibility unverified)"')]
     assert section.count("$focusProvisioned = $true") == 1
     assert section.count("$focusProvisioned = $false") == 2, (
         "both the failure and the -SkipFocusExports paths must set it")
