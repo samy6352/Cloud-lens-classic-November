@@ -3,6 +3,11 @@
 ```powershell
 pip install -r requirements.txt -r requirements-dev.txt
 
+# Public installation guide: auth boundary, markup, CSP and subscription template (offline).
+python -m pytest tests/test_install.py -q
+# With the existing npm dev dependencies and Playwright Chromium installed:
+node tests/install_browser.mjs
+
 # Pure/frontend tests run with the normal collector, without a database:
 python -m pytest tests/test_dashboard_navigation.py tests/test_dashboard_frontend.py
 python -m pytest -m "not postgres and not network and not azure"

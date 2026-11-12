@@ -11,6 +11,40 @@ incur charges, including a web app, database, private storage and an AI service.
 [Full documentation](Cloudlens-Documentation.Md) |
 [Detailed deployment guide](infra/README.md)
 
+### Public installation guide
+
+Open `/install` without signing in for a compact setup guide. Only that exact
+path is public; the dashboard and existing API authentication are unchanged.
+The recommended source-checkout flow (no hosted ZIP is assumed) is:
+
+```powershell
+git clone https://github.com/samy6352/Cloud-lens-classic-November.git
+cd Cloud-lens-classic-November
+pwsh -File .\install.ps1
+```
+
+Install Git, PowerShell 7, Python 3.11+ and Azure CLI with Bicep first.
+Preapprove the Entra registration, delegated ARM consent and final callback
+`https://cloudlens-web-<suffix>.azurewebsites.net/auth/callback`; verify regional
+SKU availability, permissions and AI quota before provisioning.
+
+The alternative **Deploy to Azure** button opens `infra/azuredeploy.json` from
+this repository's public `main` branch. It provisions infrastructure only:
+no code publication, consent grant, installer preflight or acceptance checks.
+Use the guided script for the full flow. Azure resources incur charges.
+After changing Bicep, regenerate the checked-in JSON before publishing:
+
+```powershell
+az bicep build --file .\infra\main.bicep --outfile .\infra\azuredeploy.json
+```
+
+The [documented portal link](https://learn.microsoft.com/azure/azure-resource-manager/templates/deploy-to-azure-button)
+uses `#create/Microsoft.Template/uri/` plus the URL-encoded raw JSON URL.
+Azure chooses subscription scope from the compiled template's subscription
+deployment schema, not a resource-group deployment blade. The button requires
+the compiled JSON to be published and publicly readable on `main`; a local
+checkout alone does not make the portal target available.
+
 ### AI chat model compatibility
 
 Chat keeps `temperature=0.1` for models that support it. If the inference API

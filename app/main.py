@@ -95,7 +95,7 @@ def _content_security_policy() -> str:
     """
     inline = re.compile(r"<script(?![^>]*\ssrc=)[^>]*>(.*?)</script>", re.S | re.I)
     hashes: set[str] = set()
-    for page in ("index.html", "login.html"):
+    for page in ("index.html", "login.html", "install.html"):
         try:
             body = (WEB / page).read_text(encoding="utf-8")
         except OSError:  # a partial checkout must not stop the app from starting
@@ -899,10 +899,10 @@ def auth_service() -> Auth:
     return _auth
 
 
-# Signing in, the login page itself and the static assets it needs. Everything else — including
+# Signing in, the public installation guide and the static assets they need. Everything else — including
 # the app shell — requires a session, so an unauthenticated visitor learns nothing about the
 # estate, not even how many subscriptions there are.
-PUBLIC_PATHS = {"/login", "/healthz", "/readyz", "/api/auth/login", "/api/auth/logout", "/api/auth/me",
+PUBLIC_PATHS = {"/install", "/login", "/healthz", "/readyz", "/api/auth/login", "/api/auth/logout", "/api/auth/me",
                 # Admin consent has to be reachable by someone who cannot sign in yet — that is
                 # the entire situation it exists to resolve.
                 "/auth/login", "/auth/callback", "/auth/admin-consent"}
@@ -1513,6 +1513,13 @@ class Credentials(BaseModel):
     # credential check.
     username: str = Field(max_length=120)
     password: str = Field(max_length=256)
+
+
+@app.get("/install", include_in_schema=False)
+async def install_page() -> Response:
+    html = await offload((WEB / "install.html").read_text, encoding="utf-8")
+    return Response(await offload(stamp_asset_urls, html, _static_assets),
+                    media_type="text/html", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/login", include_in_schema=False)

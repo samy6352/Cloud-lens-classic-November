@@ -1,0 +1,1797 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2018-05-01/subscriptionDeploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.49.2.45890",
+      "templateHash": "17243221831008332710"
+    }
+  },
+  "parameters": {
+    "resourceGroupName": {
+      "type": "string",
+      "defaultValue": "rg-cloudlens",
+      "metadata": {
+        "description": "Name of the resource group to create or reuse."
+      }
+    },
+    "location": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure region for every resource in the stack."
+      }
+    },
+    "namePrefix": {
+      "type": "string",
+      "defaultValue": "cloudlens",
+      "minLength": 2,
+      "maxLength": 12,
+      "metadata": {
+        "description": "Prefix for resource names other than the independently named export storage account."
+      }
+    },
+    "nameSuffix": {
+      "type": "string",
+      "defaultValue": "",
+      "maxLength": 10,
+      "metadata": {
+        "description": "Optional environment token appended to resource names other than export storage, e.g. prod. Empty keeps the default naming (id-cloudlens, plan-cloudlens); setting it produces CL-id-prod, CL-plan-prod and so on. These names become deterministic, so deploy.ps1 checks the globally-unique ones for availability first."
+      }
+    },
+    "storageAccountName": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 24,
+      "metadata": {
+        "description": "Reviewed, stable export storage account name (3-24 lowercase letters/digits). Required: for a new deployment generate a random name once and save it in the parameters; for redeployment use the actual existing account, never a newly generated name. deploy.ps1 generates/persists or adopts this value."
+      }
+    },
+    "adminPrincipalObjectId": {
+      "type": "string",
+      "metadata": {
+        "description": "Object ID of the Entra principal that becomes the PostgreSQL administrator. Usually the person or pipeline running this deployment."
+      }
+    },
+    "adminPrincipalName": {
+      "type": "string",
+      "metadata": {
+        "description": "Sign-in name of that administrator, e.g. someone@contoso.com."
+      }
+    },
+    "adminPrincipalType": {
+      "type": "string",
+      "defaultValue": "User",
+      "allowedValues": [
+        "User",
+        "Group",
+        "ServicePrincipal"
+      ],
+      "metadata": {
+        "description": "Type of that administrator principal."
+      }
+    },
+    "networkIsolation": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "True for a customer deployment: PostgreSQL is injected into the virtual network and has no public endpoint. False for development: PostgreSQL keeps a public endpoint restricted by firewall rules."
+      }
+    },
+    "vnetAddressPrefix": {
+      "type": "string",
+      "defaultValue": "10.70.0.0/16",
+      "minLength": 9,
+      "maxLength": 18,
+      "metadata": {
+        "description": "IPv4 CIDR for the new VNet when networkIsolation is true. Choose a range that does not overlap networks it will connect to. Preserve the deployed range on existing deployments."
+      }
+    },
+    "appSubnetAddressPrefix": {
+      "type": "string",
+      "defaultValue": "10.70.1.0/24",
+      "minLength": 9,
+      "maxLength": 18,
+      "metadata": {
+        "description": "IPv4 CIDR for App Service integration, contained within the VNet and disjoint from the other subnets. Minimum subnet size /28; /26 or larger is recommended. Preserve the deployed range on existing deployments."
+      }
+    },
+    "postgresSubnetAddressPrefix": {
+      "type": "string",
+      "defaultValue": "10.70.2.0/24",
+      "minLength": 9,
+      "maxLength": 18,
+      "metadata": {
+        "description": "IPv4 CIDR for PostgreSQL, contained within the VNet and disjoint from the other subnets. Minimum subnet size /28. Preserve the deployed range on existing deployments."
+      }
+    },
+    "privateEndpointSubnetAddressPrefix": {
+      "type": "string",
+      "defaultValue": "10.70.3.0/24",
+      "minLength": 9,
+      "maxLength": 18,
+      "metadata": {
+        "description": "IPv4 CIDR for private endpoints, contained within the VNet and disjoint from the other subnets, with sufficient usable addresses. Preserve the deployed range on existing deployments."
+      }
+    },
+    "developerClientIp": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Client IP allowed through the PostgreSQL firewall when networkIsolation is false. Ignored otherwise."
+      }
+    },
+    "appServicePlanSku": {
+      "type": "string",
+      "defaultValue": "B2",
+      "metadata": {
+        "description": "App Service plan SKU. B2 is the reference floor for the measured multi-million-row workload."
+      }
+    },
+    "postgresSku": {
+      "type": "string",
+      "defaultValue": "Standard_E2ds_v5",
+      "metadata": {
+        "description": "PostgreSQL compute SKU. The memory-optimised E2ds_v5 is the measured reference for large estates."
+      }
+    },
+    "postgresVersion": {
+      "type": "string",
+      "defaultValue": "16",
+      "metadata": {
+        "description": "PostgreSQL major version. Central India offers 11-18."
+      }
+    },
+    "postgresStorageType": {
+      "type": "string",
+      "defaultValue": "PremiumV2_LRS",
+      "allowedValues": [
+        "Premium_LRS",
+        "PremiumV2_LRS"
+      ],
+      "metadata": {
+        "description": "Storage type. Premium_LRS ties IOPS to capacity; PremiumV2_LRS provisions IOPS and throughput independently of size."
+      }
+    },
+    "postgresIops": {
+      "type": "int",
+      "defaultValue": 3000,
+      "metadata": {
+        "description": "Provisioned IOPS, PremiumV2_LRS only."
+      }
+    },
+    "postgresThroughput": {
+      "type": "int",
+      "defaultValue": 125,
+      "metadata": {
+        "description": "Provisioned throughput MB/sec, PremiumV2_LRS only."
+      }
+    },
+    "partitionCosts": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Create a new `costs` table partitioned by month. Must be correct before the application first starts; it cannot convert an existing table."
+      }
+    },
+    "pgWorkMem": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Session work_mem for application connections. Empty keeps the server default."
+      }
+    },
+    "pgStatementTimeout": {
+      "type": "string",
+      "defaultValue": "25s",
+      "metadata": {
+        "description": "Reader statement_timeout. The 25s default stays below the dashboard 30s client deadline; tune upward only after measuring legitimate query durations."
+      }
+    },
+    "autoIngest": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Ingest cost data on first boot when the warehouse is empty."
+      }
+    },
+    "autoRefresh": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Run the daily refresh."
+      }
+    },
+    "snapshotWarmingEnabled": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Warm recently used, private dashboard snapshots after a data generation changes. Bounded to three recent views per active browser."
+      }
+    },
+    "snapshotServerWarmingEnabled": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Recompute views people used, as them, after a deploy, a data publish or the UTC day boundary, so the first view afterwards is a cache hit."
+      }
+    },
+    "authAllowLocal": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Allow username/password sign-in alongside Entra."
+      }
+    },
+    "authUsers": {
+      "type": "securestring",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Local accounts as name:hash:role, PBKDF2 hashed."
+      }
+    },
+    "pgSchema": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Schema the warehouse owns. Empty uses `public`."
+      }
+    },
+    "postgresStorageGb": {
+      "type": "int",
+      "defaultValue": 128,
+      "metadata": {
+        "description": "PostgreSQL storage in GB. 128 GB is the measured reference capacity for large estates."
+      }
+    },
+    "aiLocation": {
+      "type": "string",
+      "metadata": {
+        "description": "Region for the AI Foundry account. Rarely the same as `location`: the regions with App Service quota and the regions offering a model on a pay-as-you-go SKU are different sets."
+      }
+    },
+    "modelName": {
+      "type": "string",
+      "defaultValue": "gpt-4.1-mini",
+      "metadata": {
+        "description": "Model deployed for the chat agent."
+      }
+    },
+    "modelSku": {
+      "type": "string",
+      "defaultValue": "GlobalStandard",
+      "metadata": {
+        "description": "Model deployment SKU. GlobalStandard is pay-as-you-go; a region offering only GlobalProvisionedManaged needs a different aiLocation."
+      }
+    },
+    "modelCapacity": {
+      "type": "int",
+      "defaultValue": 30,
+      "metadata": {
+        "description": "Tokens-per-minute quota, in thousands."
+      }
+    },
+    "deployEntraApp": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Create the Entra app registration people sign in through. Needs directory rights (Application Developer or higher); leave false where the identity team owns app registrations and pass an existing client ID to deploy.ps1 instead."
+      }
+    },
+    "entraAppDisplayName": {
+      "type": "string",
+      "defaultValue": "CloudLens",
+      "metadata": {
+        "description": "Display name for that app registration."
+      }
+    },
+    "entraAppUniqueName": {
+      "type": "string",
+      "defaultValue": "cloudlens",
+      "metadata": {
+        "description": "Stable unique name for it. Changing this creates a second registration rather than renaming the first."
+      }
+    },
+    "authDelegatedArm": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "True calls Azure as the signed-in person, so each sees exactly their own subscriptions. Needs one-time tenant admin consent for ARM `user_impersonation`; without it nobody can sign in. False is app-identity mode: the app resolves who holds a cost-capable role, bounded by the subscriptions its own identity reads."
+      }
+    },
+    "authClientId": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "authTenantId": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "authRedirectUri": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "authAdmins": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {
+        "application": "CloudLens",
+        "workload": "azure-cost-management"
+      },
+      "metadata": {
+        "description": "Tags applied to every resource."
+      }
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Resources/resourceGroups",
+      "apiVersion": "2024-03-01",
+      "name": "[parameters('resourceGroupName')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]"
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "cloudlens-stack",
+      "resourceGroup": "[parameters('resourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "namePrefix": {
+            "value": "[parameters('namePrefix')]"
+          },
+          "nameSuffix": {
+            "value": "[parameters('nameSuffix')]"
+          },
+          "storageAccountName": {
+            "value": "[parameters('storageAccountName')]"
+          },
+          "adminPrincipalObjectId": {
+            "value": "[parameters('adminPrincipalObjectId')]"
+          },
+          "adminPrincipalName": {
+            "value": "[parameters('adminPrincipalName')]"
+          },
+          "adminPrincipalType": {
+            "value": "[parameters('adminPrincipalType')]"
+          },
+          "networkIsolation": {
+            "value": "[parameters('networkIsolation')]"
+          },
+          "vnetAddressPrefix": {
+            "value": "[parameters('vnetAddressPrefix')]"
+          },
+          "appSubnetAddressPrefix": {
+            "value": "[parameters('appSubnetAddressPrefix')]"
+          },
+          "postgresSubnetAddressPrefix": {
+            "value": "[parameters('postgresSubnetAddressPrefix')]"
+          },
+          "privateEndpointSubnetAddressPrefix": {
+            "value": "[parameters('privateEndpointSubnetAddressPrefix')]"
+          },
+          "developerClientIp": {
+            "value": "[parameters('developerClientIp')]"
+          },
+          "appServicePlanSku": {
+            "value": "[parameters('appServicePlanSku')]"
+          },
+          "postgresSku": {
+            "value": "[parameters('postgresSku')]"
+          },
+          "postgresVersion": {
+            "value": "[parameters('postgresVersion')]"
+          },
+          "postgresStorageType": {
+            "value": "[parameters('postgresStorageType')]"
+          },
+          "postgresIops": {
+            "value": "[parameters('postgresIops')]"
+          },
+          "postgresThroughput": {
+            "value": "[parameters('postgresThroughput')]"
+          },
+          "partitionCosts": {
+            "value": "[parameters('partitionCosts')]"
+          },
+          "pgWorkMem": {
+            "value": "[parameters('pgWorkMem')]"
+          },
+          "pgStatementTimeout": {
+            "value": "[parameters('pgStatementTimeout')]"
+          },
+          "autoIngest": {
+            "value": "[parameters('autoIngest')]"
+          },
+          "autoRefresh": {
+            "value": "[parameters('autoRefresh')]"
+          },
+          "snapshotWarmingEnabled": {
+            "value": "[parameters('snapshotWarmingEnabled')]"
+          },
+          "snapshotServerWarmingEnabled": {
+            "value": "[parameters('snapshotServerWarmingEnabled')]"
+          },
+          "authAllowLocal": {
+            "value": "[parameters('authAllowLocal')]"
+          },
+          "authUsers": {
+            "value": "[parameters('authUsers')]"
+          },
+          "pgSchema": {
+            "value": "[parameters('pgSchema')]"
+          },
+          "postgresStorageGb": {
+            "value": "[parameters('postgresStorageGb')]"
+          },
+          "aiLocation": {
+            "value": "[parameters('aiLocation')]"
+          },
+          "modelName": {
+            "value": "[parameters('modelName')]"
+          },
+          "modelSku": {
+            "value": "[parameters('modelSku')]"
+          },
+          "modelCapacity": {
+            "value": "[parameters('modelCapacity')]"
+          },
+          "authDelegatedArm": {
+            "value": "[parameters('authDelegatedArm')]"
+          },
+          "authClientId": {
+            "value": "[parameters('authClientId')]"
+          },
+          "authTenantId": {
+            "value": "[parameters('authTenantId')]"
+          },
+          "authRedirectUri": {
+            "value": "[parameters('authRedirectUri')]"
+          },
+          "authAdmins": {
+            "value": "[parameters('authAdmins')]"
+          },
+          "tags": {
+            "value": "[parameters('tags')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.49.2.45890",
+              "templateHash": "2748504412470205348"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string",
+              "metadata": {
+                "description": "Azure region for every resource."
+              }
+            },
+            "namePrefix": {
+              "type": "string",
+              "metadata": {
+                "description": "Prefix for resource names."
+              }
+            },
+            "nameSuffix": {
+              "type": "string",
+              "defaultValue": "",
+              "metadata": {
+                "description": "Optional environment token appended to resource names other than storage. Empty keeps the default CAF naming (id-cloudlens); setting it brackets the type abbreviation instead (CL-id-prod). PostgreSQL is folded to lower case."
+              }
+            },
+            "storageAccountName": {
+              "type": "string",
+              "minLength": 3,
+              "maxLength": 24,
+              "metadata": {
+                "description": "Stable, reviewed export storage name. Generate once for a new deployment; preserve the actual account name on redeployment."
+              }
+            },
+            "adminPrincipalObjectId": {
+              "type": "string",
+              "metadata": {
+                "description": "Object ID of the Entra principal that becomes the PostgreSQL administrator."
+              }
+            },
+            "adminPrincipalName": {
+              "type": "string",
+              "metadata": {
+                "description": "Sign-in name of that administrator."
+              }
+            },
+            "adminPrincipalType": {
+              "type": "string",
+              "allowedValues": [
+                "User",
+                "Group",
+                "ServicePrincipal"
+              ],
+              "metadata": {
+                "description": "Type of that administrator principal."
+              }
+            },
+            "networkIsolation": {
+              "type": "bool",
+              "metadata": {
+                "description": "Whether to deploy the network-isolated shape."
+              }
+            },
+            "vnetAddressPrefix": {
+              "type": "string",
+              "defaultValue": "10.70.0.0/16",
+              "minLength": 9,
+              "maxLength": 18,
+              "metadata": {
+                "description": "IPv4 CIDR for the new VNet when isolated. Must not overlap networks it will connect to. Preserve the deployed range on existing deployments."
+              }
+            },
+            "appSubnetAddressPrefix": {
+              "type": "string",
+              "defaultValue": "10.70.1.0/24",
+              "minLength": 9,
+              "maxLength": 18,
+              "metadata": {
+                "description": "IPv4 CIDR for App Service integration, inside the VNet and disjoint from other subnets. Minimum size /28; /26 or larger recommended. Preserve the deployed range on existing deployments."
+              }
+            },
+            "postgresSubnetAddressPrefix": {
+              "type": "string",
+              "defaultValue": "10.70.2.0/24",
+              "minLength": 9,
+              "maxLength": 18,
+              "metadata": {
+                "description": "IPv4 CIDR for PostgreSQL, inside the VNet and disjoint from other subnets. Minimum size /28. Preserve the deployed range on existing deployments."
+              }
+            },
+            "privateEndpointSubnetAddressPrefix": {
+              "type": "string",
+              "defaultValue": "10.70.3.0/24",
+              "minLength": 9,
+              "maxLength": 18,
+              "metadata": {
+                "description": "IPv4 CIDR for private endpoints, inside the VNet and disjoint from other subnets, with sufficient usable addresses. Preserve the deployed range on existing deployments."
+              }
+            },
+            "developerClientIp": {
+              "type": "string",
+              "metadata": {
+                "description": "Developer client IP allowed through the PostgreSQL firewall when not isolated."
+              }
+            },
+            "appServicePlanSku": {
+              "type": "string",
+              "metadata": {
+                "description": "App Service plan SKU."
+              }
+            },
+            "postgresSku": {
+              "type": "string",
+              "metadata": {
+                "description": "PostgreSQL compute SKU."
+              }
+            },
+            "postgresVersion": {
+              "type": "string",
+              "defaultValue": "16",
+              "metadata": {
+                "description": "PostgreSQL major version. Kept as a parameter rather than pinned: the local baseline this deployment is measured against runs 18, and silently deploying an older engine hides the difference."
+              }
+            },
+            "postgresStorageType": {
+              "type": "string",
+              "defaultValue": "Premium_LRS",
+              "allowedValues": [
+                "Premium_LRS",
+                "PremiumV2_LRS"
+              ],
+              "metadata": {
+                "description": "Storage type. Premium_LRS welds IOPS to capacity (32GB = 120 IOPS, the trap the first deployment fell into); PremiumV2_LRS buys IOPS independently of size."
+              }
+            },
+            "postgresIops": {
+              "type": "int",
+              "defaultValue": 3000,
+              "metadata": {
+                "description": "Provisioned IOPS. PremiumV2_LRS only; ignored for Premium_LRS, where IOPS follow the disk tier."
+              }
+            },
+            "postgresThroughput": {
+              "type": "int",
+              "defaultValue": 125,
+              "metadata": {
+                "description": "Provisioned storage throughput in MB/sec. PremiumV2_LRS only."
+              }
+            },
+            "partitionCosts": {
+              "type": "bool",
+              "defaultValue": true,
+              "metadata": {
+                "description": "Create a new `costs` table partitioned by month. Read once at import; it cannot convert a table that already exists, so it must be correct before the application first starts."
+              }
+            },
+            "pgWorkMem": {
+              "type": "string",
+              "defaultValue": "",
+              "metadata": {
+                "description": "Session work_mem for application connections. Empty keeps the server default. Applies per sort node and per pooled connection, so size it against the server, not the query."
+              }
+            },
+            "pgStatementTimeout": {
+              "type": "string",
+              "defaultValue": "25s",
+              "metadata": {
+                "description": "Reader statement_timeout. Keep below the dashboard client deadline so abandoned reads return their pool slot promptly."
+              }
+            },
+            "autoIngest": {
+              "type": "bool",
+              "defaultValue": true,
+              "metadata": {
+                "description": "Let the application ingest cost data on first boot when the warehouse is empty. False for a deployment whose data is loaded by other means, so a boot cannot mix its own subscription into a restored estate."
+              }
+            },
+            "autoRefresh": {
+              "type": "bool",
+              "defaultValue": true,
+              "metadata": {
+                "description": "Run the daily refresh. False pins the warehouse to exactly what was loaded."
+              }
+            },
+            "snapshotWarmingEnabled": {
+              "type": "bool",
+              "defaultValue": true,
+              "metadata": {
+                "description": "Warm recently used, private dashboard snapshots after a data generation changes."
+              }
+            },
+            "snapshotServerWarmingEnabled": {
+              "type": "bool",
+              "defaultValue": true,
+              "metadata": {
+                "description": "Recompute views people used, as them, after a deploy, a data publish or the UTC day boundary."
+              }
+            },
+            "authAllowLocal": {
+              "type": "bool",
+              "defaultValue": false,
+              "metadata": {
+                "description": "Allow username/password sign-in alongside Entra. Production runs with this enabled."
+              }
+            },
+            "authUsers": {
+              "type": "securestring",
+              "defaultValue": "",
+              "metadata": {
+                "description": "Local accounts as name:hash:role, PBKDF2 hashed. Never a plaintext password."
+              }
+            },
+            "authClientId": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "authTenantId": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "authRedirectUri": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "authAdmins": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "pgSchema": {
+              "type": "string",
+              "defaultValue": "",
+              "metadata": {
+                "description": "Schema the warehouse owns. Empty uses `public`."
+              }
+            },
+            "postgresStorageGb": {
+              "type": "int",
+              "metadata": {
+                "description": "PostgreSQL storage in GB."
+              }
+            },
+            "aiLocation": {
+              "type": "string",
+              "metadata": {
+                "description": "Region for the AI Foundry account, which is rarely the same as the app: the regions with App Service quota and the regions offering a model on a pay-as-you-go SKU are different sets."
+              }
+            },
+            "modelName": {
+              "type": "string",
+              "metadata": {
+                "description": "Model deployed for the chat agent."
+              }
+            },
+            "modelSku": {
+              "type": "string",
+              "metadata": {
+                "description": "Model deployment SKU. GlobalStandard is pay-as-you-go; a region that only offers GlobalProvisionedManaged needs a different aiLocation."
+              }
+            },
+            "modelCapacity": {
+              "type": "int",
+              "metadata": {
+                "description": "Tokens-per-minute quota, in thousands."
+              }
+            },
+            "authDelegatedArm": {
+              "type": "bool",
+              "defaultValue": true,
+              "metadata": {
+                "description": "True calls Azure as the signed-in person; false is app-identity mode. See main.bicep."
+              }
+            },
+            "tags": {
+              "type": "object",
+              "metadata": {
+                "description": "Tags applied to every resource."
+              }
+            }
+          },
+          "variables": {
+            "suffix": "[substring(uniqueString(resourceGroup().id), 0, 5)]",
+            "bracketed": "[not(empty(parameters('nameSuffix')))]",
+            "identityName": "[if(variables('bracketed'), format('{0}-id-{1}', parameters('namePrefix'), parameters('nameSuffix')), format('id-{0}', parameters('namePrefix')))]",
+            "workspaceName": "[if(variables('bracketed'), format('{0}-log-{1}', parameters('namePrefix'), parameters('nameSuffix')), format('log-{0}', parameters('namePrefix')))]",
+            "insightsName": "[if(variables('bracketed'), format('{0}-appi-{1}', parameters('namePrefix'), parameters('nameSuffix')), format('appi-{0}', parameters('namePrefix')))]",
+            "postgresName": "[if(variables('bracketed'), toLower(format('{0}-postgres-{1}', parameters('namePrefix'), parameters('nameSuffix'))), format('{0}-pg-{1}', parameters('namePrefix'), variables('suffix')))]",
+            "planName": "[if(variables('bracketed'), format('{0}-plan-{1}', parameters('namePrefix'), parameters('nameSuffix')), format('plan-{0}', parameters('namePrefix')))]",
+            "webAppName": "[if(variables('bracketed'), format('{0}-web-{1}', parameters('namePrefix'), parameters('nameSuffix')), format('{0}-{1}', parameters('namePrefix'), variables('suffix')))]",
+            "vnetName": "[if(variables('bracketed'), format('{0}-vnet-{1}', parameters('namePrefix'), parameters('nameSuffix')), format('vnet-{0}', parameters('namePrefix')))]",
+            "foundryName": "[if(variables('bracketed'), format('{0}-aif-{1}', parameters('namePrefix'), parameters('nameSuffix')), format('aif-{0}-{1}', parameters('namePrefix'), variables('suffix')))]",
+            "projectName": "[if(variables('bracketed'), format('{0}-proj-{1}', parameters('namePrefix'), parameters('nameSuffix')), format('proj-{0}', parameters('namePrefix')))]",
+            "databaseName": "cloudlens",
+            "postgresDnsZoneName": "[format('{0}.private.postgres.database.azure.com', variables('postgresName'))]",
+            "blobDnsZoneName": "[format('privatelink.blob.{0}', environment().suffixes.storage)]",
+            "storageBlobDataContributor": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')]",
+            "monitoringMetricsPublisher": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '3913510d-42f4-4e42-8a64-420c390055eb')]",
+            "cognitiveServicesOpenAIUser": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd')]",
+            "userAccessAdministrator": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '18d7d88d-d35e-4fb5-a5c3-7773c20a72d9')]"
+          },
+          "resources": [
+            {
+              "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+              "apiVersion": "2023-01-31",
+              "name": "[variables('identityName')]",
+              "location": "[parameters('location')]",
+              "tags": "[parameters('tags')]"
+            },
+            {
+              "type": "Microsoft.OperationalInsights/workspaces",
+              "apiVersion": "2023-09-01",
+              "name": "[variables('workspaceName')]",
+              "location": "[parameters('location')]",
+              "tags": "[parameters('tags')]",
+              "properties": {
+                "sku": {
+                  "name": "PerGB2018"
+                },
+                "retentionInDays": 30
+              }
+            },
+            {
+              "type": "Microsoft.Insights/components",
+              "apiVersion": "2020-02-02",
+              "name": "[variables('insightsName')]",
+              "location": "[parameters('location')]",
+              "tags": "[parameters('tags')]",
+              "kind": "web",
+              "properties": {
+                "Application_Type": "web",
+                "WorkspaceResourceId": "[resourceId('Microsoft.OperationalInsights/workspaces', variables('workspaceName'))]",
+                "DisableLocalAuth": true
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.OperationalInsights/workspaces', variables('workspaceName'))]"
+              ]
+            },
+            {
+              "condition": "[parameters('networkIsolation')]",
+              "type": "Microsoft.Network/virtualNetworks",
+              "apiVersion": "2024-05-01",
+              "name": "[variables('vnetName')]",
+              "location": "[parameters('location')]",
+              "tags": "[parameters('tags')]",
+              "properties": {
+                "addressSpace": {
+                  "addressPrefixes": [
+                    "[parameters('vnetAddressPrefix')]"
+                  ]
+                },
+                "subnets": [
+                  {
+                    "name": "snet-app",
+                    "properties": {
+                      "addressPrefix": "[parameters('appSubnetAddressPrefix')]",
+                      "delegations": [
+                        {
+                          "name": "appservice",
+                          "properties": {
+                            "serviceName": "Microsoft.Web/serverFarms"
+                          }
+                        }
+                      ],
+                      "serviceEndpoints": [
+                        {
+                          "service": "Microsoft.Storage"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "name": "snet-postgres",
+                    "properties": {
+                      "addressPrefix": "[parameters('postgresSubnetAddressPrefix')]",
+                      "delegations": [
+                        {
+                          "name": "postgres",
+                          "properties": {
+                            "serviceName": "Microsoft.DBforPostgreSQL/flexibleServers"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "name": "snet-privatelink",
+                    "properties": {
+                      "addressPrefix": "[parameters('privateEndpointSubnetAddressPrefix')]"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "condition": "[parameters('networkIsolation')]",
+              "type": "Microsoft.Network/privateDnsZones",
+              "apiVersion": "2024-06-01",
+              "name": "[variables('postgresDnsZoneName')]",
+              "location": "global",
+              "tags": "[parameters('tags')]"
+            },
+            {
+              "condition": "[parameters('networkIsolation')]",
+              "type": "Microsoft.Network/privateDnsZones/virtualNetworkLinks",
+              "apiVersion": "2024-06-01",
+              "name": "[format('{0}/{1}', variables('postgresDnsZoneName'), format('link-{0}', variables('vnetName')))]",
+              "location": "global",
+              "properties": {
+                "registrationEnabled": false,
+                "virtualNetwork": {
+                  "id": "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]"
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/privateDnsZones', variables('postgresDnsZoneName'))]",
+                "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]"
+              ]
+            },
+            {
+              "condition": "[parameters('networkIsolation')]",
+              "type": "Microsoft.Network/privateDnsZones",
+              "apiVersion": "2024-06-01",
+              "name": "[variables('blobDnsZoneName')]",
+              "location": "global",
+              "tags": "[parameters('tags')]"
+            },
+            {
+              "condition": "[parameters('networkIsolation')]",
+              "type": "Microsoft.Network/privateDnsZones/virtualNetworkLinks",
+              "apiVersion": "2024-06-01",
+              "name": "[format('{0}/{1}', variables('blobDnsZoneName'), format('link-{0}', variables('vnetName')))]",
+              "location": "global",
+              "properties": {
+                "registrationEnabled": false,
+                "virtualNetwork": {
+                  "id": "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]"
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/privateDnsZones', variables('blobDnsZoneName'))]",
+                "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Storage/storageAccounts",
+              "apiVersion": "2023-05-01",
+              "name": "[parameters('storageAccountName')]",
+              "location": "[parameters('location')]",
+              "tags": "[parameters('tags')]",
+              "sku": {
+                "name": "Standard_LRS"
+              },
+              "kind": "StorageV2",
+              "properties": {
+                "minimumTlsVersion": "TLS1_2",
+                "allowBlobPublicAccess": false,
+                "allowSharedKeyAccess": false,
+                "supportsHttpsTrafficOnly": true,
+                "publicNetworkAccess": "[if(parameters('networkIsolation'), 'Disabled', 'Enabled')]",
+                "networkAcls": {
+                  "bypass": "AzureServices",
+                  "defaultAction": "[if(parameters('networkIsolation'), 'Deny', 'Allow')]"
+                }
+              }
+            },
+            {
+              "type": "Microsoft.Storage/storageAccounts/blobServices",
+              "apiVersion": "2023-05-01",
+              "name": "[format('{0}/{1}', parameters('storageAccountName'), 'default')]",
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+              "apiVersion": "2023-05-01",
+              "name": "[format('{0}/{1}/{2}', parameters('storageAccountName'), 'default', 'cloudlens')]",
+              "properties": {
+                "publicAccess": "None"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts/blobServices', parameters('storageAccountName'), 'default')]"
+              ]
+            },
+            {
+              "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+              "apiVersion": "2023-05-01",
+              "name": "[format('{0}/{1}/{2}', parameters('storageAccountName'), 'default', 'focus-exports')]",
+              "properties": {
+                "publicAccess": "None"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts/blobServices', parameters('storageAccountName'), 'default')]"
+              ]
+            },
+            {
+              "condition": "[parameters('networkIsolation')]",
+              "type": "Microsoft.Network/privateEndpoints",
+              "apiVersion": "2024-05-01",
+              "name": "[if(variables('bracketed'), format('{0}-pe-blob-{1}', parameters('namePrefix'), parameters('nameSuffix')), format('pe-{0}-blob', parameters('namePrefix')))]",
+              "location": "[parameters('location')]",
+              "tags": "[parameters('tags')]",
+              "properties": {
+                "subnet": {
+                  "id": "[format('{0}/subnets/snet-privatelink', resourceId('Microsoft.Network/virtualNetworks', variables('vnetName')))]"
+                },
+                "privateLinkServiceConnections": [
+                  {
+                    "name": "blob",
+                    "properties": {
+                      "privateLinkServiceId": "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]",
+                      "groupIds": [
+                        "blob"
+                      ]
+                    }
+                  }
+                ]
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]",
+                "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]"
+              ]
+            },
+            {
+              "condition": "[parameters('networkIsolation')]",
+              "type": "Microsoft.Network/privateEndpoints/privateDnsZoneGroups",
+              "apiVersion": "2024-05-01",
+              "name": "[format('{0}/{1}', if(variables('bracketed'), format('{0}-pe-blob-{1}', parameters('namePrefix'), parameters('nameSuffix')), format('pe-{0}-blob', parameters('namePrefix'))), 'default')]",
+              "properties": {
+                "privateDnsZoneConfigs": [
+                  {
+                    "name": "blob",
+                    "properties": {
+                      "privateDnsZoneId": "[resourceId('Microsoft.Network/privateDnsZones', variables('blobDnsZoneName'))]"
+                    }
+                  }
+                ]
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/privateDnsZones/virtualNetworkLinks', variables('blobDnsZoneName'), format('link-{0}', variables('vnetName')))]",
+                "[resourceId('Microsoft.Network/privateDnsZones', variables('blobDnsZoneName'))]",
+                "[resourceId('Microsoft.Network/privateEndpoints', if(variables('bracketed'), format('{0}-pe-blob-{1}', parameters('namePrefix'), parameters('nameSuffix')), format('pe-{0}-blob', parameters('namePrefix'))))]"
+              ]
+            },
+            {
+              "type": "Microsoft.DBforPostgreSQL/flexibleServers",
+              "apiVersion": "2024-08-01",
+              "name": "[variables('postgresName')]",
+              "location": "[parameters('location')]",
+              "tags": "[parameters('tags')]",
+              "sku": {
+                "name": "[parameters('postgresSku')]",
+                "tier": "[if(startsWith(parameters('postgresSku'), 'Standard_B'), 'Burstable', if(startsWith(parameters('postgresSku'), 'Standard_E'), 'MemoryOptimized', 'GeneralPurpose'))]"
+              },
+              "properties": {
+                "version": "[parameters('postgresVersion')]",
+                "storage": "[if(equals(parameters('postgresStorageType'), 'PremiumV2_LRS'), createObject('storageSizeGB', parameters('postgresStorageGb'), 'type', 'PremiumV2_LRS', 'iops', parameters('postgresIops'), 'throughput', parameters('postgresThroughput')), createObject('storageSizeGB', parameters('postgresStorageGb'), 'autoGrow', 'Enabled'))]",
+                "backup": {
+                  "backupRetentionDays": 7,
+                  "geoRedundantBackup": "Disabled"
+                },
+                "highAvailability": {
+                  "mode": "Disabled"
+                },
+                "authConfig": {
+                  "activeDirectoryAuth": "Enabled",
+                  "passwordAuth": "Disabled",
+                  "tenantId": "[subscription().tenantId]"
+                },
+                "network": "[if(parameters('networkIsolation'), createObject('delegatedSubnetResourceId', format('{0}/subnets/snet-postgres', resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))), 'privateDnsZoneArmResourceId', resourceId('Microsoft.Network/privateDnsZones', variables('postgresDnsZoneName')), 'publicNetworkAccess', 'Disabled'), createObject('publicNetworkAccess', 'Enabled'))]"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/privateDnsZones/virtualNetworkLinks', variables('postgresDnsZoneName'), format('link-{0}', variables('vnetName')))]",
+                "[resourceId('Microsoft.Network/privateDnsZones', variables('postgresDnsZoneName'))]",
+                "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.DBforPostgreSQL/flexibleServers/databases",
+              "apiVersion": "2024-08-01",
+              "name": "[format('{0}/{1}', variables('postgresName'), variables('databaseName'))]",
+              "properties": {
+                "charset": "UTF8",
+                "collation": "en_US.utf8"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers', variables('postgresName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.DBforPostgreSQL/flexibleServers/administrators",
+              "apiVersion": "2024-08-01",
+              "name": "[format('{0}/{1}', variables('postgresName'), parameters('adminPrincipalObjectId'))]",
+              "properties": {
+                "principalName": "[parameters('adminPrincipalName')]",
+                "principalType": "[parameters('adminPrincipalType')]",
+                "tenantId": "[subscription().tenantId]"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers', variables('postgresName'))]"
+              ]
+            },
+            {
+              "condition": "[not(parameters('networkIsolation'))]",
+              "type": "Microsoft.DBforPostgreSQL/flexibleServers/firewallRules",
+              "apiVersion": "2024-08-01",
+              "name": "[format('{0}/{1}', variables('postgresName'), 'AllowAzureServices')]",
+              "properties": {
+                "startIpAddress": "0.0.0.0",
+                "endIpAddress": "0.0.0.0"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers', variables('postgresName'))]",
+                "[resourceId('Microsoft.Resources/deployments', 'cloudlens-postgres-app-admin')]"
+              ]
+            },
+            {
+              "condition": "[and(not(parameters('networkIsolation')), not(empty(parameters('developerClientIp'))))]",
+              "type": "Microsoft.DBforPostgreSQL/flexibleServers/firewallRules",
+              "apiVersion": "2024-08-01",
+              "name": "[format('{0}/{1}', variables('postgresName'), 'AllowDeployingClient')]",
+              "properties": {
+                "startIpAddress": "[parameters('developerClientIp')]",
+                "endIpAddress": "[parameters('developerClientIp')]"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers/firewallRules', variables('postgresName'), 'AllowAzureServices')]",
+                "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers', variables('postgresName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.CognitiveServices/accounts",
+              "apiVersion": "2025-04-01-preview",
+              "name": "[variables('foundryName')]",
+              "location": "[parameters('aiLocation')]",
+              "tags": "[parameters('tags')]",
+              "kind": "AIServices",
+              "sku": {
+                "name": "S0"
+              },
+              "identity": {
+                "type": "SystemAssigned"
+              },
+              "properties": {
+                "customSubDomainName": "[variables('foundryName')]",
+                "publicNetworkAccess": "Enabled",
+                "allowProjectManagement": true,
+                "disableLocalAuth": true
+              }
+            },
+            {
+              "type": "Microsoft.CognitiveServices/accounts/projects",
+              "apiVersion": "2025-04-01-preview",
+              "name": "[format('{0}/{1}', variables('foundryName'), variables('projectName'))]",
+              "location": "[parameters('aiLocation')]",
+              "identity": {
+                "type": "SystemAssigned"
+              },
+              "properties": {
+                "displayName": "CloudLens",
+                "description": "Cost analysis agent"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.CognitiveServices/accounts', variables('foundryName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.CognitiveServices/accounts/deployments",
+              "apiVersion": "2024-10-01",
+              "name": "[format('{0}/{1}', variables('foundryName'), parameters('modelName'))]",
+              "sku": {
+                "name": "[parameters('modelSku')]",
+                "capacity": "[parameters('modelCapacity')]"
+              },
+              "properties": {
+                "model": {
+                  "format": "OpenAI",
+                  "name": "[parameters('modelName')]"
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.CognitiveServices/accounts', variables('foundryName'))]",
+                "[resourceId('Microsoft.CognitiveServices/accounts/projects', variables('foundryName'), variables('projectName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Web/serverfarms",
+              "apiVersion": "2023-12-01",
+              "name": "[variables('planName')]",
+              "location": "[parameters('location')]",
+              "tags": "[parameters('tags')]",
+              "sku": {
+                "name": "[parameters('appServicePlanSku')]"
+              },
+              "kind": "linux",
+              "properties": {
+                "reserved": true
+              }
+            },
+            {
+              "type": "Microsoft.Web/sites",
+              "apiVersion": "2023-12-01",
+              "name": "[variables('webAppName')]",
+              "location": "[parameters('location')]",
+              "tags": "[parameters('tags')]",
+              "kind": "app,linux",
+              "identity": {
+                "type": "UserAssigned",
+                "userAssignedIdentities": {
+                  "[format('{0}', resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('identityName')))]": {}
+                }
+              },
+              "properties": {
+                "serverFarmId": "[resourceId('Microsoft.Web/serverfarms', variables('planName'))]",
+                "httpsOnly": true,
+                "virtualNetworkSubnetId": "[if(parameters('networkIsolation'), format('{0}/subnets/snet-app', resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))), null())]",
+                "vnetRouteAllEnabled": "[parameters('networkIsolation')]",
+                "siteConfig": {
+                  "linuxFxVersion": "PYTHON|3.13",
+                  "appCommandLine": "python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=*",
+                  "alwaysOn": "[not(equals(parameters('appServicePlanSku'), 'F1'))]",
+                  "ftpsState": "Disabled",
+                  "http20Enabled": true,
+                  "minTlsVersion": "1.2",
+                  "healthCheckPath": "/healthz",
+                  "appSettings": [
+                    {
+                      "name": "SCM_DO_BUILD_DURING_DEPLOYMENT",
+                      "value": "true"
+                    },
+                    {
+                      "name": "AUTH_DISABLED",
+                      "value": "false"
+                    },
+                    {
+                      "name": "AUTH_CLIENT_ID",
+                      "value": "[parameters('authClientId')]"
+                    },
+                    {
+                      "name": "AUTH_TENANT_ID",
+                      "value": "[parameters('authTenantId')]"
+                    },
+                    {
+                      "name": "AUTH_REDIRECT_URI",
+                      "value": "[parameters('authRedirectUri')]"
+                    },
+                    {
+                      "name": "AUTH_ADMINS",
+                      "value": "[parameters('authAdmins')]"
+                    },
+                    {
+                      "name": "AUTH_DELEGATED_ARM",
+                      "value": "[string(parameters('authDelegatedArm'))]"
+                    },
+                    {
+                      "name": "AUTH_COOKIE_SECURE",
+                      "value": "true"
+                    },
+                    {
+                      "name": "AUTH_DATA_DIR",
+                      "value": "/home/cloudlens"
+                    },
+                    {
+                      "name": "WEBSITES_CONTAINER_START_TIME_LIMIT",
+                      "value": "600"
+                    },
+                    {
+                      "name": "AZURE_CLIENT_ID",
+                      "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('identityName')), '2023-01-31').clientId]"
+                    },
+                    {
+                      "name": "CLOUDLENS_PRINCIPAL_ID",
+                      "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('identityName')), '2023-01-31').principalId]"
+                    },
+                    {
+                      "name": "CLOUDLENS_TENANT_ID",
+                      "value": "[tenant().tenantId]"
+                    },
+                    {
+                      "name": "SNAPSHOT_CACHE_ENABLED",
+                      "value": "true"
+                    },
+                    {
+                      "name": "SNAPSHOT_WARMING_ENABLED",
+                      "value": "[if(parameters('snapshotWarmingEnabled'), 'true', 'false')]"
+                    },
+                    {
+                      "name": "SNAPSHOT_SERVER_WARMING_ENABLED",
+                      "value": "[if(parameters('snapshotServerWarmingEnabled'), 'true', 'false')]"
+                    },
+                    {
+                      "name": "CLOUDLENS_FX_ROLLUP",
+                      "value": "true"
+                    },
+                    {
+                      "name": "WEBSITE_WARMUP_PATH",
+                      "value": "/readyz"
+                    },
+                    {
+                      "name": "WEBSITE_WARMUP_STATUSES",
+                      "value": "200"
+                    },
+                    {
+                      "name": "PGHOST",
+                      "value": "[reference(resourceId('Microsoft.DBforPostgreSQL/flexibleServers', variables('postgresName')), '2024-08-01').fullyQualifiedDomainName]"
+                    },
+                    {
+                      "name": "PGDATABASE",
+                      "value": "[variables('databaseName')]"
+                    },
+                    {
+                      "name": "PGUSER",
+                      "value": "[variables('identityName')]"
+                    },
+                    {
+                      "name": "PGSSLMODE",
+                      "value": "require"
+                    },
+                    {
+                      "name": "CLOUDLENS_PARTITION_COSTS",
+                      "value": "[if(parameters('partitionCosts'), '1', '')]"
+                    },
+                    {
+                      "name": "PG_WORK_MEM",
+                      "value": "[parameters('pgWorkMem')]"
+                    },
+                    {
+                      "name": "PG_STATEMENT_TIMEOUT",
+                      "value": "[parameters('pgStatementTimeout')]"
+                    },
+                    {
+                      "name": "AUTO_INGEST",
+                      "value": "[if(parameters('autoIngest'), 'true', 'false')]"
+                    },
+                    {
+                      "name": "AUTO_REFRESH",
+                      "value": "[if(parameters('autoRefresh'), 'true', 'false')]"
+                    },
+                    {
+                      "name": "AUTH_ALLOW_LOCAL",
+                      "value": "[if(parameters('authAllowLocal'), 'true', 'false')]"
+                    },
+                    {
+                      "name": "AUTH_USERS",
+                      "value": "[parameters('authUsers')]"
+                    },
+                    {
+                      "name": "PGSCHEMA",
+                      "value": "[parameters('pgSchema')]"
+                    },
+                    {
+                      "name": "ARCHIVE_ACCOUNT",
+                      "value": "[parameters('storageAccountName')]"
+                    },
+                    {
+                      "name": "ARCHIVE_CONTAINER",
+                      "value": "cloudlens"
+                    },
+                    {
+                      "name": "FOCUS_EXPORT_CONTAINER",
+                      "value": "focus-exports"
+                    },
+                    {
+                      "name": "FOCUS_EXPORT_PREFIX",
+                      "value": "focus"
+                    },
+                    {
+                      "name": "ARCHIVE_ACCOUNT_ID",
+                      "value": "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]"
+                    },
+                    {
+                      "name": "ARCHIVE_LOCATION",
+                      "value": "[parameters('location')]"
+                    },
+                    {
+                      "name": "APPLICATIONINSIGHTS_CONNECTION_STRING",
+                      "value": "[reference(resourceId('Microsoft.Insights/components', variables('insightsName')), '2020-02-02').ConnectionString]"
+                    },
+                    {
+                      "name": "PROJECT_ENDPOINT",
+                      "value": "[format('{0}api/projects/{1}', reference(resourceId('Microsoft.CognitiveServices/accounts', variables('foundryName')), '2025-04-01-preview').endpoint, variables('projectName'))]"
+                    },
+                    {
+                      "name": "MODEL_DEPLOYMENT_NAME",
+                      "value": "[parameters('modelName')]"
+                    },
+                    {
+                      "name": "WEBSITE_DNS_SERVER",
+                      "value": "[if(parameters('networkIsolation'), '168.63.129.16', '')]"
+                    }
+                  ]
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', parameters('storageAccountName'), 'default', 'cloudlens')]",
+                "[resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', parameters('storageAccountName'), 'default', 'focus-exports')]",
+                "[resourceId('Microsoft.CognitiveServices/accounts', variables('foundryName'))]",
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('identityName'))]",
+                "[resourceId('Microsoft.Insights/components', variables('insightsName'))]",
+                "[resourceId('Microsoft.Web/serverfarms', variables('planName'))]",
+                "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers', variables('postgresName'))]",
+                "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]",
+                "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]",
+              "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('identityName')), variables('storageBlobDataContributor'))]",
+              "properties": {
+                "roleDefinitionId": "[variables('storageBlobDataContributor')]",
+                "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('identityName')), '2023-01-31').principalId]",
+                "principalType": "ServicePrincipal"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('identityName'))]",
+                "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]",
+              "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('identityName')), variables('userAccessAdministrator'))]",
+              "properties": {
+                "roleDefinitionId": "[variables('userAccessAdministrator')]",
+                "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('identityName')), '2023-01-31').principalId]",
+                "principalType": "ServicePrincipal",
+                "condition": "((!(ActionMatches{'Microsoft.Authorization/roleAssignments/write'})) OR (@Request[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAnyValues:GuidEquals{ba92f5b4-2d11-453d-a403-e96b0029c9fe}))",
+                "conditionVersion": "2.0"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('identityName'))]",
+                "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[resourceId('Microsoft.Insights/components', variables('insightsName'))]",
+              "name": "[guid(resourceId('Microsoft.Insights/components', variables('insightsName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('identityName')), variables('monitoringMetricsPublisher'))]",
+              "properties": {
+                "roleDefinitionId": "[variables('monitoringMetricsPublisher')]",
+                "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('identityName')), '2023-01-31').principalId]",
+                "principalType": "ServicePrincipal"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('identityName'))]",
+                "[resourceId('Microsoft.Insights/components', variables('insightsName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[resourceId('Microsoft.CognitiveServices/accounts', variables('foundryName'))]",
+              "name": "[guid(resourceId('Microsoft.CognitiveServices/accounts', variables('foundryName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('identityName')), variables('cognitiveServicesOpenAIUser'))]",
+              "properties": {
+                "roleDefinitionId": "[variables('cognitiveServicesOpenAIUser')]",
+                "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('identityName')), '2023-01-31').principalId]",
+                "principalType": "ServicePrincipal"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.CognitiveServices/accounts', variables('foundryName'))]",
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('identityName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Resources/deployments",
+              "apiVersion": "2025-04-01",
+              "name": "cloudlens-postgres-app-admin",
+              "properties": {
+                "expressionEvaluationOptions": {
+                  "scope": "inner"
+                },
+                "mode": "Incremental",
+                "parameters": {
+                  "postgresName": {
+                    "value": "[variables('postgresName')]"
+                  },
+                  "principalObjectId": {
+                    "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('identityName')), '2023-01-31').principalId]"
+                  },
+                  "principalName": {
+                    "value": "[variables('identityName')]"
+                  },
+                  "principalType": {
+                    "value": "ServicePrincipal"
+                  }
+                },
+                "template": {
+                  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+                  "contentVersion": "1.0.0.0",
+                  "metadata": {
+                    "_generator": {
+                      "name": "bicep",
+                      "version": "0.49.2.45890",
+                      "templateHash": "9229086946226482279"
+                    }
+                  },
+                  "parameters": {
+                    "postgresName": {
+                      "type": "string",
+                      "metadata": {
+                        "description": "Name of the PostgreSQL flexible server."
+                      }
+                    },
+                    "principalObjectId": {
+                      "type": "string",
+                      "metadata": {
+                        "description": "Object ID of the principal to register as an administrator."
+                      }
+                    },
+                    "principalName": {
+                      "type": "string",
+                      "metadata": {
+                        "description": "Display or sign-in name of that principal."
+                      }
+                    },
+                    "principalType": {
+                      "type": "string",
+                      "allowedValues": [
+                        "User",
+                        "Group",
+                        "ServicePrincipal"
+                      ],
+                      "metadata": {
+                        "description": "Type of that principal."
+                      }
+                    }
+                  },
+                  "resources": [
+                    {
+                      "type": "Microsoft.DBforPostgreSQL/flexibleServers/administrators",
+                      "apiVersion": "2024-08-01",
+                      "name": "[format('{0}/{1}', parameters('postgresName'), parameters('principalObjectId'))]",
+                      "properties": {
+                        "principalName": "[parameters('principalName')]",
+                        "principalType": "[parameters('principalType')]",
+                        "tenantId": "[subscription().tenantId]"
+                      }
+                    }
+                  ]
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers/databases', variables('postgresName'), variables('databaseName'))]",
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('identityName'))]",
+                "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers', variables('postgresName'))]",
+                "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers/administrators', variables('postgresName'), parameters('adminPrincipalObjectId'))]"
+              ]
+            }
+          ],
+          "outputs": {
+            "webAppName": {
+              "type": "string",
+              "value": "[variables('webAppName')]"
+            },
+            "webAppUrl": {
+              "type": "string",
+              "value": "[format('https://{0}', reference(resourceId('Microsoft.Web/sites', variables('webAppName')), '2023-12-01').defaultHostName)]"
+            },
+            "postgresName": {
+              "type": "string",
+              "value": "[variables('postgresName')]"
+            },
+            "postgresHost": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.DBforPostgreSQL/flexibleServers', variables('postgresName')), '2024-08-01').fullyQualifiedDomainName]"
+            },
+            "postgresDatabase": {
+              "type": "string",
+              "value": "[variables('databaseName')]"
+            },
+            "storageAccount": {
+              "type": "string",
+              "value": "[parameters('storageAccountName')]"
+            },
+            "storageAccountId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]"
+            },
+            "storageContainer": {
+              "type": "string",
+              "value": "cloudlens"
+            },
+            "managedIdentityName": {
+              "type": "string",
+              "value": "[variables('identityName')]"
+            },
+            "managedIdentityClientId": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('identityName')), '2023-01-31').clientId]"
+            },
+            "managedIdentityPrincipalId": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('identityName')), '2023-01-31').principalId]"
+            },
+            "applicationInsightsConnectionString": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Insights/components', variables('insightsName')), '2020-02-02').ConnectionString]"
+            },
+            "foundryAccount": {
+              "type": "string",
+              "value": "[variables('foundryName')]"
+            },
+            "foundryEndpoint": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.CognitiveServices/accounts', variables('foundryName')), '2025-04-01-preview').endpoint]"
+            },
+            "projectEndpoint": {
+              "type": "string",
+              "value": "[format('{0}api/projects/{1}', reference(resourceId('Microsoft.CognitiveServices/accounts', variables('foundryName')), '2025-04-01-preview').endpoint, variables('projectName'))]"
+            },
+            "modelDeployment": {
+              "type": "string",
+              "value": "[parameters('modelName')]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('resourceGroupName'))]"
+      ]
+    },
+    {
+      "condition": "[parameters('deployEntraApp')]",
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "cloudlens-entra",
+      "resourceGroup": "[parameters('resourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "displayName": {
+            "value": "[parameters('entraAppDisplayName')]"
+          },
+          "uniqueName": {
+            "value": "[parameters('entraAppUniqueName')]"
+          },
+          "delegatedArm": {
+            "value": "[parameters('authDelegatedArm')]"
+          },
+          "redirectUris": {
+            "value": [
+              "[format('{0}/auth/callback', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'cloudlens-stack'), '2025-04-01').outputs.webAppUrl.value)]",
+              "http://localhost:8000/auth/callback"
+            ]
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "languageVersion": "2.0",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.49.2.45890",
+              "templateHash": "12833459966654703423"
+            }
+          },
+          "parameters": {
+            "displayName": {
+              "type": "string",
+              "defaultValue": "CloudLens",
+              "metadata": {
+                "description": "Display name for the app registration."
+              }
+            },
+            "uniqueName": {
+              "type": "string",
+              "defaultValue": "cloudlens",
+              "metadata": {
+                "description": "Stable unique name. Changing it creates a second registration rather than renaming this one."
+              }
+            },
+            "redirectUris": {
+              "type": "array",
+              "metadata": {
+                "description": "Redirect URIs. Include https://<web-app>/auth/callback, and a localhost URI for development."
+              }
+            },
+            "delegatedArm": {
+              "type": "bool",
+              "defaultValue": true
+            }
+          },
+          "variables": {
+            "graphAppId": "00000003-0000-0000-c000-000000000000",
+            "userReadScope": "e1fe6dd8-ba31-4d61-89e7-88639da4683d",
+            "openidScope": "37f7f235-527c-4136-accd-4a02d197296e",
+            "profileScope": "14dad69e-099b-42c9-810b-d002981feec1",
+            "offlineAccessScope": "7427e0e9-2fba-42fe-b0c0-848c9e6a8182",
+            "armAppId": "797f4846-ba00-4fd7-ba43-dac1f8f63013",
+            "armUserImpersonation": "41094075-9dad-400e-a0bd-54e686782033"
+          },
+          "imports": {
+            "microsoftGraphV1_0": {
+              "provider": "MicrosoftGraph",
+              "version": "1.0.0"
+            }
+          },
+          "resources": {
+            "application": {
+              "import": "microsoftGraphV1_0",
+              "type": "Microsoft.Graph/applications@v1.0",
+              "properties": {
+                "uniqueName": "[parameters('uniqueName')]",
+                "displayName": "[parameters('displayName')]",
+                "signInAudience": "AzureADMyOrg",
+                "isFallbackPublicClient": true,
+                "publicClient": {
+                  "redirectUris": "[parameters('redirectUris')]"
+                },
+                "web": {
+                  "implicitGrantSettings": {
+                    "enableAccessTokenIssuance": false,
+                    "enableIdTokenIssuance": false
+                  }
+                },
+                "requiredResourceAccess": "[concat(createArray(createObject('resourceAppId', variables('graphAppId'), 'resourceAccess', createArray(createObject('id', variables('openidScope'), 'type', 'Scope'), createObject('id', variables('profileScope'), 'type', 'Scope'), createObject('id', variables('offlineAccessScope'), 'type', 'Scope'), createObject('id', variables('userReadScope'), 'type', 'Scope')))), if(parameters('delegatedArm'), createArray(createObject('resourceAppId', variables('armAppId'), 'resourceAccess', createArray(createObject('id', variables('armUserImpersonation'), 'type', 'Scope')))), createArray()))]"
+              }
+            },
+            "servicePrincipal": {
+              "import": "microsoftGraphV1_0",
+              "type": "Microsoft.Graph/servicePrincipals@v1.0",
+              "properties": {
+                "appId": "[reference('application').appId]"
+              },
+              "dependsOn": [
+                "application"
+              ]
+            }
+          },
+          "outputs": {
+            "clientId": {
+              "type": "string",
+              "value": "[reference('application').appId]"
+            },
+            "objectId": {
+              "type": "string",
+              "value": "[reference('application').id]"
+            },
+            "servicePrincipalId": {
+              "type": "string",
+              "value": "[reference('servicePrincipal').id]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('resourceGroupName'))]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'cloudlens-stack')]"
+      ]
+    }
+  ],
+  "outputs": {
+    "resourceGroup": {
+      "type": "string",
+      "value": "[parameters('resourceGroupName')]"
+    },
+    "webAppName": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'cloudlens-stack'), '2025-04-01').outputs.webAppName.value]"
+    },
+    "entraClientId": {
+      "type": "string",
+      "value": "[if(parameters('deployEntraApp'), reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'cloudlens-entra'), '2025-04-01').outputs.clientId.value, '')]"
+    },
+    "authRedirectUri": {
+      "type": "string",
+      "value": "[format('{0}/auth/callback', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'cloudlens-stack'), '2025-04-01').outputs.webAppUrl.value)]"
+    },
+    "webAppUrl": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'cloudlens-stack'), '2025-04-01').outputs.webAppUrl.value]"
+    },
+    "postgresHost": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'cloudlens-stack'), '2025-04-01').outputs.postgresHost.value]"
+    },
+    "postgresDatabase": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'cloudlens-stack'), '2025-04-01').outputs.postgresDatabase.value]"
+    },
+    "storageAccount": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'cloudlens-stack'), '2025-04-01').outputs.storageAccount.value]"
+    },
+    "storageAccountId": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'cloudlens-stack'), '2025-04-01').outputs.storageAccountId.value]"
+    },
+    "storageContainer": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'cloudlens-stack'), '2025-04-01').outputs.storageContainer.value]"
+    },
+    "managedIdentityName": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'cloudlens-stack'), '2025-04-01').outputs.managedIdentityName.value]"
+    },
+    "managedIdentityClientId": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'cloudlens-stack'), '2025-04-01').outputs.managedIdentityClientId.value]"
+    },
+    "managedIdentityPrincipalId": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'cloudlens-stack'), '2025-04-01').outputs.managedIdentityPrincipalId.value]"
+    },
+    "foundryAccount": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'cloudlens-stack'), '2025-04-01').outputs.foundryAccount.value]"
+    },
+    "projectEndpoint": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'cloudlens-stack'), '2025-04-01').outputs.projectEndpoint.value]"
+    },
+    "modelDeployment": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'cloudlens-stack'), '2025-04-01').outputs.modelDeployment.value]"
+    }
+  }
+}
