@@ -65,8 +65,7 @@ def test_install_markup_and_subscription_template():
     href = re.search(r'id="deploy-azure" href="([^"]+)"', html).group(1)
     assert unquote(href) == (
         "https://portal.azure.com/#create/Microsoft.Template/uri/"
-        "https://raw.githubusercontent.com/samy6352/"
-        "Cloud-lens-classic-November/main/infra/azuredeploy.json"
+        "https://cloudlens-rnabu.azurewebsites.net/install/template"
     )
     commands = re.search(r"<pre[^>]*><code>(.*?)</code></pre>", html, re.S).group(1)
     assert commands.splitlines() == [
@@ -81,6 +80,15 @@ def test_install_markup_and_subscription_template():
     assert template["$schema"].endswith("/subscriptionDeploymentTemplate.json#")
     assert template["resources"]
     assert template["metadata"]["_generator"]["name"] == "bicep"
+    assert (ROOT / "web" / "azuredeploy.json").read_bytes() == (
+        ROOT / "infra" / "azuredeploy.json").read_bytes()
+
+
+def test_template_is_public_without_opening_dashboard(client):
+    response = client.get("/install/template")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["$schema"].endswith("/subscriptionDeploymentTemplate.json#")
 
 
 def test_component_colors_use_theme_tokens():

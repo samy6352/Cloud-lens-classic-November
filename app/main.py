@@ -902,7 +902,7 @@ def auth_service() -> Auth:
 # Signing in, the public installation guide and the static assets they need. Everything else — including
 # the app shell — requires a session, so an unauthenticated visitor learns nothing about the
 # estate, not even how many subscriptions there are.
-PUBLIC_PATHS = {"/install", "/login", "/healthz", "/readyz", "/api/auth/login", "/api/auth/logout", "/api/auth/me",
+PUBLIC_PATHS = {"/install", "/install/template", "/login", "/healthz", "/readyz", "/api/auth/login", "/api/auth/logout", "/api/auth/me",
                 # Admin consent has to be reachable by someone who cannot sign in yet — that is
                 # the entire situation it exists to resolve.
                 "/auth/login", "/auth/callback", "/auth/admin-consent"}
@@ -1520,6 +1520,13 @@ async def install_page() -> Response:
     html = await offload((WEB / "install.html").read_text, encoding="utf-8")
     return Response(await offload(stamp_asset_urls, html, _static_assets),
                     media_type="text/html", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/install/template", include_in_schema=False)
+async def install_template() -> Response:
+    document = await offload((WEB / "azuredeploy.json").read_text, encoding="utf-8")
+    return Response(document, media_type="application/json",
+                    headers={"Cache-Control": "no-store"})
 
 
 @app.get("/login", include_in_schema=False)

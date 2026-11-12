@@ -22,7 +22,7 @@ if (Test-Path -LiteralPath $destinationPath) {
     throw "Destination already exists: $destinationPath"
 }
 $files = [System.Collections.Generic.List[object]]::new()
-$allowedWeb = @('.html', '.js', '.css', '.svg', '.png', '.ico', '.woff', '.woff2', '.ttf')
+$allowedWeb = @('.html', '.js', '.css', '.svg', '.png', '.ico', '.woff', '.woff2', '.ttf', '.json')
 foreach ($directory in @('app', 'web')) {
     $base = Join-Path $root $directory
     if (-not (Test-Path -LiteralPath $base -PathType Container)) {
