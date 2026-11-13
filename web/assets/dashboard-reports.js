@@ -704,6 +704,32 @@ function wireCostData() {
       : row.exported_months_status === "error" ? "Unavailable"
       : "None yet";
   };
+  const monthWindow = row => {
+    const imported = (Array.isArray(row.exported_months) ? row.exported_months : [])
+      .filter(m => /^\d{4}-\d{2}$/.test(m)).sort();
+    if (!imported.length) return "";
+    const [y, m] = imported.at(-1).split("-").map(Number);
+    const labels = [];
+    let year = y, month = m;
+    for (let i = 0; i < 12; i++) {
+      labels.push(`${year}-${String(month).padStart(2, "0")}`);
+      month--;
+      if (month < 1) { month = 12; year--; }
+    }
+    labels.reverse();
+    const importedSet = new Set(imported);
+    const chips = labels.map(key => {
+      const [yy, mm] = key.split("-").map(Number);
+      const name = new Date(Date.UTC(yy, mm - 1, 1))
+        .toLocaleDateString(undefined, { month: "short", year: "2-digit", timeZone: "UTC" });
+      const on = importedSet.has(key);
+      return `<span class="cd-month ${on ? "on" : "off"}" title="${esc(key)}">${esc(name)}</span>`;
+    }).join("");
+    return `<div class="cd-months">
+      <p class="muted note"><strong>Synced months (latest 12):</strong></p>
+      <div class="cd-month-grid" role="list" aria-label="Synced month coverage">${chips}</div>
+    </div>`;
+  };
   const applyIngestQuery = () => {
     const query = ingestQuery.toLowerCase();
     let shown = 0;
@@ -796,6 +822,7 @@ function wireCostData() {
         Next scheduled check: ${esc(s.next_check ? displayTime(s.next_check) : "Not enabled")}<br>
         Initial history: ${esc(s.history?.from || "")} → ${esc(s.history?.to || "")}
         · ${s.coverage.authoritative_days}/${s.coverage.requested_days} days verified.</p>
+        ${monthWindow(s)}
         ${s.exported_months_detail ? `<p class="muted note">${esc(s.exported_months_detail)}</p>` : ""}
         <p class="muted note">${esc(s.detail || "")}</p>
         ${(s.tasks || []).filter(t => t.status !== "ready").map(t => `<p class="muted note">${esc(t.from ? `${t.from} → ${t.to}` : "Automatic updates")}:

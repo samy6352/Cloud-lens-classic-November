@@ -4419,10 +4419,38 @@ button.wf-row:focus-visible { outline: none; box-shadow: var(--ring); }
 .cost-data-subscriptions { display: grid; gap: var(--s1); }
 .cost-data #cdSetup { margin-top: var(--s4); }
 .cost-data #cdPlan:not(:empty) { margin-top: var(--s4); }
+.cost-data .cd-months { margin: var(--s2) 0 var(--s3); }
+.cost-data .cd-month-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 6px;
+  max-width: 36rem;
+}
+.cost-data .cd-month {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 26px;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  font-size: var(--t-xs);
+  font-variant-numeric: tabular-nums;
+  background: var(--surface-2);
+  color: var(--muted);
+}
+.cost-data .cd-month.on {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--text);
+  font-weight: var(--w-medium);
+}
+.cost-data .cd-month.off { opacity: .7; }
 @media (max-width: 860px) {
   .cost-data-steps { grid-template-columns: 1fr; }
   .cost-data .budget-grid { grid-template-columns: 1fr; }
   .cost-data .build-bar { flex-wrap: wrap; }
+  .cost-data .cd-month-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 }
 .fr-step {
   display: flex;
