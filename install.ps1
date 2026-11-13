@@ -154,7 +154,18 @@ try {
         $defaultResourceGroup
     }
 
-    $entraClientId = Read-Input 'Preapproved single-tenant Entra app client ID' $GuidPattern
+    $entraClientId = ''
+    if ($accessMode -eq 'delegated') {
+        $entraClientId = Read-Input 'Preapproved single-tenant Entra app client ID' $GuidPattern
+    } else {
+        $appRegistrationMode = Read-Choice 'Sign-in app registration for local-user login:' @(
+            @{ Label = 'Auto-create during deployment (recommended for first-time install)'; Value = 'auto-create' }
+            @{ Label = 'Use precreated app client ID'; Value = 'precreated' }
+        ) 1
+        if ($appRegistrationMode -eq 'precreated') {
+            $entraClientId = Read-Input 'Preapproved single-tenant Entra app client ID' $GuidPattern
+        }
+    }
     $defaultAdmin = if ($account.user -and $account.user.name) { $account.user.name } else { '' }
     $adminsRaw = Read-Input 'Admin sign-in addresses (comma separated)' '^[^@\s,]+@[^@\s,]+(,[^@\s,]+@[^@\s,]+)*$' $defaultAdmin
     $admins = @($adminsRaw.Split(',').Trim() | Where-Object { $_ })
@@ -180,7 +191,6 @@ try {
         AiLocation = $aiLocation
         ResourceGroup = $resourceGroup
         NameSuffix = $nameSuffix
-        EntraClientId = $entraClientId
         ModelName = 'gpt-4.1-mini'
         ModelSku = 'GlobalStandard'
         ModelCapacity = $sizeProfile[$size].ModelCapacity
@@ -195,8 +205,14 @@ try {
         Admins = $admins
     }
     if ($accessMode -eq 'delegated') {
+        $parameters.EntraClientId = $entraClientId
         $parameters.DelegatedArm = $true
     } else {
+        if ($entraClientId) {
+            $parameters.EntraClientId = $entraClientId
+        } else {
+            $parameters.EntraAppUniqueName = "cloudlens-$nameSuffix"
+        }
         $parameters.AllowAppIdentityFallback = $true
     }
     if ($useAllVisible) {
