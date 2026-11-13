@@ -88,7 +88,7 @@ const advance=async()=>{
 def test_initial_render_is_cached_scope_first_and_has_one_setup_flow():
     run_node(HARNESS + r"""
 await reports.renderSettings(1);
-assert.deepEqual(requests,["/api/cost-data/subscriptions","/api/cost-data?scope=sub-a%2Csub-b"]);
+assert.deepEqual(requests,["/api/cost-data/subscriptions","/api/cost-data?scope=sub-a%2Csub-b&include_export_months=1"]);
 assert.equal(writes.length,0);assert.equal(timers.size,0);
 assert.equal($("cdCadence-Daily").hasAttribute("checked"),true);
 assert.equal((new Date($("cdTo").value)-new Date($("cdFrom").value))/86400000,89);

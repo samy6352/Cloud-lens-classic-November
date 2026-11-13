@@ -165,6 +165,56 @@ def status(subscriptions: list[dict]) -> dict:
     }
 
 
+def _month_span(start: str, end: str) -> set[str]:
+    lo = date.fromisoformat(start).replace(day=1)
+    hi = date.fromisoformat(end).replace(day=1)
+    months: set[str] = set()
+    while lo <= hi:
+        months.add(f"{lo.year:04d}-{lo.month:02d}")
+        lo = (lo.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return months
+
+
+async def exported_months(subscriptions: list[dict]) -> dict[str, dict]:
+    """Show which months are already present in deployment-owned storage exports."""
+    from . import focus_sync
+
+    if not subscriptions:
+        return {}
+    scope = [s["id"].lower() for s in subscriptions]
+    discovered = await focus_sync.discover(scope)
+    schedules_by_sub = {row["subscription_id"].lower(): row for row in discovered["schedules"]}
+    errors = {row["subscription"].lower(): row["detail"] for row in discovered.get("errors", [])}
+    result: dict[str, dict] = {}
+    for sub in subscriptions:
+        sid = sub["id"].lower()
+        schedule = schedules_by_sub.get(sid)
+        if sid in errors:
+            result[sid] = {"status": "error", "months": [],
+                           "detail": "Could not read owned exports: " + errors[sid][:240]}
+            continue
+        if schedule is None:
+            result[sid] = {"status": "missing", "months": [],
+                           "detail": "No deployment-owned FOCUS export is configured yet."}
+            continue
+        try:
+            manifests = await focus_workflow.manifests(schedule)
+            months: set[str] = set()
+            for manifest in manifests:
+                lo, hi = focus_workflow.actual_window(manifest)
+                months.update(_month_span(lo, hi))
+            result[sid] = {
+                "status": "ok",
+                "months": sorted(months),
+                "detail": ("Months found in deployment-owned storage exports."
+                           if months else "No complete FOCUS report has landed in storage yet."),
+            }
+        except Exception as exc:
+            result[sid] = {"status": "error", "months": [],
+                           "detail": "Could not read export manifests: " + str(exc)[:240]}
+    return result
+
+
 def history_window(start: str | None = None, end: str | None = None,
                    history_days: int | None = None) -> tuple[str, str, int]:
     """Validate the customer import horizon, independently of internal catch-up batches."""

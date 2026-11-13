@@ -504,10 +504,11 @@ async function renderSettings(token, reloadCatalog = true) {
       ingestSelection = new Set((header.length ? header : [...allowed]).filter(id => allowed.has(id)));
     } else ingestSelection = new Set(ingestIds().filter(id => allowed.has(id)));
     const scope = ingestIds(), selected = ingestCatalog.filter(s => ingestSelection.has(s.id));
+    const excluded = ingestCatalog.filter(s => !ingestSelection.has(s.id));
     let loadError = "";
     let data = { subscriptions: [], setup_needed: true, can_review: false };
     if (scope.length) {
-      try { data = await get(`/api/cost-data?scope=${encodeURIComponent(scope.join(","))}`, { timeout: 20000 }); }
+      try { data = await get(`/api/cost-data?scope=${encodeURIComponent(scope.join(","))}&include_export_months=1`, { timeout: 20000 }); }
       catch (error) {
         loadError = error.message || "Could not load status.";
         if (settingsData?.costData && settingsData.subscriptions.map(s => s.id).sort().join(",") === scope.join(","))
@@ -563,6 +564,7 @@ async function renderSettings(token, reloadCatalog = true) {
         </div>
         <p id="cdScopeNote" class="sr-only" role="status">${scope.length ? `${scope.length} selected: ${selected.slice(0, 3).map(s => esc(s.name || s.id)).join(", ")}${selected.length > 3 ? ` (+${selected.length - 3} more)` : ""}` : "Choose at least one subscription."}
           ${!ingestCatalog.length ? "No readable subscriptions were returned for your account." : ""}</p>
+        <p id="cdExcluded" class="muted note">${excluded.length ? `Excluded from this Cost data setup: ${excluded.slice(0, 4).map(s => esc(s.name || s.id)).join(", ")}${excluded.length > 4 ? ` (+${excluded.length - 4} more)` : ""}.` : "No subscriptions are excluded from this Cost data setup."}</p>
       </section>
       <p id="cdProgress" class="muted note" role="status" aria-live="polite"></p>
       <div class="cost-data-tabs" role="tablist" aria-label="Cost import">
@@ -695,6 +697,13 @@ function wireCostData() {
     ingestSelection = new Set(ids.filter(id => ingestCatalog.some(s => s.id === id)));
     await renderSettings(ctx.loadToken, false);
   };
+  const exportedMonthsText = row => {
+    const months = Array.isArray(row.exported_months) ? row.exported_months : [];
+    if (months.length) return months.join(", ");
+    return row.exported_months_status === "missing" ? "None yet"
+      : row.exported_months_status === "error" ? "Unavailable"
+      : "None yet";
+  };
   const applyIngestQuery = () => {
     const query = ingestQuery.toLowerCase();
     let shown = 0;
@@ -782,13 +791,16 @@ function wireCostData() {
         · ${esc(label(s))} · ${esc(s.configured ? s.config?.cadence : "Schedule not enabled")}</summary>
         <p class="muted note">Available through: ${esc(s.through || "Not yet reported")}<br>
         Automatic updates: ${s.configured && s.config?.enabled !== false ? "Enabled" : "Not enabled"} · ${esc(s.config?.cadence || "Not configured")}<br>
+        Exported months in storage: ${esc(exportedMonthsText(s))}<br>
         Last successful update: ${esc(s.last_success ? displayTime(s.last_success) : "None yet")}<br>
         Next scheduled check: ${esc(s.next_check ? displayTime(s.next_check) : "Not enabled")}<br>
         Initial history: ${esc(s.history?.from || "")} → ${esc(s.history?.to || "")}
         · ${s.coverage.authoritative_days}/${s.coverage.requested_days} days verified.</p>
+        ${s.exported_months_detail ? `<p class="muted note">${esc(s.exported_months_detail)}</p>` : ""}
         <p class="muted note">${esc(s.detail || "")}</p>
         ${(s.tasks || []).filter(t => t.status !== "ready").map(t => `<p class="muted note">${esc(t.from ? `${t.from} → ${t.to}` : "Automatic updates")}:
           ${esc(t.status)} — ${esc(t.detail || "")}</p>`).join("")}
+        <p><button type="button" class="linkish" data-cd-exclude="${esc(s.id)}">Exclude from this Cost data setup</button></p>
         </details>`).join("")}</div>`;
     const last = rows.length && rows.every(s => s.last_success) ? displayTime(rows.map(s => s.last_success).sort()[0]) : "None for the full selection yet";
     const next = rows.map(s => s.next_check).filter(Boolean).sort()[0];
@@ -805,6 +817,12 @@ function wireCostData() {
     $("cdStatus").innerHTML += `<p class="muted note">Last successful update: ${esc(last)}<br>Next scheduled check: ${esc(next ? displayTime(next) : "Not enabled")}.</p>`;
     if (next && Date.parse(next) < Date.now() - 900000)
       $("cdStatus").innerHTML += '<p class="muted note">A scheduled check is overdue or waiting for current work. Keep the backend and database running so the pipeline can catch up.</p>';
+    for (const button of $("cdStatus").querySelectorAll("[data-cd-exclude]")) {
+      button.onclick = async () => {
+        const id = button.dataset.cdExclude;
+        await chooseScope(ingestIds().filter(x => x !== id));
+      };
+    }
     $("cdTechnical").innerHTML = `<p class="muted note"><strong>Selected timing and coverage:</strong>
       ${esc(settingsData.cadences?.[cadenceValue()] || "")}</p>` + rows.map(s => `<p class="muted note"><strong>${esc(s.name)}</strong>:
       ${esc(s.config?.optimization || (s.config?.mode === "native-month-to-date" ? "Legacy native Daily MTD compatibility" : "Existing configuration unchanged until approved"))}

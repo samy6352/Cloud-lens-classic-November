@@ -3063,11 +3063,20 @@ async def _assert_cost_data_approval(user: User, subscription: str) -> None:
 
 
 @app.get("/api/cost-data")
-async def cost_data_status(request: Request, scope: str | None = None) -> JSONResponse:
+async def cost_data_status(request: Request, scope: str | None = None,
+                           include_export_months: bool = False) -> JSONResponse:
     from . import cost_data
     user = current_user(request)
     subs = await _cost_data_subscriptions(scope.split(",") if scope is not None else None, user)
     result = await offload(cost_data.status, subs)
+    if include_export_months:
+        catalog = await cost_data.exported_months(subs)
+        for row in result["subscriptions"]:
+            detail = catalog.get(row["id"], {"status": "missing", "months": [],
+                                             "detail": "No export evidence available for this selection."})
+            row["exported_months"] = detail["months"]
+            row["exported_months_status"] = detail["status"]
+            row["exported_months_detail"] = detail["detail"]
     result["can_review"] = bool(user.admin) and not read_only_mode()
     result["read_only"] = read_only_mode()
     return JSONResponse(result)
