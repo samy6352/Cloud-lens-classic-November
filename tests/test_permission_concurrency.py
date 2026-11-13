@@ -131,7 +131,7 @@ def test_cost_visibility_keeps_the_reader_friendly_semantics(monkeypatch):
 
     monkeypatch.setattr(cost, "_role_permits", fake_permits)
     monkeypatch.setattr(cost, "_roles_for", fake_roles)
-    monkeypatch.setattr(cost, "list_subscriptions", lambda: _subs())
+    monkeypatch.setattr(cost, "list_subscriptions", lambda **_: _subs())
 
     async def _subs():
         return {"subscriptions": [{"id": "s1"}, {"id": "s2"}]}

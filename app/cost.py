@@ -660,7 +660,7 @@ async def _query(sub: str, body: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- tools
-async def list_subscriptions() -> dict[str, Any]:
+async def list_subscriptions(*, fresh: bool = False) -> dict[str, Any]:
     """Every subscription the signed-in user can see.
 
     For a caller whose access spans tenants this cannot be a single ARM call: /subscriptions is
@@ -672,7 +672,8 @@ async def list_subscriptions() -> dict[str, Any]:
         subs = [s for s in caller.subscriptions if s.get("state", "Enabled") == "Enabled"]
         return {"subscriptions": subs, "count": len(subs)}
 
-    payload = await azure.request("GET", f"{ARM}/subscriptions", params={"api-version": SUBS_API})
+    payload = await azure.request(
+        "GET", f"{ARM}/subscriptions", params={"api-version": SUBS_API}, cache=not fresh)
     subs = [
         {"id": s["subscriptionId"], "name": s.get("displayName"), "state": s.get("state")}
         for s in payload.get("value", [])
@@ -812,6 +813,7 @@ async def _roles_for(object_id: str, subscription_id: str) -> set[str] | None:
         payload = await azure.request(
             "GET", url,
             params={"api-version": ROLE_API, "$filter": f"assignedTo('{object_id}')"},
+            cache=False,
         )
     except CostError as exc:
         # One unreadable subscription must not hide the rest, or a single missing Reader
@@ -912,7 +914,10 @@ async def subscriptions_for_principal(object_id: str) -> list[dict[str, Any]]:
     if not object_id:
         return []
 
-    visible = (await list_subscriptions())["subscriptions"]
+    # RBAC changes are operator actions we want to reflect promptly. A cached subscription list
+    # can hide a newly readable subscription until cache expiry, so this discovery path asks ARM
+    # directly.
+    visible = (await list_subscriptions(fresh=True))["subscriptions"]
 
     async def has_cost_access(sub: dict) -> dict | None:
         roles = await _roles_for(object_id, sub["id"])

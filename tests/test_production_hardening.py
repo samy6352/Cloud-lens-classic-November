@@ -202,7 +202,10 @@ def test_app_identity_discovery_counts_only_cost_capable_roles(monkeypatch):
     vm_operator = "/providers/Microsoft.Authorization/roleDefinitions/11111111-2222-3333-4444-555555555555"
     assignments = {"cost-role": reader, "vm-role": vm_operator}
 
+    seen = []
+
     async def request(method, url, **kwargs):
+        seen.append((method, url, kwargs))
         if url.endswith("/subscriptions"):
             return {"value": [{"subscriptionId": sub, "state": "Enabled"}
                               for sub in assignments]}
@@ -218,6 +221,10 @@ def test_app_identity_discovery_counts_only_cost_capable_roles(monkeypatch):
     found = asyncio.run(cost.subscriptions_for_principal("principal-oid"))
     assert [sub["id"] for sub in found] == ["cost-role"]
     assert asyncio.run(cost.subscriptions_for_principal("")) == []
+    subs_calls = [call for call in seen if call[1].endswith("/subscriptions")]
+    role_calls = [call for call in seen if "/roleAssignments" in call[1]]
+    assert subs_calls and all(call[2].get("cache") is False for call in subs_calls)
+    assert role_calls and all(call[2].get("cache") is False for call in role_calls)
 
 
 def test_pool_bounds_checkouts_and_recovers_from_open_failure(monkeypatch):
