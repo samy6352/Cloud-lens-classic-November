@@ -3,9 +3,26 @@
 <head>
   <script>
     (function () {
+      var themes = ["light", "dark", "vivid", "paper"];
       var theme = new URLSearchParams(location.search).get("scoutTheme");
-      document.documentElement.dataset.theme = theme === "light" || theme === "dark"
-        ? theme : (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+      try {
+        if (themes.indexOf(theme) < 0) theme = localStorage.getItem("costTheme");
+      } catch (e) {
+        theme = null;
+      }
+      document.documentElement.dataset.theme = themes.indexOf(theme) >= 0
+        ? theme : (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+      document.addEventListener("DOMContentLoaded", function () {
+        var picker = document.getElementById("install-theme");
+        picker.value = document.documentElement.dataset.theme;
+        picker.addEventListener("change", function () {
+          document.documentElement.dataset.theme = picker.value;
+          try { localStorage.setItem("costTheme", picker.value); }
+          catch (e) {
+            document.getElementById("theme-status").textContent = "Theme applied for this page; browser storage is unavailable.";
+          }
+        });
+      });
     })();
   </script>
   <meta charset="utf-8" />
@@ -13,24 +30,46 @@
   <meta name="color-scheme" content="light dark" />
   <title>Install CloudLens · Your Azure, clearly</title>
   <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/assets/app.css" />
   <link rel="stylesheet" href="/assets/install.css" />
 </head>
 <body>
   <main>
     <header>
-      <a class="brand" href="/install" aria-label="CloudLens installation">CloudLens<span>SETUP</span></a>
-      <a href="/login">Sign in to dashboard →</a>
+      <a class="brand" href="/install" aria-label="CloudLens installation"><img src="/assets/logo.svg" width="32" height="32" alt="" />CloudLens<span class="brand-tag">DEPLOYMENT CENTER</span></a>
+      <div class="header-actions"><label class="sr-only" for="install-theme">Theme</label><select id="install-theme"><option value="light">Light</option><option value="dark">Dark</option><option value="vivid">Colourful</option><option value="paper">Kindle E-Ink</option></select><a href="/login">Sign in to dashboard →</a></div>
     </header>
+    <p id="theme-status" class="sr-only" role="status" aria-live="polite"></p>
+    <div class="hero">
     <section class="intro" aria-labelledby="heading">
-      <p class="eyebrow">YOUR SUBSCRIPTION. YOUR CONTROL.</p>
-      <h1 id="heading">Clarity for your cloud spend.</h1>
+      <p class="eyebrow"><span class="intro-marker" aria-hidden="true"></span> YOUR SUBSCRIPTION. YOUR CONTROL.</p>
+      <h1 id="heading">Your cloud.<br>Your costs.<br><em>Clearly in focus.</em></h1>
       <p class="lead">Bring costs, savings and an AI analyst together in your own Azure subscription.
-        No password is needed to read this guide. Azure sign-in and approved permissions are required to deploy.</p>
+        Turn Azure spending into decisions you can act on. Deploy CloudLens on infrastructure you control.</p>
+      <div class="hero-actions"><a class="button" href="#script-heading">Get started <span aria-hidden="true">↓</span></a><a href="#ready-heading">Check prerequisites <span aria-hidden="true">↗</span></a></div>
+      <p class="hero-caption">Public installation guide · Azure sign-in required to deploy</p>
     </section>
-    <section class="card" aria-labelledby="script-heading">
+    <aside class="product-preview" aria-label="Illustrative CloudLens interface, not live customer data">
+      <div class="preview-bar"><span class="preview-mark" aria-hidden="true">◉</span><strong>CloudLens</strong><span class="preview-label">PRODUCT PREVIEW</span></div>
+      <div class="preview-body">
+        <div class="preview-title"><span>Cloud intelligence</span><span class="preview-pill">Your Azure</span></div>
+        <h2>One view. Better decisions.</h2>
+        <p class="preview-subtitle">From understanding spend to taking action.</p>
+        <div class="preview-metrics"><div><span>UNDERSTAND</span><strong>Cost visibility</strong><small>Know where it goes</small></div><div><span>OPTIMISE</span><strong>Find savings</strong><small>See where to act</small></div></div>
+        <div class="preview-row"><span class="preview-symbol" aria-hidden="true">↗</span><div><strong>Make every resource count</strong><small>Explore costs and savings together</small></div><span aria-hidden="true">→</span></div>
+        <div class="analyst-preview"><span class="analyst-label">ASK YOUR AI ANALYST</span><p>“Where should I focus my cloud spend?”</p><div class="analyst-bottom"><span>Questions in plain English</span><span aria-hidden="true">↗</span></div></div>
+        <div class="preview-foot"><span aria-hidden="true">◇</span> Deployed in your own subscription <span>Illustrative interface</span></div>
+      </div>
+    </aside>
+    </div>
+    <div class="value-strip" aria-label="CloudLens capabilities"><span><b>01</b> Understand your spend</span><span><b>02</b> Discover savings</span><span><b>03</b> Ask better questions</span><span><b>04</b> Keep control in Azure</span></div>
+    <div class="section-heading"><div><p class="eyebrow">FROM CLARITY TO CONTROL</p><h2>Choose your starting point.</h2></div><p>One destination. Two ways to begin.</p></div>
+    <div class="install-options">
+    <section class="card recommended" aria-labelledby="script-heading">
       <div class="section-top"><span class="step">01</span><p class="eyebrow">RECOMMENDED · GUIDED FULL FLOW</p></div>
-      <h2 id="script-heading">Install with PowerShell</h2>
+      <h2 id="script-heading">Install with PowerShell <span aria-hidden="true">›_</span></h2>
       <p>Run these three lines in PowerShell 7 from a directory where you want the source checkout.</p>
+      <div class="terminal-label"><span aria-hidden="true">›_</span> PowerShell 7 <span>3 COMMANDS · FULL SETUP</span></div>
       <pre aria-label="PowerShell installation commands"><code>git clone https://github.com/samy6352/Cloud-lens-classic-November.git
 cd Cloud-lens-classic-November
 pwsh -File .\install.ps1</code></pre>
@@ -41,23 +80,26 @@ pwsh -File .\install.ps1</code></pre>
     </section>
     <section class="card" aria-labelledby="portal-heading">
       <div class="section-top"><span class="step">02</span><p class="eyebrow">ALTERNATIVE · INFRASTRUCTURE ONLY</p></div>
-      <h2 id="portal-heading">Start in Azure portal</h2>
+      <h2 id="portal-heading">Start in Azure portal <span aria-hidden="true">↗</span></h2>
       <p>Review and deploy the subscription-scope infrastructure template in Azure.
         This creates chargeable resources; it does not publish application code or grant Entra consent.</p>
-      <a class="button" id="deploy-azure" href="https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fcloudlens-rnabu.azurewebsites.net%2Finstall%2Ftemplate" target="_blank" rel="noopener noreferrer">Deploy to Azure <span aria-hidden="true">↗</span></a>
-      <p class="note">Opens Azure portal in a new tab. Prefer the guided script for the full flow:
+      <a class="button" id="deploy-azure" href="https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fcloudlens-rnabu.azurewebsites.net%2Finstall%2Ftemplate">Deploy to Azure <span aria-hidden="true">→</span></a>
+      <p class="note">Opens Azure portal in this tab. Sign in with your Azure account to review the custom deployment;
+        nothing is provisioned until you approve it in Azure.
+        <a href="/install/template">Review the template JSON</a>. Prefer the guided script for the full flow:
         the portal does not run the installer's consent, preflight or What-If gates.
         Continue with the deployment guide for code publication and acceptance checks.</p>
     </section>
+    </div>
     <aside class="requirements" aria-labelledby="ready-heading">
-      <h2 id="ready-heading">Before you deploy</h2>
+      <div class="requirements-heading"><p class="eyebrow">DEPLOY WITH INTENTION</p><h2 id="ready-heading">A few things to have ready</h2><p>No shortcuts around permissions, consent or cost.</p></div>
       <ul>
-        <li>Obtain a preapproved, customer-owned single-tenant public-client Entra application,
+        <li><strong>Identity &amp; consent</strong>Obtain a preapproved, customer-owned single-tenant public-client Entra application,
           delegated ARM consent and the final HTTPS callback
           <code>https://cloudlens-web-&lt;suffix&gt;.azurewebsites.net/auth/callback</code>.</li>
-        <li>Confirm subscription permissions, approved regions and SKUs, AI model quota and capacity,
+        <li><strong>Subscription &amp; capacity</strong>Confirm subscription permissions, approved regions and SKUs, AI model quota and capacity,
           network ranges and resource names. No automatic consent or quota/region bypasses.</li>
-        <li>Provisioning is not acceptance: verify sign-in, user RBAC, ingestion and a real AI question.
+        <li><strong>Verify the full experience</strong>Provisioning is not acceptance: verify sign-in, user RBAC, ingestion and a real AI question.
           Dashboard and API access remain authenticated.</li>
       </ul>
     </aside>

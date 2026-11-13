@@ -5,6 +5,13 @@ requires an existing customer-owned Entra registration with verified tenant-wide
 delegated ARM consent **before** provisioning. See the [guided customer steps](../README.md#install-cloudlens)
 and the generated customer release's deployment and acceptance documents.
 
+The public `/install` guide uses the dashboard's shared palette and saved `costTheme`
+preference, with light, dark, colourful and Kindle E-Ink choices. **Deploy to Azure**
+opens the Azure custom-deployment flow in the current tab (no pop-up required).
+Azure sign-in and explicit approval are still required; opening the link does not
+provision anything. The portal template provisions infrastructure only, not application
+code or Entra consent. `/install/template` provides the public JSON for review.
+
 ```powershell
 # Use the values collected and verified in the guided customer steps.
 .\infra\preflight.ps1 -Location $appRegion -AiLocation $aiRegion -EntraClientId $clientId -RedirectUri $redirectUri

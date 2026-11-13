@@ -39,7 +39,8 @@ def test_install_public_and_csp(client):
     assert "'unsafe-inline'" not in policy.split("script-src ", 1)[1].split(";")[0]
     assert html.index("<script>") < html.index('rel="stylesheet"')
     assert 'get("scoutTheme")' in block
-    assert "prefers-color-scheme: dark" in block
+    assert "prefers-color-scheme: light" in block
+    assert 'localStorage.getItem("costTheme")' in block
     assert client.get("/assets/install.css").status_code == 200
 
 
@@ -74,6 +75,9 @@ def test_install_markup_and_subscription_template():
         r"pwsh -File .\install.ps1",
     ]
     assert "does not publish application code or grant Entra consent" in html
+    button = re.search(r'<a class="button" id="deploy-azure"[^>]+>', html).group(0)
+    assert "target=" not in button
+    assert 'href="/assets/app.css"' in html
     assert 'href="/login"' in html
     assert "https://cloudlens-web-&lt;suffix&gt;.azurewebsites.net/auth/callback" in html
     template = json.loads((ROOT / "infra" / "azuredeploy.json").read_text(encoding="utf-8"))
