@@ -89,10 +89,17 @@ try {
 
     $enabled = @(
         Invoke-AzJson @('account', 'list', '--all', '--query',
-            "[?state=='Enabled' && tenantId=='$($current.tenantId)'].{name:name,id:id,isDefault:isDefault}")
+            "[?state=='Enabled' && tenantId=='$($current.tenantId)'].{name:name,id:id,isDefault:isDefault}") |
+        Where-Object { $_ -and $_.id }
     )
     if (-not $enabled.Count) {
-        throw "No enabled subscriptions found in tenant $($current.tenantId)."
+        # Some constrained shells/policies suppress account-list responses; keep going with the
+        # active subscription rather than failing the guided flow.
+        $enabled = @([pscustomobject]@{
+                name = $current.name
+                id = $current.id
+                isDefault = $true
+            })
     }
     $subChoices = @($enabled | Sort-Object name | ForEach-Object {
             [pscustomobject]@{ Label = "$($_.name) ($($_.id))"; Value = $_.id }
@@ -139,8 +146,8 @@ try {
     ) 1
 
     $accessMode = Read-Choice 'Choose Azure access mode:' @(
-        @{ Label = 'Delegated user access (recommended)'; Value = 'delegated' }
-        @{ Label = 'App identity only (managed identity)'; Value = 'app-identity' }
+        @{ Label = 'Delegated user access (recommended, auto-picks new user subscription access)'; Value = 'delegated' }
+        @{ Label = 'App identity only (managed identity, fixed to app RBAC grants)'; Value = 'app-identity' }
     ) 1
 
     $defaultResourceGroup = ('rg-cloudlens-{0}' -f (Get-Date -Format 'yyyyMMdd-HHmm')).ToLowerInvariant()
@@ -157,7 +164,10 @@ try {
     $entraClientId = ''
     if ($accessMode -eq 'delegated') {
         $entraClientId = Read-Input 'Preapproved single-tenant Entra app client ID' $GuidPattern
+        Write-Host 'Delegated mode selected: after deployment, new user subscription access appears automatically.' -ForegroundColor Green
     } else {
+        Write-Warning 'App-identity mode selected: post-install subscription visibility is capped by app managed-identity RBAC.'
+        Write-Warning 'New user access on a subscription will not appear until Reader + Cost Management Reader are granted to the app identity there.'
         $appRegistrationMode = Read-Choice 'Sign-in app registration for local-user login:' @(
             @{ Label = 'Auto-create during deployment (recommended for first-time install)'; Value = 'auto-create' }
             @{ Label = 'Use precreated app client ID'; Value = 'precreated' }

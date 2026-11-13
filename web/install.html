@@ -97,6 +97,7 @@ pwsh -File .\install.ps1</code></pre>
         <li><strong>Identity &amp; consent</strong>Obtain a preapproved, customer-owned single-tenant public-client Entra application,
           delegated ARM consent and the final HTTPS callback
           <code>https://cloudlens-web-&lt;suffix&gt;.azurewebsites.net/auth/callback</code>.</li>
+        <li><strong>Post-install subscription visibility</strong>Use delegated access mode for automatic pickup when a user's Azure subscription access changes after deployment. App-identity mode follows the app managed identity's own RBAC grants.</li>
         <li><strong>Subscription &amp; capacity</strong>Confirm subscription permissions, approved regions and SKUs, AI model quota and capacity,
           network ranges and resource names. No automatic consent or quota/region bypasses.</li>
         <li><strong>Verify the full experience</strong>Provisioning is not acceptance: verify sign-in, user RBAC, ingestion and a real AI question.
