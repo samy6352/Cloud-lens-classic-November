@@ -84,6 +84,8 @@ confirmation. `CANCEL` or Ctrl+C stops; cancelling apply does not roll back
 resources already created. No hosted download URL, automatic consent, dependency
 installation, or unapproved region/SKU fallback is assumed. See bundled
 `DEPLOYMENT.md` and `READINESS.md`; provisioning is not customer acceptance.
+Use the `QUICK` profile for option-based prompts with safe defaults, or `CUSTOM`
+for the full parameter-by-parameter entry.
 
 ## Optional Environment-filter summary for existing installations
 
