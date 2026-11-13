@@ -25,7 +25,7 @@ pwsh -File .\install.ps1
 
 Install Git, PowerShell 7, Python 3.11+ and Azure CLI with Bicep first.
 Preapprove the Entra registration, delegated ARM consent and final callback
-`https://cloudlens-web-<suffix>.azurewebsites.net/auth/callback`; verify regional
+`https://cloudlens-web-<suffix>.azurewebsites.net/auth/callback` (with a 1-10 character lowercase/digit suffix); verify regional
 SKU availability, permissions and AI quota before provisioning.
 
 The alternative **Deploy to Azure** button opens `infra/azuredeploy.json` from
@@ -219,7 +219,7 @@ data residency, network ranges and ongoing charges need explicit approval.
 $resourceGroup = Read-Host "Enter a NEW resource group name, for example cloudlens-myteam"
 $appRegion = Read-Host "Approved app/database Azure region code"
 $aiRegion = Read-Host "Approved AI Azure region code (confirm model residency and SKU)"
-$nameSuffix = Read-Host "Approved lowercase deployment suffix"
+$nameSuffix = Read-Host "Approved lowercase deployment suffix (1-10 characters)"
 $clientId = Read-Host "Customer-owned preapproved Entra application client ID"
 $redirectUri = "https://cloudlens-web-$nameSuffix.azurewebsites.net/auth/callback"
 

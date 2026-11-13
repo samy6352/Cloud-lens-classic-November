@@ -15,6 +15,12 @@ function Read-Approved([string]$Prompt, [string]$Pattern = '.+') {
     return $value
 }
 
+function Read-ApprovedChoice([string]$Prompt, [string[]]$AllowedValues) {
+    $pattern = '^(?i)(' + (($AllowedValues | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')$'
+    $value = Read-Approved $Prompt $pattern
+    return $value.ToUpperInvariant()
+}
+
 function Invoke-Checked([string]$Command, [string[]]$Arguments) {
     $global:LASTEXITCODE = 0
     $result = & $Command @Arguments
@@ -45,11 +51,15 @@ try {
     $guid = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
     $tenant = Read-Approved 'Approved tenant ID' $guid
     $subscription = Read-Approved 'Approved hosting subscription ID' $guid
+    $accessMode = Read-ApprovedChoice `
+        'Access mode (DELEGATED for preapproved ARM consent, MEGHKOSH for managed-identity role handoff only)' `
+        @('DELEGATED', 'MEGHKOSH')
+    $delegatedArm = ($accessMode -eq 'DELEGATED')
     $parameters = @{
         Location = Read-Approved 'Approved app/database region' '^[a-z0-9]+$'
         AiLocation = Read-Approved 'Approved AI region (no residency assumption)' '^[a-z0-9]+$'
         ResourceGroup = Read-Approved 'Approved resource group' '^[\w().-]+$'
-        NameSuffix = Read-Approved 'Approved deployment suffix' '^[a-z0-9]{1,20}$'
+        NameSuffix = Read-Approved 'Approved deployment suffix (1-10 lowercase letters/numbers)' '^[a-z0-9]{1,10}$'
         EntraClientId = Read-Approved 'Preapproved single-tenant public-client application ID' $guid
         ModelName = Read-Approved 'Approved AI model name'
         ModelSku = Read-Approved 'Approved AI model SKU (GlobalStandard is not a residency promise)'
@@ -61,16 +71,24 @@ try {
         PostgresSubnetAddressPrefix = Read-Approved 'Approved PostgreSQL subnet CIDR'
         PrivateEndpointSubnetAddressPrefix = Read-Approved 'Approved private endpoint subnet CIDR'
         NetworkIsolation = $true
-        DelegatedArm = $true
+        DelegatedArm = $delegatedArm
         PostgresSkuFallback = @()
     }
+    if (-not $delegatedArm) { $parameters.AllowAppIdentityFallback = $true }
     $parameters.Admins = @((Read-Approved 'Approved admin sign-in addresses, comma separated').Split(',').Trim())
     if (@($parameters.Admins | Where-Object { $_ -notmatch '^[^@\s,]+@[^@\s,]+$' }).Count) {
         throw 'Every admin must be an approved sign-in address.'
     }
-    $parameters.CostScopeSubscriptions = @((Read-Approved 'Approved cost subscription IDs, comma separated').Split(',').Trim())
-    if (@($parameters.CostScopeSubscriptions | Where-Object { $_ -notmatch $guid }).Count) {
-        throw 'Every cost scope must be an explicit approved subscription GUID.'
+    $scopeMode = Read-ApprovedChoice `
+        'Cost scope mode (LIST for explicit subscription IDs, ALLVISIBLE for same-tenant sweep)' `
+        @('LIST', 'ALLVISIBLE')
+    if ($scopeMode -eq 'ALLVISIBLE') {
+        $parameters.CostScopeAllVisible = $true
+    } else {
+        $parameters.CostScopeSubscriptions = @((Read-Approved 'Approved cost subscription IDs, comma separated').Split(',').Trim())
+        if (@($parameters.CostScopeSubscriptions | Where-Object { $_ -notmatch $guid }).Count) {
+            throw 'Every cost scope must be an explicit approved subscription GUID.'
+        }
     }
     Write-Host "Required preapproved callback: https://cloudlens-web-$($parameters.NameSuffix).azurewebsites.net/auth/callback"
     Write-Host 'Review ALL effective deployment parameters below, including defaults for storage, networking and ingestion:'

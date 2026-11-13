@@ -18,6 +18,8 @@ code or Entra consent. `/install/template` provides the public JSON for review.
 .\infra\deploy.ps1 -Location $appRegion -AiLocation $aiRegion -NameSuffix $nameSuffix -EntraClientId $clientId -WhatIf
 ```
 
+`nameSuffix` is constrained by the template to 1-10 lowercase letters/digits.
+
 `deploy.ps1` provisions the infrastructure, grants the app the cost access it needs, wires
 sign-in, publishes the code, and polls `/readyz` plus an unauthenticated sign-in challenge.
 

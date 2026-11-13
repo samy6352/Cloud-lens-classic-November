@@ -237,9 +237,9 @@ foreach($scenario in @('ok','cancel','early-cancel','decline','dependency-fail',
     $script:answers=[System.Collections.Generic.Queue[string]]::new()
     $id='11111111-1111-4111-8111-111111111111'
     foreach($answer in @($(if($scenario -eq 'early-cancel'){'CANCEL'}else{$id}),$id,
-        'approvedregion','approvedairegion','rg-fixture','fixture',$id,
+        'DELEGATED','approvedregion','approvedairegion','rg-fixture','fixture',$id,
         'approvedmodel','Standard','10','Standard_E2ds_v5','B2','10.70.0.0/16',
-        '10.70.1.0/24','10.70.2.0/24','10.70.3.0/24','admin@example.invalid',$id,
+        '10.70.1.0/24','10.70.2.0/24','10.70.3.0/24','admin@example.invalid','LIST',$id,
         'PREVIEW',$(if($scenario -eq 'cancel'){'CANCEL'}elseif($scenario -eq 'decline'){'deploy'}else{'DEPLOY'}))) {
         $script:answers.Enqueue($answer)
     }
