@@ -72,8 +72,8 @@ try {
     $tenant = if ($profile -eq 'QUICK') { Read-ApprovedWithDefault 'Approved tenant ID' $guid $suggestedTenant } else { Read-Approved 'Approved tenant ID' $guid }
     $subscription = if ($profile -eq 'QUICK') { Read-ApprovedWithDefault 'Approved hosting subscription ID' $guid $suggestedSubscription } else { Read-Approved 'Approved hosting subscription ID' $guid }
     $accessMode = Read-ApprovedChoice `
-        'Access mode (DELEGATED for preapproved ARM consent, MEGHKOSH for managed-identity role handoff only)' `
-        @('DELEGATED', 'MEGHKOSH')
+        'Access mode (DELEGATED for preapproved ARM consent,         IDENTITY for managed-identity role handoff only)' `
+                @('DELEGATED', 'IDENTITY')
     $delegatedArm = ($accessMode -eq 'DELEGATED')
     $defaults = @{
         Location = 'centralindia'
