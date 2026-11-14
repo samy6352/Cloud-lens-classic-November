@@ -493,7 +493,7 @@ async function renderSettings(token, reloadCatalog = true) {
   } else setContent($("tabBody"), `<section class="card"><h3>Cost data</h3><p role="status">Loading accessible subscriptions and saved setup…</p></section>`);
   try {
     if (reloadCatalog) {
-      const catalog = await get("/api/cost-data/subscriptions", { timeout: 20000 });
+      const catalog = await get("/api/cost-data/subscriptions", { timeout: 30000 });
       if (token !== ctx.loadToken || sequence !== settingsSequence) return;
       if (!Array.isArray(catalog.subscriptions)) throw Error("The accessible subscription catalog is not ready.");
       ingestCatalog = catalog.subscriptions;
@@ -508,7 +508,7 @@ async function renderSettings(token, reloadCatalog = true) {
     let loadError = "";
     let data = { subscriptions: [], setup_needed: true, can_review: false };
     if (scope.length) {
-      try { data = await get(`/api/cost-data?scope=${encodeURIComponent(scope.join(","))}&include_export_months=1`, { timeout: 20000 }); }
+      try { data = await get(`/api/cost-data?scope=${encodeURIComponent(scope.join(","))}&include_export_months=1`, { timeout: 60000 }); }
       catch (error) {
         loadError = error.message || "Could not load status.";
         if (settingsData?.costData && settingsData.subscriptions.map(s => s.id).sort().join(",") === scope.join(","))
@@ -905,7 +905,7 @@ function wireCostData() {
     const requestController = controller = new AbortController();
     try {
       const result = await get(`/api/cost-data?scope=${encodeURIComponent(scope.join(","))}`,
-        { timeout: 20000, signal: requestController.signal });
+        { timeout: 60000, signal: requestController.signal });
       if (!active() || requestController.signal.aborted || document.hidden) return;
       if (result.subscriptions.map(s => s.id).sort().join(",") !== selected)
         throw Error("The accessible scope changed. Reload accessible subscriptions.");
