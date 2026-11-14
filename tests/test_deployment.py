@@ -172,7 +172,7 @@ class DeploymentFailures(unittest.TestCase):
             state = str(Path(work) / "storage.json").replace("'", "''")
             report = str(Path(work) / "cost-access.json").replace("'", "''")
             mode = "" if "-DelegatedArm" in options else "-DelegatedArm:$false"
-            command = f"$scenario = '{scenario}'\n{MOCK}\n& '{script}' -Location eastus2 -AiLocation eastus2 {mode} -SkipPreflight -StorageNameStatePath '{state}' -CostAccessReportPath '{report}' {options}"
+            command = f"$scenario = '{scenario}'\n{MOCK}\n& '{script}' -Location eastus2 -AiLocation eastus2 {mode} -SkipPreflight -AllowMissingFocusExports -StorageNameStatePath '{state}' -CostAccessReportPath '{report}' {options}"
             return subprocess.run([POWERSHELL, "-NoProfile", "-Command", command],
                                   capture_output=True, text=True, timeout=60)
 

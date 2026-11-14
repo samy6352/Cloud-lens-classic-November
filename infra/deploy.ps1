@@ -164,6 +164,11 @@ param(
     # moment to do it. Pass this to defer it, then run focus-exports.ps1 separately.
     [switch]$SkipFocusExports,
 
+    # Fail closed by default: a deployment without owned FOCUS exports looks healthy while
+    # detailed reporting stays empty. Set this only when an explicit deferred handoff is
+    # approved, and run infra\focus-exports.ps1 immediately afterwards.
+    [switch]$AllowMissingFocusExports,
+
     # Non-secret identity/role handoff. Defaults to ignored data\cost-access\<run>.json.
     [string]$CostAccessReportPath = '',
 
@@ -672,7 +677,9 @@ if ($costAccess.pendingSubscriptions.Count) {
 #
 # Never fatal. The stack is complete and usable without exports -- Quick refresh reads cost
 # through ARM -- so a missing grant is reported and the deployment stands.
+$focusProvisionAttempted = $false
 if (-not $SkipFocusExports -and -not $DeferCostAccess) {
+    $focusProvisionAttempted = $true
     Step 'Provisioning FOCUS exports'
     $focusScope = @($costAccess.subscriptions |
         Where-Object { $_.validation -eq 'valid' } |
@@ -688,8 +695,14 @@ if (-not $SkipFocusExports -and -not $DeferCostAccess) {
     } catch {
         $focusProvisioned = $false
         Write-Warning "FOCUS exports were not provisioned: $($_.Exception.Message)"
-        Write-Warning 'Data visibility is not verified. Detailed reporting requires readable exports and successful ingestion.'
-        Write-Warning 'Re-run infra\focus-exports.ps1 once the reported access is granted.'
+        if ($AllowMissingFocusExports) {
+            Write-Warning 'Data visibility is not verified. Detailed reporting requires readable exports and successful ingestion.'
+            Write-Warning 'Re-run infra\focus-exports.ps1 once the reported access is granted.'
+        } else {
+            throw ("Deployment blocked: owned FOCUS exports are required for customer-ready cost data. " +
+                   "Fix the reported RBAC issue and rerun. To defer explicitly, rerun with " +
+                   "-AllowMissingFocusExports or -SkipFocusExports and then run infra\focus-exports.ps1.")
+        }
     }
 } else {
     $focusProvisioned = $false

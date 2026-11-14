@@ -376,9 +376,12 @@ reports refusal as `401 RBACAccessDenied`, which reads like an authentication pr
 not one. RBAC changes take about ten minutes to propagate — do not retest immediately.
 
 **`deploy.ps1` provisions these automatically**, for every subscription it granted cost access
-to, and reports which state it left behind in its final summary. Pass `-SkipFocusExports` to
-defer it. The rest of this section explains why it is a deployment step rather than something
-the application does for itself.
+to, and now **fails the deployment by default** if export provisioning cannot be completed.
+This keeps customer releases from landing in a "looks healthy, detail missing" state. Use
+`-AllowMissingFocusExports` only for an explicitly approved deferred handoff, or
+`-SkipFocusExports` when a separate operator run is planned immediately after deployment.
+The rest of this section explains why it is a deployment step rather than something the
+application does for itself.
 
 **Provision exports with `infra/focus-exports.ps1`, not from inside the app.** The requirement
 above is the reason. An export can only carry a *system-assigned* identity — the API types the
