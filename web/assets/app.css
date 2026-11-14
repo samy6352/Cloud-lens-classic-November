@@ -4417,6 +4417,67 @@ button.wf-row:focus-visible { outline: none; box-shadow: var(--ring); }
 .cost-data .budget-grid { max-width: 44rem; }
 .cost-data :is(p, summary, code) { overflow-wrap: anywhere; }
 .cost-data-subscriptions { display: grid; gap: var(--s1); }
+.cost-data .cd-overview {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--s2);
+  margin: var(--s2) 0 var(--s3);
+}
+.cost-data .cd-kpi {
+  display: grid;
+  gap: 2px;
+  padding: var(--s3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.cost-data .cd-kpi > span {
+  color: var(--muted);
+  font-size: var(--t-xs);
+}
+.cost-data .cd-kpi > strong {
+  font-size: var(--t-md);
+  font-weight: var(--w-semi);
+  line-height: 1.3;
+}
+.cost-data .cd-kpi > small {
+  color: var(--faint);
+  font-size: var(--t-xs);
+}
+.cost-data .cd-status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 20px;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: var(--t-xs);
+  font-weight: var(--w-medium);
+  color: var(--text-dim);
+  background: var(--surface-2);
+  vertical-align: middle;
+}
+.cost-data .cd-status.good {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 45%, var(--border));
+  background: var(--ok-wash);
+}
+.cost-data .cd-status.warn {
+  color: var(--warn-text);
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
+  background: var(--warn-wash);
+}
+.cost-data .cd-status.bad {
+  color: var(--err-text);
+  border-color: color-mix(in srgb, var(--err) 45%, var(--border));
+  background: var(--err-wash);
+}
+.cost-data .cd-status.info {
+  color: var(--accent);
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
 .cost-data #cdSetup { margin-top: var(--s4); }
 .cost-data #cdPlan:not(:empty) { margin-top: var(--s4); }
 .cost-data .cd-months { margin: var(--s2) 0 var(--s3); }
@@ -4449,6 +4510,7 @@ button.wf-row:focus-visible { outline: none; box-shadow: var(--ring); }
   .cost-data-steps { grid-template-columns: 1fr; }
   .cost-data .budget-grid { grid-template-columns: 1fr; }
   .cost-data .build-bar { flex-wrap: wrap; }
+  .cost-data .cd-overview { grid-template-columns: 1fr; }
   .cost-data .cd-month-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 }
 .fr-step {

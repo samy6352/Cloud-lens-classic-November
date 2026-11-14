@@ -789,21 +789,41 @@ function wireCostData() {
   };
   const fullyConfigured = () => settingsData.subscriptions.length > 0 &&
     settingsData.subscriptions.every(s => s.configured);
+  const statusTone = status => ({
+    ready: "good",
+    partial: "warn",
+    failed: "bad",
+    "waiting-for-Azure": "info",
+    queued: "info",
+    running: "info",
+    importing: "info",
+    downloading: "info",
+    validating: "info",
+    authenticating: "info",
+  })[status] || "";
   const paint = () => {
     const rows = settingsData.subscriptions, completed = rows.reduce((n, s) => n + s.coverage.authoritative_days, 0);
     const total = rows.reduce((n, s) => n + s.coverage.requested_days, 0);
+    const verifiedPct = total ? Math.floor(100 * completed / total) : 0;
     $("cdProgress").textContent = !scope.length ? "Choose at least one subscription." : !total ? "Saved progress is not available yet. Check status or use Access & fixes."
-      : `Initial history: ${completed} of ${total} subscription-days verified (${Math.floor(100 * completed / total)}%). `
+      : `Initial history: ${completed} of ${total} subscription-days verified (${verifiedPct}%). `
         + (rows.some(s => busyStates.includes(s.status)) ? "Background work continues; existing costs stay available." : "");
     const through = rows.every(s => s.through) ? rows.map(s => s.through).sort()[0] : null;
+    const nextDue = rows.map(s => s.next_check).filter(Boolean).sort()[0];
+    const enabledCount = rows.filter(s => s.configured).length;
     $("cdStatus").innerHTML = `<h4>Costs available through ${esc(through || "— awaiting complete reports")}</h4>
+      <div class="cd-overview">
+        <div class="cd-kpi"><span>Initial history verified</span><strong>${completed} / ${total || 0}</strong><small>${verifiedPct}% coverage</small></div>
+        <div class="cd-kpi"><span>Schedules enabled</span><strong>${enabledCount} / ${rows.length}</strong><small>${rows.length ? "selected subscriptions" : "none selected"}</small></div>
+        <div class="cd-kpi"><span>Next scheduled check</span><strong>${esc(nextDue ? displayTime(nextDue) : "Not enabled")}</strong><small>02:00 UTC cadence</small></div>
+      </div>
       <p class="muted note">Initial FOCUS coverage: ${total && completed === total ? "complete" : "partial / not yet complete"}
-        · ${completed} of ${total} subscription-days verified${total ? ` (${Math.floor(100 * completed / total)}%)` : ""}.
+        · ${completed} of ${total} subscription-days verified${total ? ` (${verifiedPct}%)` : ""}.
         Quick data remains available but does not count toward this coverage.</p>
       ${rows.some(s => s.coverage.current_day_provisional) ? '<p class="muted note">Today’s costs are provisional. Automatic updates pick up later charges and corrections.</p>' : ""}
       ${settingsData.auto_enabled === false ? '<p class="banner warn">Automatic checks are disabled or deployment storage is unavailable. Ask the deployment administrator to enable the backend pipeline.</p>' : ""}
       <div class="cost-data-subscriptions">${rows.map(s => `<details class="view-help"><summary><strong>${esc(s.name || s.id)}</strong>
-        · ${esc(label(s))} · ${esc(s.configured ? s.config?.cadence : "Schedule not enabled")}</summary>
+        · <span class="cd-status ${statusTone(s.status)}">${esc(label(s))}</span> · ${esc(s.configured ? s.config?.cadence : "Schedule not enabled")}</summary>
         <p class="muted note">Available through: ${esc(s.through || "Not yet reported")}<br>
         Automatic updates: ${s.configured && s.config?.enabled !== false ? "Enabled" : "Not enabled"} · ${esc(s.config?.cadence || "Not configured")}<br>
         Exported months in storage: ${esc(exportedMonthsText(s))}<br>
