@@ -4445,7 +4445,6 @@ button.wf-row:focus-visible { outline: none; box-shadow: var(--ring); }
   color: var(--text);
   font-weight: var(--w-medium);
 }
-.cost-data .cd-month.off { opacity: .7; }
 @media (max-width: 860px) {
   .cost-data-steps { grid-template-columns: 1fr; }
   .cost-data .budget-grid { grid-template-columns: 1fr; }

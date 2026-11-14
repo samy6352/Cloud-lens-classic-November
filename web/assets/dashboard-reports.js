@@ -708,25 +708,14 @@ function wireCostData() {
     const imported = (Array.isArray(row.exported_months) ? row.exported_months : [])
       .filter(m => /^\d{4}-\d{2}$/.test(m)).sort();
     if (!imported.length) return "";
-    const [y, m] = imported.at(-1).split("-").map(Number);
-    const labels = [];
-    let year = y, month = m;
-    for (let i = 0; i < 12; i++) {
-      labels.push(`${year}-${String(month).padStart(2, "0")}`);
-      month--;
-      if (month < 1) { month = 12; year--; }
-    }
-    labels.reverse();
-    const importedSet = new Set(imported);
-    const chips = labels.map(key => {
+    const chips = imported.slice(-12).map(key => {
       const [yy, mm] = key.split("-").map(Number);
       const name = new Date(Date.UTC(yy, mm - 1, 1))
         .toLocaleDateString(undefined, { month: "short", year: "2-digit", timeZone: "UTC" });
-      const on = importedSet.has(key);
-      return `<span class="cd-month ${on ? "on" : "off"}" title="${esc(key)}">${esc(name)}</span>`;
+      return `<span class="cd-month on" title="${esc(key)}">${esc(name)}</span>`;
     }).join("");
     return `<div class="cd-months">
-      <p class="muted note"><strong>Synced months (latest 12):</strong></p>
+      <p class="muted note"><strong>Synced months:</strong></p>
       <div class="cd-month-grid" role="list" aria-label="Synced month coverage">${chips}</div>
     </div>`;
   };
