@@ -130,6 +130,7 @@ try {
         @{ Label = 'Central India (centralindia)'; Value = 'centralindia' }
         @{ Label = 'South India (southindia)'; Value = 'southindia' }
         @{ Label = 'Southeast Asia (southeastasia)'; Value = 'southeastasia' }
+        @{ Label = 'Malaysia West (malaysiawest)'; Value = 'malaysiawest' }
         @{ Label = 'West Europe (westeurope)'; Value = 'westeurope' }
         @{ Label = 'East US (eastus)'; Value = 'eastus' }
     ) 1
